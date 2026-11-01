@@ -27,10 +27,10 @@ class RoutingGraphTest {
         built.use {
             assertTrue(stats.edges > 10_000)
             it.prepareCH()
-            assertEquals(setOf("car-ors_fastest", "car-ors_fastest_core", "heavyvehicle_recommended", "heavyvehicle_recommended_core"), it.chStorages.keys)
+            assertEquals(setOf("car-ors_fastest", "car-ors_fastest_core", "car-ors_shortest", "car-ors_shortest_core", "heavyvehicle_recommended", "heavyvehicle_recommended_core", "heavyvehicle_shortest", "heavyvehicle_shortest_core"), it.chStorages.keys)
         }
         RoutingGraph.load(dir).use { rg ->
-            assertEquals(4, rg.chStorages.size)
+            assertEquals(8, rg.chStorages.size)
             for ((a, b) in pairs) {
                 // Core (con restrizioni e divieti di svolta) vs Dijkstra edge-based filtrato: stesso peso
                 val params = VehicleParameters(height = 4.0, weight = 12.0)
