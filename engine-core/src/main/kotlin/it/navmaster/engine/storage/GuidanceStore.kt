@@ -14,13 +14,15 @@ import java.io.Closeable
  *  8 ref                 12 turn:lanes A→B      16 turn:lanes B→A       20 destination A→B
  * 24 destination B→A     28 destination:ref A→B 32 destination:ref B→A  36 svincolo al nodo A
  * 40 svincolo al nodo B  44 nodi speciali lungo l'arco ("tipo@indice;…", indice nella geometria completa A→B)
+ * 48 restrizioni a orario 52 cartelli corsie A→B 56 cartelli corsie B→A 60 cartello (relazione) partendo da A
+ * 64 cartello (relazione) partendo da B           68 u8 categoria ADR galleria, 3 byte liberi
  * ```
  * Le stringhe stanno nel deposito dei nomi del grafo (puntatore 0 = vuota).
  */
 class GuidanceStore(private var da: DataAccess, private val names: StringStore) : Closeable {
     private var count = 0
 
-    fun set(edge: Int, g: GuidanceAttributes, junctionA: String?, junctionB: String?, nodes: String?) {
+    fun set(edge: Int, g: GuidanceAttributes, junctionA: String?, junctionB: String?, nodes: String?, signA: String? = null, signB: String? = null) {
         ensure(edge)
         val p = edge.toLong() * ENTRY_BYTES
         da.setByte(p, g.maxSpeedFwd.toByte()); da.setByte(p + 1, g.maxSpeedBwd.toByte())
@@ -38,6 +40,10 @@ class GuidanceStore(private var da: DataAccess, private val names: StringStore) 
         da.setInt(p + 28, names.put(g.destinationRefFwd)); da.setInt(p + 32, names.put(g.destinationRefBwd))
         da.setInt(p + 36, names.put(junctionA ?: "")); da.setInt(p + 40, names.put(junctionB ?: ""))
         da.setInt(p + 44, names.put(nodes ?: ""))
+        da.setInt(p + 48, names.put(g.conditional))
+        da.setInt(p + 52, names.put(g.laneSignsFwd)); da.setInt(p + 56, names.put(g.laneSignsBwd))
+        da.setInt(p + 60, names.put(signA ?: "")); da.setInt(p + 64, names.put(signB ?: ""))
+        da.setByte(p + 68, g.adrTunnel.toByte())
     }
 
     /** Spazio per gli archi fino a [edge] compreso (gli archi senza dati di guida restano a zero). */
@@ -69,6 +75,14 @@ class GuidanceStore(private var da: DataAccess, private val names: StringStore) 
     fun junctionAtStart(edge: Int, reverse: Boolean): String = if (!has(edge)) "" else str(edge, if (reverse) 40 else 36)
     /** Nodi speciali lungo l'arco: "tipo@indice;…" con l'indice del punto nella geometria completa A→B. */
     fun specialNodes(edge: Int): String = if (!has(edge)) "" else str(edge, 44)
+    /** Restrizioni a orario: "chiave=valore" separate da [GuidanceAttributes.SEP_ITEM]. */
+    fun conditional(edge: Int): String = if (!has(edge)) "" else str(edge, 48)
+    /** Cartelli sulle corsie percorrendo l'arco nel verso dato: "destinazioni|ref|colori" (campi `:lanes`). */
+    fun laneSigns(edge: Int, reverse: Boolean): String = if (!has(edge)) "" else str(edge, if (reverse) 56 else 52)
+    /** Cartello di una relazione `destination_sign` all'imbocco dell'arco nel verso dato: "destinazioni|ref|colore". */
+    fun relationSign(edge: Int, reverse: Boolean): String = if (!has(edge)) "" else str(edge, if (reverse) 64 else 60)
+    /** Categoria ADR della galleria: 0 nessuna, 2 = B … 5 = E. */
+    fun adrTunnel(edge: Int): Int = if (!has(edge)) 0 else u8(edge, 68)
 
     /**
      * Corsie percorrendo l'arco: quelle esplicite del verso; altrimenti tutte su un senso unico,
@@ -91,7 +105,7 @@ class GuidanceStore(private var da: DataAccess, private val names: StringStore) 
     override fun close() = da.close()
 
     companion object {
-        const val ENTRY_BYTES = 48
+        const val ENTRY_BYTES = 72
         private const val F_TUNNEL = 1
         private const val F_BRIDGE = 2
         private const val F_ONEWAY_FWD = 4

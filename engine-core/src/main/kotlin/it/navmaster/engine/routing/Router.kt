@@ -127,6 +127,22 @@ class Router(
         return best ?: throw RouteNotFoundException("Nessun percorso trovato fra i punti richiesti")
     }
 
+    /**
+     * Il percorso migliore e fino a [targetCount] − 1 alternative (metodo dei plateau, vedi
+     * [AlternativeRoutes]) con la ricerca bidirezionale node-based piena, come la modalità
+     * flessibile di ORS: niente CH, costi di svolta non considerati.
+     */
+    fun alternatives(from: Snap, to: Snap, targetCount: Int, weightFactor: Double, shareFactor: Double): List<RoutePath> {
+        val fromParts = splitEdge(from, asTarget = false)
+        val toParts = splitEdge(to, asTarget = true)
+        val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes, explorationFactor = weightFactor)
+        for (p in fromParts) algo.addSource(p.node, p.weight)
+        for (p in toParts) algo.addTarget(p.node, p.weight)
+        val paths = AlternativeRoutes(algo, targetCount, weightFactor, shareFactor).run()
+        if (paths.isEmpty()) throw RouteNotFoundException("Nessun percorso trovato fra i punti richiesti")
+        return paths.map { sp -> assemble(sp, fromParts.first { it.node == sp.startNode }, toParts.first { it.node == sp.endNode }) }
+    }
+
     /** Tratto parziale di un arco agganciato: dal punto agganciato alla torre [node] (o viceversa). */
     private class EdgePart(val node: Int, val weight: Double, val distance: Double, val millis: Long, val geometry: PointList, val edge: Int, val reverse: Boolean)
 

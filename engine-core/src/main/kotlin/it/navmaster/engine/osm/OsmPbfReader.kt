@@ -122,6 +122,7 @@ class OsmPbfReader(private val file: File) {
         /** Dei nodi servono i tag che influenzano la percorribilità (barriere, guadi), i limiti puntuali e gli svincoli (`ref`, `name`). */
         fun keepNodeTag(key: String): Boolean =
             key == "barrier" || key == "ford" || key == "highway" || key == "locked" || key == "access" || key == "ref" || key == "name" ||
+                key == "direction" || key.startsWith("maxspeed") ||
                 key == "motor_vehicle" || key == "motorcar" || key == "vehicle" || key == "hgv" || key == "goods" ||
                 key == "bus" || key == "delivery" || key == "agricultural" || key == "forestry" ||
                 key.startsWith("maxheight") || key.startsWith("maxwidth") || key.startsWith("maxweight") ||

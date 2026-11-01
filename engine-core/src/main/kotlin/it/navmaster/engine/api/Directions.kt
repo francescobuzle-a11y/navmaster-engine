@@ -44,6 +44,9 @@ class ApiException(val httpStatus: Int, val code: Int, message: String) : Runtim
 
 enum class ResponseFormat { JSON, GEOJSON }
 
+/** ORS `alternative_routes`: quanti percorsi in tutto, quanto possono pesare di più, quanto possono condividere. */
+class AlternativeOptions(val targetCount: Int, val weightFactor: Double, val shareFactor: Double)
+
 /** Richiesta directions nel vocabolario ORS, già validata. */
 class DirectionsRequest(
     val profile: String,
@@ -65,6 +68,8 @@ class DirectionsRequest(
     val continueStraight: Boolean,
     /** Estensione NavMaster `{"navmaster": {"roads": true}}`: i fatti sulle strade del percorso ([RoadFactsBuilder]). */
     val navmasterRoads: Boolean,
+    /** ORS `alternative_routes` (target_count, weight_factor, share_factor), null se non richieste. */
+    val alternatives: AlternativeOptions?,
     /** Raggio di aggancio per punto in metri (-1 = illimitato → raggio massimo del profilo). */
     val radiuses: DoubleArray?,
     val id: String?,
@@ -142,6 +147,11 @@ class DirectionsRequest(
                 avoidPolygons = polygons, maximumSpeed = maximumSpeed,
                 continueStraight = body["continue_straight"] as? Boolean ?: false,
                 navmasterRoads = (body["navmaster"] as? Map<*, *>)?.get("roads") == true,
+                alternatives = (body["alternative_routes"] as? Map<*, *>)?.let { a ->
+                    val count = (a["target_count"] as? Number)?.toInt() ?: 2
+                    if (count !in 2..3) throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'alternative_routes.target_count' has incorrect value of '$count' (2 or 3).")
+                    AlternativeOptions(count, (a["weight_factor"] as? Number)?.toDouble() ?: 1.4, (a["share_factor"] as? Number)?.toDouble() ?: 0.6)
+                },
                 radiuses = radiuses, id = body["id"]?.toString(), attributes = attributes, extraInfo = extraInfo, echo = body,
             )
         }
@@ -223,19 +233,42 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
                 throw ApiException(404, RoutingErrorCodes.POINT_NOT_FOUND, "Could not find routable point within a radius of ${radius.toLong()} meters of specified coordinate ${e.pointIndex}: %.7f %.7f.".format(lon, lat))
             }
         }
-        val legs = ArrayList<RoutePath>()
-        for (i in 1 until snaps.size) {
-            // continue_straight: il tratto prosegue nel verso con cui il precedente è arrivato al via-point
-            val arrival = if (request.continueStraight) legs.lastOrNull()?.edges?.lastOrNull() else null
-            try { legs += router.route(snaps[i - 1], snaps[i], arrival) } catch (e: RouteNotFoundException) {
-                throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points ${i - 1} (%.7f %.7f) and $i (%.7f %.7f).".format(
-                    request.coordinates[i - 1].second, request.coordinates[i - 1].first, request.coordinates[i].second, request.coordinates[i].first))
+        val alt = request.alternatives
+        val routes = ArrayList<List<RoutePath>>()
+        if (alt != null) {
+            // come ORS: alternative solo fra due punti, in modalità flessibile
+            if (snaps.size != 2) throw ApiException(400, RoutingErrorCodes.INCOMPATIBLE_PARAMETERS, "Alternative routes algorithm does not support more than two way points.")
+            try { for (p in router.alternatives(snaps[0], snaps[1], alt.targetCount, alt.weightFactor, alt.shareFactor)) routes += listOf(p) } catch (e: RouteNotFoundException) {
+                throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points 0 (%.7f %.7f) and 1 (%.7f %.7f).".format(
+                    request.coordinates[0].second, request.coordinates[0].first, request.coordinates[1].second, request.coordinates[1].first))
             }
+        } else {
+            val legs = ArrayList<RoutePath>()
+            for (i in 1 until snaps.size) {
+                // continue_straight: il tratto prosegue nel verso con cui il precedente è arrivato al via-point
+                val arrival = if (request.continueStraight) legs.lastOrNull()?.edges?.lastOrNull() else null
+                try { legs += router.route(snaps[i - 1], snaps[i], arrival) } catch (e: RouteNotFoundException) {
+                    throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points ${i - 1} (%.7f %.7f) and $i (%.7f %.7f).".format(
+                        request.coordinates[i - 1].second, request.coordinates[i - 1].first, request.coordinates[i].second, request.coordinates[i].first))
+                }
+            }
+            routes += legs
         }
-        return buildResponse(request, legs, encoder, format)
+        val docs = routes.map { buildRoute(request, it, encoder) }
+        val all = BBox.empty()
+        for (d in docs) { all.include(d.bbox[1], d.bbox[0]); all.include(d.bbox[3], d.bbox[2]) }
+        val bboxArr = doubleArrayOf(r6(all.minLon), r6(all.minLat), r6(all.maxLon), r6(all.maxLat))
+        val metadata = metadata(request)
+        return when (format) {
+            ResponseFormat.JSON -> linkedMapOf("bbox" to bboxArr, "routes" to docs.map { it.json }, "metadata" to metadata)
+            ResponseFormat.GEOJSON -> linkedMapOf("type" to "FeatureCollection", "bbox" to bboxArr, "features" to docs.map { it.feature }, "metadata" to metadata)
+        }
     }
 
-    private fun buildResponse(request: DirectionsRequest, legs: List<RoutePath>, encoder: String, format: ResponseFormat): Map<String, Any?> {
+    /** Un percorso nelle due forme (oggetto `routes[i]` del JSON, `features[i]` del GeoJSON) e il suo bbox. */
+    private class RouteDoc(val json: Map<String, Any?>, val feature: Map<String, Any?>, val bbox: DoubleArray)
+
+    private fun buildRoute(request: DirectionsRequest, legs: List<RoutePath>, encoder: String): RouteDoc {
         val pe = graphs.encoding.profile(encoder)
         val instructionsBuilder = InstructionsBuilder(graphs.graph, graphs.encoding, pe)
         val stepBuilder = OrsStepBuilder(StepOptions(request.language, request.units, request.maneuvers, request.htmlFormat))
@@ -271,36 +304,36 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         if ("percentage" in request.attributes) for (seg in segments) (seg as MutableMap<String, Any?>)["percentage"] = if (totalDistance > 0) Math.round((seg["distance"] as Double) * 100 / totalDistance * 100) / 100.0 else 0.0
         val summary = linkedMapOf<String, Any?>("distance" to roundForUnits(totalDistance, request.units), "duration" to totalDuration)
         val bboxArr = doubleArrayOf(r6(bbox.minLon), r6(bbox.minLat), r6(bbox.maxLon), r6(bbox.maxLat))
-        val metadata = metadata(request)
+        val extras = if (request.extraInfo.isNotEmpty()) ExtraInfoBuilder(graphs.graph, graphs.encoding, pe).build(request.extraInfo, legs, request.units.perMeter, request.units.decimals) else null
+        val navmaster = if (request.navmasterRoads) {
+            val rf = RoadFactsBuilder(graphs.graph, graphs.encoding, pe, graphs.guidance)
+            val nm = linkedMapOf<String, Any?>("roads" to rf.build(legs))
+            graphs.points?.let { nm["points"] = rf.pointsAlong(legs, it) }
+            nm
+        } else null
 
-        return when (format) {
-            ResponseFormat.JSON -> {
-                val route = LinkedHashMap<String, Any?>()
-                route["summary"] = summary
-                route["segments"] = segments
-                route["bbox"] = bboxArr
-                if (request.geometry) {
-                    route["geometry"] = encodeGeometry(geometry)
-                    route["way_points"] = wayPoints
-                }
-                if (request.extraInfo.isNotEmpty()) route["extras"] = ExtraInfoBuilder(graphs.graph, graphs.encoding, pe).build(request.extraInfo, legs, request.units.perMeter, request.units.decimals)
-                if (request.navmasterRoads) route["navmaster"] = linkedMapOf("roads" to RoadFactsBuilder(graphs.graph, graphs.encoding, pe, graphs.guidance).build(legs))
-                linkedMapOf("bbox" to bboxArr, "routes" to listOf(route), "metadata" to metadata)
-            }
-            ResponseFormat.GEOJSON -> {
-                val coords = ArrayList<DoubleArray>(geometry.size)
-                for (i in 0 until geometry.size) coords.add(doubleArrayOf(r6(geometry.lon(i)), r6(geometry.lat(i))))
-                val properties = linkedMapOf<String, Any?>("segments" to segments, "way_points" to wayPoints, "summary" to summary)
-                if (request.extraInfo.isNotEmpty()) properties["extras"] = ExtraInfoBuilder(graphs.graph, graphs.encoding, pe).build(request.extraInfo, legs, request.units.perMeter, request.units.decimals)
-                if (request.navmasterRoads) properties["navmaster"] = linkedMapOf("roads" to RoadFactsBuilder(graphs.graph, graphs.encoding, pe, graphs.guidance).build(legs))
-                val feature = linkedMapOf<String, Any?>(
-                    "bbox" to bboxArr, "type" to "Feature",
-                    "properties" to properties,
-                    "geometry" to linkedMapOf("coordinates" to coords, "type" to "LineString"),
-                )
-                linkedMapOf("type" to "FeatureCollection", "bbox" to bboxArr, "features" to listOf(feature), "metadata" to metadata)
-            }
+        val route = LinkedHashMap<String, Any?>()
+        route["summary"] = summary
+        route["segments"] = segments
+        route["bbox"] = bboxArr
+        if (request.geometry) {
+            route["geometry"] = encodeGeometry(geometry)
+            route["way_points"] = wayPoints
         }
+        if (extras != null) route["extras"] = extras
+        if (navmaster != null) route["navmaster"] = navmaster
+
+        val coords = ArrayList<DoubleArray>(geometry.size)
+        for (i in 0 until geometry.size) coords.add(doubleArrayOf(r6(geometry.lon(i)), r6(geometry.lat(i))))
+        val properties = linkedMapOf<String, Any?>("segments" to segments, "way_points" to wayPoints, "summary" to summary)
+        if (extras != null) properties["extras"] = extras
+        if (navmaster != null) properties["navmaster"] = navmaster
+        val feature = linkedMapOf<String, Any?>(
+            "bbox" to bboxArr, "type" to "Feature",
+            "properties" to properties,
+            "geometry" to linkedMapOf("coordinates" to coords, "type" to "LineString"),
+        )
+        return RouteDoc(route, feature, bboxArr)
     }
 
     private fun stepJson(s: RouteStep, request: DirectionsRequest): Map<String, Any?> {

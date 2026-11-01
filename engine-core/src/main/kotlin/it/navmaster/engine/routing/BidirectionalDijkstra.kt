@@ -76,6 +76,8 @@ class BidirectionalDijkstra(
     private val weighting: Weighting,
     private val filter: EdgeFilter = EdgeFilter.ALL,
     private val maxVisitedNodes: Int = Int.MAX_VALUE,
+    /** > 1: la ricerca continua oltre il percorso migliore fino a questo multiplo del suo peso (percorsi alternativi). */
+    private val explorationFactor: Double = 1.0,
 ) {
     val fwd = SearchState(1024)
     val bwd = SearchState(1024)
@@ -108,7 +110,7 @@ class BidirectionalDijkstra(
         if (meetingNode < 0) return false
         val fwdKey = if (fwd.heap.isEmpty) Double.POSITIVE_INFINITY else fwd.heap.peekKey()
         val bwdKey = if (bwd.heap.isEmpty) Double.POSITIVE_INFINITY else bwd.heap.peekKey()
-        return fwdKey + bwdKey >= bestWeight
+        return fwdKey + bwdKey >= bestWeight * explorationFactor
     }
 
     private fun settleNext(state: SearchState, it: BaseGraph.EdgeIterator, reverse: Boolean) {

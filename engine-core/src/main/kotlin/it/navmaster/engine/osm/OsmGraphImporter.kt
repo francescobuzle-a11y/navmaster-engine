@@ -5,6 +5,7 @@ import com.carrotsearch.hppc.LongArrayList
 import com.carrotsearch.hppc.LongObjectHashMap
 import it.navmaster.engine.profile.GuidanceParser
 import it.navmaster.engine.storage.GuidanceStore
+import it.navmaster.engine.storage.PointStore
 import it.navmaster.engine.profile.Access
 import it.navmaster.engine.profile.WayAttributeParser
 import it.navmaster.engine.storage.BaseGraph
@@ -51,10 +52,17 @@ class OsmGraphImporter(
     private val options: ImportOptions = ImportOptions(),
     /** Se presente, riceve i dati di guida di ogni arco (file `guidance`). */
     private val guidance: GuidanceStore? = null,
+    /** Se presente, riceve autovelox, Tutor e fotocamere ai semafori (file `points`). */
+    private val points: PointStore? = null,
 ) {
     private val profiles = encoding.profiles
     private val junctions = LongObjectHashMap<String>()   // id OSM → svincolo "ref|nome"
     private val specialNodes = LongObjectHashMap<String>() // id OSM → casello / portale / dogana
+    private class Enforcement(val type: Int, val maxspeed: Int, val device: Long, val from: Long, val to: Long)
+    private val enforcements = ArrayList<Enforcement>()
+    private val neededNodes = LongObjectHashMap<DoubleArray>() // nodi delle relazioni enforcement → [lat, lon]
+    private val cameraNodes = com.carrotsearch.hppc.LongHashSet()  // nodi highway=speed_camera già scritti
+    private val relationSigns = HashMap<Long, MutableList<Pair<Long, String>>>() // way "to" → (nodo intersection, cartello)
     private val nodeUse = LongIntHashMap()       // id OSM → bit: 1 = visto una volta, 2 = più volte, 4 = estremo di way
     private val towers = LongIntHashMap()        // id OSM → id nodo del grafo
     private val pillars = LongIntHashMap()       // id OSM → indice pillar
@@ -74,6 +82,17 @@ class OsmGraphImporter(
         reader.read(Pass1(), nodes = false)
         reader.read(Pass2Nodes(), ways = false, relations = false)
         reader.read(Pass2Ways(), nodes = false, relations = false)
+        // autovelox e Tutor delle relazioni enforcement (il nodo device con highway=speed_camera è già scritto)
+        if (points != null) for (e in enforcements) {
+            fun at(id: Long): DoubleArray? = if (id < 0) null else neededNodes.get(id)?.takeIf { it.size == 2 }
+            when (e.type) {
+                PointStore.AVERAGE_SPEED_START -> {
+                    at(e.from)?.let { points.add(it[0], it[1], PointStore.AVERAGE_SPEED_START, e.maxspeed, -1) }
+                    at(e.to)?.let { points.add(it[0], it[1], PointStore.AVERAGE_SPEED_END, e.maxspeed, -1) }
+                }
+                else -> if (e.device < 0 || !cameraNodes.contains(e.device)) (at(e.device) ?: at(e.from))?.let { points.add(it[0], it[1], e.type, e.maxspeed, -1) }
+            }
+        }
         var appliedRestrictions = 0
         if (turnCosts != null) {
             val applier = TurnRestrictionApplier(graph, encoding, turnCosts)
@@ -110,6 +129,27 @@ class OsmGraphImporter(
         }
 
         override fun relation(id: Long, tags: Map<String, String>, members: List<RelationMember>) {
+            if (guidance != null) when (tags["type"]) {
+                "enforcement" -> {
+                    val t = when (tags["enforcement"]) {
+                        "maxspeed" -> PointStore.SPEED_CAMERA; "average_speed" -> PointStore.AVERAGE_SPEED_START
+                        "traffic_signals" -> PointStore.TRAFFIC_SIGNALS_CAMERA; else -> 0
+                    }
+                    if (t == 0) return
+                    fun node(role: String) = members.firstOrNull { it.type == MemberType.NODE && it.role == role }?.ref ?: -1L
+                    val e = Enforcement(t, GuidanceParser.speed(tags["maxspeed"]), node("device"), node("from"), node("to"))
+                    enforcements += e
+                    for (n in longArrayOf(e.device, e.from, e.to)) if (n >= 0) neededNodes.put(n, DoubleArray(0))
+                    return
+                }
+                "destination_sign" -> {
+                    val sign = GuidanceParser.relationSign(tags) ?: return
+                    val to = members.firstOrNull { it.type == MemberType.WAY && it.role == "to" }?.ref ?: return
+                    val inter = members.firstOrNull { it.type == MemberType.NODE && it.role == "intersection" }?.ref ?: -1L
+                    relationSigns.getOrPut(to) { ArrayList(2) } += inter to sign
+                    return
+                }
+            }
             if (tags["type"] != "restriction") return
             var restriction: String? = null; var vehicle: String? = null
             for ((k, v) in tags) {
@@ -127,6 +167,13 @@ class OsmGraphImporter(
 
     private inner class Pass2Nodes : OsmSink {
         override fun node(id: Long, lat: Double, lon: Double, tags: Map<String, String>?) {
+            if (points != null) {
+                if (tags != null && tags["highway"] == "speed_camera") {
+                    points.add(lat, lon, PointStore.SPEED_CAMERA, GuidanceParser.speed(tags["maxspeed"]), bearingOf(tags["direction"]))
+                    cameraNodes.add(id)
+                }
+                if (!neededNodes.isEmpty && neededNodes.containsKey(id)) neededNodes.put(id, doubleArrayOf(lat, lon))
+            }
             val use = nodeUse.getOrDefault(id, 0)
             if (use == 0) return
             var isBarrier = false
@@ -267,8 +314,22 @@ class OsmGraphImporter(
                 }
                 val jA = if (segIds.size() == n) junctions.get(segIds.get(0)) else null
                 val jB = if (segIds.size() == n) junctions.get(segIds.get(n - 1)) else null
-                g.set(edge, GuidanceParser.parse(way), jA, jB, special?.toString())
+                // cartelli delle relazioni destination_sign verso questa way: all'imbocco dal nodo dell'incrocio
+                val rs = relationSigns[way.id]
+                val sA = if (rs != null && segIds.size() == n) rs.firstOrNull { it.first == segIds.get(0) }?.second else null
+                val sB = if (rs != null && segIds.size() == n) rs.firstOrNull { it.first == segIds.get(n - 1) }?.second else null
+                g.set(edge, GuidanceParser.parse(way), jA, jB, special?.toString(), sA, sB)
             }
+        }
+    }
+
+    /** Il tag `direction` di un autovelox in gradi (numero o punto cardinale), -1 se assente. */
+    private fun bearingOf(raw: String?): Int {
+        val v = raw?.trim()?.substringBefore(';')?.lowercase() ?: return -1
+        v.toDoubleOrNull()?.let { return ((it.toInt() % 360) + 360) % 360 }
+        return when (v) {
+            "n", "north" -> 0; "ne" -> 45; "e", "east" -> 90; "se" -> 135; "s", "south" -> 180; "sw" -> 225; "w", "west" -> 270; "nw" -> 315
+            else -> -1
         }
     }
 

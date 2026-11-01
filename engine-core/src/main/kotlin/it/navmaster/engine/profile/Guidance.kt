@@ -5,8 +5,9 @@ import it.navmaster.engine.osm.OsmWay
 
 /**
  * Dati di guida di una way, indipendenti dal profilo e senza effetto sul calcolo del percorso:
- * limiti di velocità, corsie e frecce, destinazioni, ref, galleria/ponte, senso unico. Servono
- * all'app (corsie, cartelli, limiti lungo il percorso) e vengono salvati nel file `guidance`.
+ * limiti di velocità, corsie e frecce, destinazioni, ref, galleria/ponte, senso unico, categoria
+ * ADR della galleria, restrizioni a orario, cartelli sulle corsie. Servono all'app (corsie,
+ * cartelli, limiti lungo il percorso) e vengono salvati nel file `guidance`.
  *
  * I valori "forward" seguono il verso della way (nodeA → nodeB dell'arco), "backward" il contrario.
  * Velocità in km/h (0 = sconosciuta, [NO_LIMIT] = cartello "nessun limite"); corsie 0 = sconosciute.
@@ -22,9 +23,17 @@ class GuidanceAttributes(
     val turnLanesFwd: String = "", val turnLanesBwd: String = "",
     val destinationFwd: String = "", val destinationBwd: String = "",
     val destinationRefFwd: String = "", val destinationRefBwd: String = "",
+    /** Categoria ADR della galleria: 0 nessuna, 2 = B … 5 = E (`hazmat:B=no` … `hazmat:E=no`, la più restrittiva). */
+    val adrTunnel: Int = 0,
+    /** Restrizioni a orario (`*:conditional`), "chiave=valore" separate da [SEP_ITEM]; vuoto se assenti. */
+    val conditional: String = "",
+    /** Cartelli sulle corsie: `destination:lanes`, `destination:ref:lanes`, `destination:colour:lanes` separati da [SEP_FIELD]. */
+    val laneSignsFwd: String = "", val laneSignsBwd: String = "",
 ) {
     companion object {
         const val NO_LIMIT = 255
+        const val SEP_ITEM = '\u001e'
+        const val SEP_FIELD = '\u001f'
         val NONE = GuidanceAttributes()
     }
 }
@@ -33,6 +42,11 @@ object GuidanceParser {
     private val onewayYes = setOf("yes", "1", "true")
     private val onewayReverse = setOf("-1", "reverse")
     private val impliedOneway = setOf("motorway", "motorway_link", "trunk_link")
+    private val adrLetters = listOf("B", "C", "D", "E")
+    /** Le restrizioni a orario che riguardano un mezzo pesante o le sue misure. */
+    private val conditionalKeys = listOf("access:conditional", "vehicle:conditional", "motor_vehicle:conditional", "hgv:conditional", "goods:conditional",
+        "bus:conditional", "maxweight:conditional", "maxweight:hgv:conditional", "maxheight:conditional", "maxwidth:conditional", "maxlength:conditional",
+        "maxaxleload:conditional", "maxspeed:conditional", "maxspeed:hgv:conditional", "hazmat:conditional", "oneway:conditional")
 
     fun parse(way: OsmWay): GuidanceAttributes {
         val oneway = oneway(way)
@@ -60,6 +74,10 @@ object GuidanceParser {
             destinationBwd = way.tag("destination:backward") ?: (if (oneway != 1) plainDest else ""),
             destinationRefFwd = way.tag("destination:ref:forward") ?: (if (oneway != -1) plainDestRef else ""),
             destinationRefBwd = way.tag("destination:ref:backward") ?: (if (oneway != 1) plainDestRef else ""),
+            adrTunnel = adrTunnel(way),
+            conditional = conditional(way),
+            laneSignsFwd = laneSigns(way, "forward", oneway != -1),
+            laneSignsBwd = laneSigns(way, "backward", oneway == -1),
         )
     }
 
@@ -85,6 +103,31 @@ object GuidanceParser {
         return v.coerceIn(0, 255)
     }
 
+    /** Categoria ADR della galleria: la lettera più restrittiva con `hazmat:X=no` (B = 2 … E = 5), 0 se nessuna. */
+    fun adrTunnel(way: OsmWay): Int {
+        way.tag("hazmat:adr_tunnel_category")?.trim()?.uppercase()?.let { c -> adrLetters.indexOf(c).takeIf { it >= 0 }?.let { return it + 2 } }
+        for ((i, l) in adrLetters.withIndex()) if (way.tag("hazmat:$l") == "no") return i + 2
+        return 0
+    }
+
+    fun conditional(way: OsmWay): String {
+        val sb = StringBuilder()
+        for (k in conditionalKeys) {
+            val v = way.tag(k) ?: continue
+            if (sb.isNotEmpty()) sb.append(GuidanceAttributes.SEP_ITEM)
+            sb.append(k).append('=').append(v.replace(GuidanceAttributes.SEP_ITEM, ' ').replace(GuidanceAttributes.SEP_FIELD, ' '))
+        }
+        return sb.toString()
+    }
+
+    /** I cartelli sulle corsie nel verso [dir]: i tag con suffisso, altrimenti quelli semplici se [plainApplies]. */
+    fun laneSigns(way: OsmWay, dir: String, plainApplies: Boolean): String {
+        fun tag(base: String): String = way.tag("$base:$dir") ?: (if (plainApplies) way.tag(base) ?: "" else "")
+        val dest = tag("destination:lanes"); val ref = tag("destination:ref:lanes"); val colour = tag("destination:colour:lanes")
+        if (dest.isEmpty() && ref.isEmpty()) return ""
+        return listOf(dest, ref, colour).joinToString(GuidanceAttributes.SEP_FIELD.toString()) { it.replace(GuidanceAttributes.SEP_FIELD, ' ').replace(GuidanceAttributes.SEP_ITEM, ' ') }
+    }
+
     /** Informazione di un nodo utile alla guida: svincolo autostradale ("ref|name") o nodo speciale. */
     fun junction(tags: Map<String, String>): String? {
         if (tags["highway"] != "motorway_junction") return null
@@ -98,5 +141,12 @@ object GuidanceParser {
         tags["highway"] == "toll_gantry" -> "toll_gantry"
         tags["barrier"] == "border_control" -> "border_control"
         else -> null
+    }
+
+    /** Un cartello di una relazione `destination_sign`: "destinazioni|ref|colore". */
+    fun relationSign(tags: Map<String, String>): String? {
+        val dest = tags["destination"] ?: ""; val ref = tags["destination:ref"] ?: ""; val colour = tags["colour"] ?: tags["destination:colour"] ?: ""
+        if (dest.isEmpty() && ref.isEmpty()) return null
+        return "$dest|$ref|$colour"
     }
 }

@@ -21,7 +21,7 @@ import kotlin.system.exitProcess
 private const val USAGE = """
 navmaster-engine
 
-  import <file.osm.pbf> <cartella-grafo> [--profiles=car,hgv] [--no-ch] [--no-width-from-carriageway]   costruisce il grafo
+  import <file.osm.pbf> <cartella-grafo> [--profiles=car,hgv] [--no-ch] [--no-width-from-carriageway] [--mmap]   costruisce il grafo (--mmap: file su disco invece che in RAM)
   info <cartella-grafo>                                          riepilogo del grafo
   route <cartella-grafo> <lat,lon> <lat,lon> [--profile=driving-hgv] [--weighting=fastest|shortest|recommended]
         [--avoid=highways,tollways,ferries,fords] [--height=4.0 --weight=40 --width=2.55 --length=18.75 --hazmat] [--no-turn-costs] [--no-ch]
@@ -125,7 +125,7 @@ private fun importGraph(args: List<String>) {
     val profiles = profilesFromArgs(args)
     val importOptions = it.navmaster.engine.osm.ImportOptions(widthFromCarriageway = !args.contains("--no-width-from-carriageway"))
     println("${Engine.NAME}: import di $pbf → $dir, profili ${profiles.map { it.name }}" + if (!importOptions.widthFromCarriageway) " (tag width ignorato)" else "")
-    val (rg, stats) = RoutingGraph.build(pbf, dir, profiles, importOptions = importOptions)
+    val (rg, stats) = RoutingGraph.build(pbf, dir, profiles, mmap = args.contains("--mmap"), importOptions = importOptions)
     rg.use {
         println("nodi OSM %,d, way %,d (accettate %,d)".format(stats.osmNodes, stats.osmWays, stats.acceptedWays))
         println("grafo: %,d nodi, %,d archi (%,d pillar, %,d archi barriera), divieti di svolta %,d applicati su %,d, %.1f s".format(

@@ -169,4 +169,33 @@ class DirectionsServiceTest {
             assertTrue(((plain["routes"] as List<*>)[0] as Map<*, *>)["navmaster"] == null)
         }
     }
+    @Test
+    fun `alternative routes, branches and points`() {
+        val dir = Files.createTempDirectory("nme-alt").toFile().also { it.deleteOnExit() }
+        RoutingGraph.build(File("../data/heidelberg.test.pbf"), dir, listOf(CarProfile(), HgvProfile())).first.close()
+        RoutingGraph.load(dir, mmap = false).use { g ->
+            assertTrue(g.points != null, "il grafo ha il file points")
+            val service = DirectionsService(g)
+            val body = Json.parse("""{"coordinates":[[8.6937,49.4094],[8.7606,49.4186]],"alternative_routes":{"target_count":3,"weight_factor":1.6,"share_factor":0.6},"navmaster":{"roads":true}}""") as Map<String, Any?>
+            val r = service.handle(DirectionsRequest.fromJson("driving-car", body), ResponseFormat.JSON)
+            val routes = r["routes"] as List<*>
+            assertTrue(routes.size in 2..3, "alternative: ${routes.size}")
+            val best = (routes[0] as Map<*, *>)["summary"] as Map<*, *>
+            val alt = (routes[1] as Map<*, *>)["summary"] as Map<*, *>
+            assertTrue((alt["duration"] as Double) >= (best["duration"] as Double) - 1e-6)
+            assertTrue((alt["duration"] as Double) <= (best["duration"] as Double) * 1.6 + 1)
+            // le geometrie differiscono
+            assertTrue((routes[0] as Map<*, *>)["geometry"] != (routes[1] as Map<*, *>)["geometry"])
+            val nm = (routes[0] as Map<*, *>)["navmaster"] as Map<*, *>
+            val roads = nm["roads"] as List<*>
+            assertTrue(roads.any { (it as Map<*, *>)["branches"] != null }, "almeno un incrocio con altre strade")
+            assertTrue(nm["points"] is List<*>)
+            // più di due punti: non ammesso con le alternative (come ORS)
+            val three = Json.parse("""{"coordinates":[[8.6937,49.4094],[8.6757,49.4036],[8.7606,49.4186]],"alternative_routes":{"target_count":2}}""") as Map<String, Any?>
+            assertEquals(RoutingErrorCodes.INCOMPATIBLE_PARAMETERS, assertFailsWith<ApiException> { service.handle(DirectionsRequest.fromJson("driving-car", three), ResponseFormat.JSON) }.code)
+            // strade intorno: i campi per verso
+            val around = RoadsService(g).around("driving-car", 49.4094, 8.6937, 200.0)["roads"] as List<*>
+            assertTrue(around.any { (it as Map<*, *>).containsKey("lanes_ab") || (it as Map<*, *>).containsKey("maxspeed_ab") })
+        }
+    }
 }
