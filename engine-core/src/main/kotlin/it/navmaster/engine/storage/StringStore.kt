@@ -20,12 +20,14 @@ class StringStore(private var da: DataAccess) : Closeable {
         recent[value]?.let { return it }
         var bytes = value.toByteArray(Charsets.UTF_8)
         if (bytes.size > MAX_BYTES) bytes = bytes.copyOf(MAX_BYTES)
-        val ptr = bytePointer
+        var ptr = bytePointer
+        // l'intestazione (2 byte) non deve cavalcare il confine fra due segmenti del DataAccess
+        if ((ptr and (SEGMENT - 1)) == SEGMENT - 1) ptr++
         require(ptr + 2 + bytes.size < Int.MAX_VALUE) { "troppi nomi: deposito pieno" }
         da.ensureCapacity(ptr + 2 + bytes.size)
         da.setShort(ptr, bytes.size.toShort())
         da.setBytes(ptr + 2, bytes, bytes.size)
-        bytePointer += 2 + bytes.size
+        bytePointer = ptr + 2 + bytes.size
         recent[value] = ptr.toInt()
         return ptr.toInt()
     }
@@ -54,7 +56,10 @@ class StringStore(private var da: DataAccess) : Closeable {
 
     override fun close() = da.close()
 
-    companion object { const val MAX_BYTES = 65535 }
+    companion object {
+        const val MAX_BYTES = 65535
+        private const val SEGMENT = DataAccess.DEFAULT_SEGMENT_SIZE.toLong()
+    }
 }
 
 /** File `properties` del grafo: coppie chiave=valore in testo. */
