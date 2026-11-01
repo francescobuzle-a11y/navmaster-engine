@@ -96,4 +96,42 @@ class DirectionsServiceTest {
             assertTrue(status.contains("driving-hgv") && status.contains("\"preparations\""), status)
         }
     }
+    @Test
+    fun `continue_straight keeps the arrival direction at a via point`() {
+        val dir = Files.createTempDirectory("nme-cs").toFile().also { it.deleteOnExit() }
+        val (rg, _) = RoutingGraph.build(File("../data/heidelberg.test.pbf"), dir, listOf(HgvProfile()))
+        rg.use { g ->
+            // andata e ritorno sullo stesso punto: senza continue_straight il secondo tratto può invertire sull'arco del via-point
+            val a = 49.4094 to 8.6937
+            val straight = g.router(it.navmaster.engine.RouteOptions(profile = "driving-hgv", continueStraight = true))
+            val free = g.router(it.navmaster.engine.RouteOptions(profile = "driving-hgv", allowCH = false))
+            assertTrue(!it.navmaster.engine.RouteOptions(continueStraight = true).isStatic)
+            val sA = straight.snap(a.first, a.second, 400.0, 0)
+            var twoWay = 0
+            for (via in listOf(49.4036 to 8.6757, 49.4120 to 8.6850, 49.4060 to 8.6900, 49.4150 to 8.6950, 49.4000 to 8.6800)) {
+                val sV = straight.snap(via.first, via.second, 400.0, 1)
+                if (sV.position == it.navmaster.engine.index.SnapPosition.TOWER) continue
+                val arrival = straight.route(sA, sV).edges.last()
+                // nel verso d'arrivo si prosegue sempre sull'arco del via
+                val onward = straight.route(sV, sA, arrival)
+                assertTrue(onward.edges.first().edge == arrival.edge && onward.edges.first().reverse == arrival.reverse, "con continue_straight si prosegue nel verso d'arrivo")
+                // con un arrivo nel verso opposto si riparte nell'altro verso, se la strada è a doppio senso
+                val flipped = it.navmaster.engine.routing.PathEdge(arrival.edge, !arrival.reverse, arrival.adjNode, arrival.baseNode, arrival.geometry, arrival.distance, arrival.millis, arrival.weight, arrival.name)
+                val opposite = straight.route(sV, sA, flipped)
+                assertTrue(opposite.edges.first().edge == arrival.edge)
+                if (opposite.edges.first().reverse == flipped.reverse) {
+                    twoWay++
+                    assertTrue(onward.distance != opposite.distance)
+                    assertTrue(free.route(sV, sA).distance <= minOf(onward.distance, opposite.distance) + 1e-6)
+                }
+            }
+            assertTrue(twoWay > 0, "nessun via-point su strada a doppio senso")
+            // e dalla API: la richiesta è accettata e il secondo segmento è più lungo del ritorno diretto
+            val service = DirectionsService(g)
+            val body = Json.parse("""{"coordinates":[[8.6937,49.4094],[8.6757,49.4036],[8.6937,49.4094]],"continue_straight":true}""") as Map<String, Any?>
+            val r = service.handle(DirectionsRequest.fromJson("driving-hgv", body), ResponseFormat.JSON)
+            val segs = ((r["routes"] as List<*>)[0] as Map<*, *>)["segments"] as List<*>
+            assertEquals(2, segs.size)
+        }
+    }
 }

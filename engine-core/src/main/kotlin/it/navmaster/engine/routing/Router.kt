@@ -74,14 +74,27 @@ class Router(
         return s
     }
 
-    fun route(from: Snap, to: Snap): RoutePath {
-        val fromParts = splitEdge(from)
-        val toParts = splitEdge(to)
+    /**
+     * Percorso fra due punti agganciati. [arrival]: con `continue_straight`, l'arco (e verso) con cui
+     * il tratto precedente è arrivato in [from]: il nuovo tratto riparte nello stesso verso, senza
+     * invertire sull'arco. Per un aggancio esatto su una torre l'arco d'arrivo è già alle spalle e
+     * nessuna parte viene esclusa.
+     */
+    fun route(from: Snap, to: Snap, arrival: PathEdge? = null): RoutePath {
+        var fromParts = splitEdge(from, asTarget = false)
+        val toParts = splitEdge(to, asTarget = true)
         var best: RoutePath? = null
+        val keepDirection = arrival != null && from.position != SnapPosition.TOWER && arrival.edge == from.edge
+        if (keepDirection) {
+            val same = fromParts.filter { part -> part.reverse == arrival!!.reverse }
+            if (same.isNotEmpty()) fromParts = same
+        }
 
         // caso speciale: stesso arco, tratto diretto fra i due punti
         if (from.edge == to.edge && from.position != SnapPosition.TOWER || (from.edge == to.edge && to.position != SnapPosition.TOWER)) {
             best = sameEdgeRoute(from, to)
+            // continue_straight: il tratto diretto vale solo se prosegue nel verso d'arrivo
+            if (keepDirection && best != null && best.edges.isNotEmpty() && best.edges[0].reverse != arrival!!.reverse) best = null
         }
 
         val sp: SearchPath? = if (ch != null) {
@@ -121,8 +134,11 @@ class Router(
      * Le due estremità raggiungibili da un punto agganciato. Per uno snap su torre c'è un solo
      * elemento a costo zero. Per uno snap a metà arco: verso nodeB nella direzione A→B e verso
      * nodeA nella direzione inversa, ciascuna con peso proporzionale alla frazione di arco.
+     * [asTarget]: il punto è un arrivo, quindi i tratti parziali vengono percorsi verso lo snap
+     * (dalla torre B in direzione B→A con il peso inverso, dalla torre A in direzione A→B): conta per
+     * i sensi unici. `reverse` resta "la torre della parte è A".
      */
-    private fun splitEdge(s: Snap): List<EdgePart> {
+    private fun splitEdge(s: Snap, asTarget: Boolean = false): List<EdgePart> {
         if (s.position == SnapPosition.TOWER) return listOf(EdgePart(s.closestNode, 0.0, 0.0, 0L, PointList().also { it.add(graph.lat(s.closestNode), graph.lon(s.closestNode)) }, s.edge, false))
         val a = graph.nodeA(s.edge); val b = graph.nodeB(s.edge)
         val all = graph.fetchWayGeometry(s.edge, reverse = false, FetchMode.ALL)
@@ -139,10 +155,12 @@ class Router(
         val wFwd = weighting.edgeWeight(it, false); val wBwd = weighting.edgeWeight(it, true)
         val msFwd = weighting.edgeMillis(it, false); val msBwd = weighting.edgeMillis(it, true)
         val parts = ArrayList<EdgePart>(2)
-        // verso B percorrendo A→B (direzione diretta): usa la frazione fracB
-        if (!wFwd.isInfinite()) parts += EdgePart(b, wFwd * fracB, dB, (msFwd * fracB).toLong(), fromSnap, s.edge, false)
-        // verso A percorrendo B→A (direzione inversa): frazione fracA, geometria invertita
-        if (!wBwd.isInfinite()) parts += EdgePart(a, wBwd * fracA, dA, (msBwd * fracA).toLong(), toSnap.also { }, s.edge, true)
+        // partenza: verso B percorrendo A→B (peso diretto); arrivo: da B verso lo snap percorrendo B→A (peso inverso)
+        val wToB = if (asTarget) wBwd else wFwd; val msToB = if (asTarget) msBwd else msFwd
+        if (!wToB.isInfinite()) parts += EdgePart(b, wToB * fracB, dB, (msToB * fracB).toLong(), fromSnap, s.edge, false)
+        // partenza: verso A percorrendo B→A (peso inverso); arrivo: da A verso lo snap percorrendo A→B (peso diretto)
+        val wToA = if (asTarget) wFwd else wBwd; val msToA = if (asTarget) msFwd else msBwd
+        if (!wToA.isInfinite()) parts += EdgePart(a, wToA * fracA, dA, (msToA * fracA).toLong(), toSnap, s.edge, true)
         if (parts.isEmpty()) {
             // arco non percorribile in nessuna direzione per questo peso: la ricerca parte comunque dalle torri a costo zero
             parts += EdgePart(a, 0.0, dA, 0L, toSnap, s.edge, true)

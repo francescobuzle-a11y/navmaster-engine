@@ -61,6 +61,8 @@ class DirectionsRequest(
     val vehicleParameters: VehicleParameters?,
     val avoidPolygons: List<org.locationtech.jts.geom.Polygon>,
     val maximumSpeed: Double,
+    /** ORS `continue_straight`: ai via-point si prosegue nel verso d'arrivo (niente inversione), ricerca non "static". */
+    val continueStraight: Boolean,
     /** Raggio di aggancio per punto in metri (-1 = illimitato → raggio massimo del profilo). */
     val radiuses: DoubleArray?,
     val id: String?,
@@ -136,6 +138,7 @@ class DirectionsRequest(
                 geometry = body["geometry"] as? Boolean ?: true, maneuvers = body["maneuvers"] as? Boolean ?: false,
                 avoidFeatures = avoid, vehicleType = vehicleType, vehicleParameters = params?.takeIf { it.hasAttributes },
                 avoidPolygons = polygons, maximumSpeed = maximumSpeed,
+                continueStraight = body["continue_straight"] as? Boolean ?: false,
                 radiuses = radiuses, id = body["id"]?.toString(), attributes = attributes, extraInfo = extraInfo, echo = body,
             )
         }
@@ -195,6 +198,7 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
             profile = request.profile, weighting = request.preference, avoidFeatures = request.avoidFeatures,
             vehicleType = request.vehicleType, vehicleParameters = request.vehicleParameters,
             avoidPolygons = request.avoidPolygons, maximumSpeed = request.maximumSpeed,
+            continueStraight = request.continueStraight,
         )
         val encoder = try { graphs.encoderName(request.profile) } catch (e: IllegalArgumentException) {
             throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'profile' has incorrect value of '${request.profile}'.")
@@ -218,7 +222,9 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         }
         val legs = ArrayList<RoutePath>()
         for (i in 1 until snaps.size) {
-            try { legs += router.route(snaps[i - 1], snaps[i]) } catch (e: RouteNotFoundException) {
+            // continue_straight: il tratto prosegue nel verso con cui il precedente è arrivato al via-point
+            val arrival = if (request.continueStraight) legs.lastOrNull()?.edges?.lastOrNull() else null
+            try { legs += router.route(snaps[i - 1], snaps[i], arrival) } catch (e: RouteNotFoundException) {
                 throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points ${i - 1} (%.7f %.7f) and $i (%.7f %.7f).".format(
                     request.coordinates[i - 1].second, request.coordinates[i - 1].first, request.coordinates[i].second, request.coordinates[i].first))
             }
