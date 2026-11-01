@@ -54,8 +54,9 @@ class RoutingGraphTest {
                 // con restrizioni del veicolo o avoid_features niente CH: Core
                 assertEquals("core_alt_edge_based", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS)).algorithm)
                 assertEquals("core_alt", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS, turnCosts = false)).algorithm)
-                // ORS: la CH del camion è su "recommended"; una richiesta "shortest" non ha preparazioni
-                assertEquals("dijkstra_edge_based", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST)).algorithm)
+                // anche "shortest" ha le sue preparazioni (CH statica, core con restrizioni)
+                assertEquals("ch", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST)).algorithm)
+                assertEquals("core_alt_edge_based", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST, vehicleParameters = VehicleParameters(height = 4.0))).algorithm)
                 assertEquals("ch", rg.router(RouteOptions(profile = "driving-car", weighting = WeightingMethod.FASTEST, turnCosts = false)).algorithm)
             }
         }
