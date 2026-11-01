@@ -48,6 +48,8 @@ class CoreTest {
                 assertEquals(coreCount, storage.coreNodeCount)
                 assertTrue(coreCount in 1 until g.nodeCount)
                 val ch = CHGraph(g, storage, w)
+                val lm = CoreLandmarks.prepare(ch, w, 8)
+                assertEquals(8, lm.landmarkCount)
                 val rnd = Random(11)
                 val scenarios = listOf(
                     "nessun filtro" to EdgeFilterFactory.create(encoding, "heavyvehicle"),
@@ -55,7 +57,7 @@ class CoreTest {
                     "evita pedaggi e autostrade" to EdgeFilterFactory.create(encoding, "heavyvehicle", avoidFeatures = AvoidFeatureFlags.TOLLWAYS or AvoidFeatureFlags.HIGHWAYS),
                 )
                 for ((label, filter) in scenarios) {
-                    var pairs = 0; var coreVisited = 0L; var plainVisited = 0L
+                    var pairs = 0; var coreVisited = 0L; var altVisited = 0L; var plainVisited = 0L
                     repeat(60) {
                         val s = rnd.nextInt(g.nodeCount); val t = rnd.nextInt(g.nodeCount)
                         // node-based
@@ -63,24 +65,28 @@ class CoreTest {
                         val found = plain.run()
                         val cd = CoreDijkstra(ch, w, filter, null).also { it.addSource(s, 0.0); it.addTarget(t, 0.0) }
                         assertEquals(found, cd.run(), "[$label] raggiungibilità node-based diversa per $s→$t")
+                        val alt = CoreDijkstra(ch, w, filter, null, lm).also { it.addSource(s, 0.0); it.addTarget(t, 0.0) }
+                        assertEquals(found, alt.run(), "[$label] raggiungibilità core-ALT diversa per $s→$t")
                         if (found) {
                             assertTrue(abs(plain.bestWeight - cd.bestWeight) <= 0.01 + plain.bestWeight * 1e-5, "[$label] $s→$t node-based: dijkstra ${plain.bestWeight} vs core ${cd.bestWeight}")
-                            checkPath(g, cd.extractPath()!!, s, t)
-                            pairs++; coreVisited += cd.visitedNodes; plainVisited += plain.visitedNodes
+                            assertTrue(abs(plain.bestWeight - alt.bestWeight) <= 0.01 + plain.bestWeight * 1e-5, "[$label] $s→$t core-ALT: dijkstra ${plain.bestWeight} vs alt ${alt.bestWeight}")
+                            checkPath(g, cd.extractPath()!!, s, t); checkPath(g, alt.extractPath()!!, s, t)
+                            pairs++; coreVisited += cd.visitedNodes; altVisited += alt.visitedNodes; plainVisited += plain.visitedNodes
                         }
                         // edge-based con divieti di svolta
                         val tcp = TurnCostProvider(tc, "heavyvehicle")
                         val eb = EdgeBasedBidirectionalDijkstra(g, w, tcp, filter).also { it.addSource(s, 0.0); it.addTarget(t, 0.0) }
                         val ebFound = eb.run()
-                        val cde = CoreDijkstra(ch, w, filter, tcp).also { it.addSource(s, 0.0); it.addTarget(t, 0.0) }
+                        val cde = CoreDijkstra(ch, w, filter, tcp, lm).also { it.addSource(s, 0.0); it.addTarget(t, 0.0) }
                         assertEquals(ebFound, cde.run(), "[$label] raggiungibilità edge-based diversa per $s→$t")
                         if (ebFound) {
-                            assertTrue(abs(eb.bestWeight - cde.bestWeight) <= 0.01 + eb.bestWeight * 1e-5, "[$label] $s→$t edge-based: dijkstra ${eb.bestWeight} vs core ${cde.bestWeight}")
+                            assertTrue(abs(eb.bestWeight - cde.bestWeight) <= 0.01 + eb.bestWeight * 1e-5, "[$label] $s→$t edge-based core-ALT: dijkstra ${eb.bestWeight} vs core ${cde.bestWeight}")
                             checkPath(g, cde.extractPath()!!, s, t)
                         }
                     }
-                    println("[$label] coppie $pairs, nodi visitati: core ${coreVisited / maxOf(1, pairs)} vs dijkstra ${plainVisited / maxOf(1, pairs)}")
+                    println("[$label] coppie $pairs, nodi visitati: core-ALT ${altVisited / maxOf(1, pairs)}, core ${coreVisited / maxOf(1, pairs)}, dijkstra ${plainVisited / maxOf(1, pairs)}")
                     assertTrue(coreVisited < plainVisited, "[$label] il core dovrebbe visitare meno nodi")
+                    assertTrue(altVisited <= coreVisited, "[$label] i landmark non dovrebbero aumentare i nodi visitati")
                 }
             }
         }

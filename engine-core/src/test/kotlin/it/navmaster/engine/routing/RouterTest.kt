@@ -59,6 +59,15 @@ class RouterTest {
         assertTrue(s.isValid)
         assertTrue(s.distance < 50, "snap a ${s.distance} m")
         assertTrue(index.cells > 100 && index.entries >= graph.edgeCount)
+        // salvataggio e ricarica: stessi risultati
+        val dir = it.navmaster.engine.storage.GraphDirectory(Files.createTempDirectory("nme-idx").toFile().also { it.deleteOnExit() })
+        index.save(dir)
+        val loaded = it.navmaster.engine.index.LocationIndex.load(graph, dir)!!
+        assertEquals(index.cells, loaded.cells); assertEquals(index.entries, loaded.entries)
+        for ((lat, lon) in listOf(bismarckplatz, hauptbahnhof, ziegelhausen)) {
+            val a = index.findClosest(lat, lon); val b = loaded.findClosest(lat, lon)
+            assertEquals(a.edge, b.edge); assertEquals(a.distance, b.distance, 1e-9)
+        }
     }
 
     @Test

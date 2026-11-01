@@ -53,12 +53,14 @@ class Router(
     private val ch: CHGraph? = null,
     /** Se presente (e [ch] è assente), la ricerca usa il Core: CH fuori dal core, filtri e costi di svolta dentro. */
     private val core: CHGraph? = null,
+    /** Landmark del core: la fase 2 diventa un A* bidirezionale (core-ALT). */
+    private val landmarks: it.navmaster.engine.ch.CoreLandmarks? = null,
     private val maxVisitedNodes: Int = Int.MAX_VALUE,
 ) {
     /** Quale algoritmo verrà usato: utile per diagnostica e test. */
     val algorithm: String get() = when {
         ch != null -> "ch"
-        core != null -> if (turnCosts != null) "core_edge_based" else "core"
+        core != null -> (if (landmarks != null) "core_alt" else "core") + (if (turnCosts != null) "_edge_based" else "")
         turnCosts != null -> "dijkstra_edge_based"
         else -> "dijkstra"
     }
@@ -88,7 +90,7 @@ class Router(
             for (p in toParts) algo.addTarget(p.node, p.weight)
             if (algo.run()) algo.extractPath() else null
         } else if (core != null) {
-            val algo = CoreDijkstra(core, weighting, filter, turnCosts)
+            val algo = CoreDijkstra(core, weighting, filter, turnCosts, landmarks)
             for (p in fromParts) algo.addSource(p.node, p.weight)
             for (p in toParts) algo.addTarget(p.node, p.weight)
             if (algo.run()) algo.extractPath() else null

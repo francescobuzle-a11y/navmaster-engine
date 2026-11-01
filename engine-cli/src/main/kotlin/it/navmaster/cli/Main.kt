@@ -33,7 +33,42 @@ fun main(args: Array<String>) {
         "import" -> importGraph(args.drop(1))
         "info" -> info(args.drop(1))
         "route" -> route(args.drop(1))
+        "bench" -> bench(args.drop(1))
         else -> { println("comando sconosciuto: ${args[0]}\n${USAGE.trimIndent()}"); exitProcess(1) }
+    }
+}
+
+/** Misura i tempi medi di calcolo a JVM calda su coppie casuali di nodi, per ciascun algoritmo. */
+private fun bench(args: List<String>) {
+    val positional = args.filter { !it.startsWith("--") }
+    require(positional.size == 1) { "uso: bench <cartella-grafo> [--n=200]" }
+    val n = opt(args, "n")?.toInt() ?: 200
+    RoutingGraph.load(File(positional[0])).use { rg ->
+        val g = rg.graph
+        val rnd = java.util.Random(42)
+        val pairs = (0 until n).map {
+            val a = rnd.nextInt(g.nodeCount); val b = rnd.nextInt(g.nodeCount)
+            doubleArrayOf(g.lat(a), g.lon(a), g.lat(b), g.lon(b))
+        }
+        val scenarios = listOf(
+            "camion, CH (nessuna restrizione)" to RouteOptions(profile = "driving-hgv", turnCosts = false),
+            "camion, Core edge-based (4 m, 40 t, divieti di svolta)" to RouteOptions(profile = "driving-hgv", vehicleParameters = VehicleParameters(height = 4.0, weight = 40.0)),
+            "camion, Dijkstra edge-based (stesse restrizioni, senza preparazioni)" to RouteOptions(profile = "driving-hgv", vehicleParameters = VehicleParameters(height = 4.0, weight = 40.0), allowCH = false),
+            "auto, CH" to RouteOptions(profile = "driving-car", weighting = WeightingMethod.FASTEST, turnCosts = false),
+        )
+        for ((label, options) in scenarios) {
+            val router = rg.router(options)
+            var ok = 0; var totalNs = 0L; var totalKm = 0.0; var maxNs = 0L
+            for ((i, p) in pairs.withIndex()) {
+                val t0 = System.nanoTime()
+                try {
+                    val path = router.route(router.snap(p[0], p[1], 1000.0, 0), router.snap(p[2], p[3], 1000.0, 1))
+                    val dt = System.nanoTime() - t0
+                    if (i >= n / 10) { ok++; totalNs += dt; totalKm += path.distance / 1000; if (dt > maxNs) maxNs = dt } // il primo 10 % scalda la JVM
+                } catch (e: Exception) { /* punto non agganciabile o non raggiungibile */ }
+            }
+            println("%-70s %4d percorsi, media %.1f ms, max %.0f ms, lunghezza media %.0f km (%s)".format(label, ok, totalNs / 1e6 / maxOf(1, ok), maxNs / 1e6, totalKm / maxOf(1, ok), router.algorithm))
+        }
     }
 }
 

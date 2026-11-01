@@ -132,9 +132,41 @@ class LocationIndex private constructor(
         return set.toArray()
     }
 
+    /** Salva l'indice (file `location_index`): intestazione con griglia e checksum del grafo, poi gli array CSR. */
+    fun save(dir: it.navmaster.engine.storage.GraphDirectory) {
+        val da = dir.create("location_index", 1 shl 20)
+        da.setHeader(0, it.navmaster.engine.GRAPH_FORMAT_VERSION)
+        da.setHeader(1, graph.nodeCount xor graph.edgeCount)
+        da.setHeader(2, rows); da.setHeader(3, cols)
+        da.setHeader(4, cellEdges.size)
+        da.setHeader(5, java.lang.Double.doubleToLongBits(minLat).toInt()); da.setHeader(6, (java.lang.Double.doubleToLongBits(minLat) ushr 32).toInt())
+        da.setHeader(7, java.lang.Double.doubleToLongBits(minLon).toInt()); da.setHeader(8, (java.lang.Double.doubleToLongBits(minLon) ushr 32).toInt())
+        da.setHeader(9, java.lang.Double.doubleToLongBits(cellSizeLat).toInt()); da.setHeader(10, (java.lang.Double.doubleToLongBits(cellSizeLat) ushr 32).toInt())
+        val startBytes = cellStart.size.toLong() * 4
+        da.ensureCapacity(startBytes + cellEdges.size.toLong() * 4)
+        for (i in cellStart.indices) da.setInt(i.toLong() * 4, cellStart[i])
+        for (i in cellEdges.indices) da.setInt(startBytes + i.toLong() * 4, cellEdges[i])
+        da.flush(); da.close()
+    }
+
     companion object {
         /** Passo minimo delle celle in gradi (circa 300 m in latitudine). */
         const val MIN_CELL_DEG = 0.0027
+
+        /** Carica l'indice salvato, se esiste e corrisponde al grafo. */
+        fun load(graph: BaseGraph, dir: it.navmaster.engine.storage.GraphDirectory): LocationIndex? {
+            val da = dir.open("location_index", 1 shl 20) ?: return null
+            try {
+                if (da.getHeader(0) != it.navmaster.engine.GRAPH_FORMAT_VERSION || da.getHeader(1) != (graph.nodeCount xor graph.edgeCount)) return null
+                val rows = da.getHeader(2); val cols = da.getHeader(3); val entries = da.getHeader(4)
+                fun dbl(lo: Int, hi: Int) = java.lang.Double.longBitsToDouble((da.getHeader(lo).toLong() and 0xFFFFFFFFL) or (da.getHeader(hi).toLong() shl 32))
+                val minLat = dbl(5, 6); val minLon = dbl(7, 8); val cell = dbl(9, 10)
+                val cellStart = IntArray(rows * cols + 1) { da.getInt(it.toLong() * 4) }
+                val startBytes = cellStart.size.toLong() * 4
+                val cellEdges = IntArray(entries) { da.getInt(startBytes + it.toLong() * 4) }
+                return LocationIndex(graph, minLat, minLon, cell, cell, rows, cols, cellStart, cellEdges)
+            } finally { da.close() }
+        }
 
         fun build(graph: BaseGraph, maxCells: Int = 4_000_000): LocationIndex {
             val b = graph.bounds

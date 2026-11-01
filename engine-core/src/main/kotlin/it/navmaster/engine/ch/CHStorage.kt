@@ -9,10 +9,11 @@ import kotlin.math.roundToLong
 /**
  * Shortcut e livelli di una Contraction Hierarchy node-based (GraphHopper `CHStorage`).
  *
- * Shortcut (20 byte): `nodeA<<1|fwd @0 | nodeB<<1|bwd @4 | peso in millesimi @8 | skip1 @12 | skip2 @16`.
+ * Shortcut (28 byte): `nodeA<<1|fwd @0 | nodeB<<1|bwd @4 | peso in millesimi @8 | skip1 @12 | skip2 @16 | origFirst @20 | origLast @24`.
  * `nodeA` è il nodo di livello più basso; gli shortcut sono scritti in ordine non decrescente di
  * livello(nodeA), così ogni nodo ha un intervallo contiguo `[firstShortcut, lastShortcut]`.
- * skip1/skip2 sono id di arco CH (arco base, oppure `baseEdges + indice shortcut`) nell'orientamento nodeA→nodeB.
+ * skip1/skip2 sono id di arco CH (arco base, oppure `baseEdges + indice shortcut`) nell'orientamento nodeA→nodeB;
+ * origFirst/origLast sono il primo e l'ultimo arco **base** del percorso nodeA→nodeB (per i costi di svolta senza scompattare).
  * Nodo (8 byte): `livello @0 | ultimo shortcut @4` (-1 = nessuno).
  */
 class CHStorage(private val dir: GraphDirectory, val name: String, val baseEdges: Int, val baseNodes: Int) : Closeable {
@@ -33,7 +34,7 @@ class CHStorage(private val dir: GraphDirectory, val name: String, val baseEdges
     fun lastShortcut(node: Int): Int = nodes.getInt(node.toLong() * NODE_BYTES + 4)
 
     /** Aggiunge uno shortcut registrato su [nodeA]; ritorna l'id di arco CH (`baseEdges + indice`). */
-    fun addShortcut(nodeA: Int, nodeB: Int, fwd: Boolean, bwd: Boolean, weight: Double, skip1: Int, skip2: Int): Int {
+    fun addShortcut(nodeA: Int, nodeB: Int, fwd: Boolean, bwd: Boolean, weight: Double, skip1: Int, skip2: Int, origFirst: Int, origLast: Int): Int {
         require(fwd || bwd)
         if (lastNodeA >= 0 && nodeA != lastNodeA) check(level(nodeA) >= level(lastNodeA)) { "shortcut fuori ordine di livello" }
         val idx = shortcutCount++
@@ -43,10 +44,16 @@ class CHStorage(private val dir: GraphDirectory, val name: String, val baseEdges
         shortcuts.setInt(p + 4, (nodeB shl 1) or (if (bwd) 1 else 0))
         shortcuts.setInt(p + 8, encodeWeight(weight))
         shortcuts.setInt(p + 12, skip1); shortcuts.setInt(p + 16, skip2)
+        shortcuts.setInt(p + 20, origFirst); shortcuts.setInt(p + 24, origLast)
         nodes.setInt(nodeA.toLong() * NODE_BYTES + 4, idx)
         lastNodeA = nodeA
         return baseEdges + idx
     }
+
+    /** Primo arco base percorrendo lo shortcut da nodeA verso nodeB. */
+    fun origFirst(sc: Int): Int = shortcuts.getInt(sc.toLong() * SHORTCUT_BYTES + 20)
+    /** Ultimo arco base percorrendo lo shortcut da nodeA verso nodeB. */
+    fun origLast(sc: Int): Int = shortcuts.getInt(sc.toLong() * SHORTCUT_BYTES + 24)
 
     fun isShortcut(chEdge: Int) = chEdge >= baseEdges
     fun shortcutIndex(chEdge: Int) = chEdge - baseEdges
@@ -78,7 +85,7 @@ class CHStorage(private val dir: GraphDirectory, val name: String, val baseEdges
 
     companion object {
         const val NO_SHORTCUT = -1
-        const val SHORTCUT_BYTES = 20L
+        const val SHORTCUT_BYTES = 28L
         const val NODE_BYTES = 8L
         private const val MIN_WEIGHT = 0.001
         private const val MAX_STORED = (Int.MAX_VALUE.toLong() shl 1)

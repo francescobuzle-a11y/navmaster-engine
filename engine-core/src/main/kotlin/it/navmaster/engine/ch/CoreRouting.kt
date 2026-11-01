@@ -73,11 +73,14 @@ class CoreDijkstra(
     private val weighting: Weighting,
     private val filter: EdgeFilter,
     private val turnCosts: TurnCostProvider?,
+    /** Se presenti, la fase 2 è un A* bidirezionale con potenziali ALT ("core-ALT"). */
+    landmarks: CoreLandmarks? = null,
 ) {
     private val base = ch.base
     private val storage = ch.storage
     private val coreLevel = base.nodeCount
     private fun inCore(node: Int) = storage.level(node) >= coreLevel
+    private val potentials: CorePotentials? = landmarks?.takeIf { it.landmarkCount > 0 }?.let { CorePotentials(it) }
 
     private class State {
         val weight = IntDoubleHashMap(1024)
@@ -86,9 +89,10 @@ class CoreDijkstra(
         val settled = IntHashSet(1024)
         val heap = NodeHeap(256)
         fun weightOf(n: Int) = weight.getOrDefault(n, Double.POSITIVE_INFINITY)
-        fun relax(n: Int, w: Double, from: Int, edge: Int): Boolean {
+        /** [key] è la chiave dell'heap (peso più potenziale); [w] il peso reale. */
+        fun relax(n: Int, w: Double, from: Int, edge: Int, key: Double = w): Boolean {
             if (w >= weightOf(n)) return false
-            weight.put(n, w); parentNode.put(n, from); parentEdge.put(n, edge); heap.push(n, w); return true
+            weight.put(n, w); parentNode.put(n, from); parentEdge.put(n, edge); heap.push(n, key); return true
         }
     }
 
@@ -117,24 +121,36 @@ class CoreDijkstra(
             if (!fwd.heap.isEmpty) settlePhase1(fwd, fwdIt, false)
             if (!bwd.heap.isEmpty) settlePhase1(bwd, bwdIt, true)
         }
-        // fase 2: semina gli ingressi al core e cerca dentro con i filtri
+        // fase 2: semina gli ingressi al core e cerca dentro con i filtri (A* bilanciato se ci sono i landmark)
+        potentials?.let { p ->
+            for (c in fwd.weight) if (inCore(c.key) && fwd.settled.contains(c.key)) p.addSource(c.key, c.value)
+            for (c in bwd.weight) if (inCore(c.key) && bwd.settled.contains(c.key)) p.addTarget(c.key, c.value)
+        }
         seedCore(fwd, cFwd, reverse = false)
         seedCore(bwd, cBwd, reverse = true)
         while (!cFwd.heap.isEmpty || !cBwd.heap.isEmpty) {
             val fk = if (cFwd.heap.isEmpty) Double.POSITIVE_INFINITY else cFwd.heap.peekKey()
             val bk = if (cBwd.heap.isEmpty) Double.POSITIVE_INFINITY else cBwd.heap.peekKey()
+            // con p_b = −p_f le chiavi di un incontro sommano al peso reale: la condizione resta esatta
             if (fk + bk >= bestWeight) break
             if (fk <= bk) settleCore(cFwd, false) else settleCore(cBwd, true)
         }
         return meetingNode >= 0 || coreMet
     }
 
+    /** Chiave dell'heap per un nodo: peso più potenziale (segno opposto per la ricerca all'indietro). */
+    private fun heapKey(w: Double, node: Int, reverse: Boolean): Double {
+        val p = potentials ?: return w
+        val pf = p.forward(node)
+        return if (reverse) w - pf else w + pf
+    }
+
     /** Registra una chiave di fase 2 nel suo nodo (una sola volta) e verifica gli incontri. */
     private fun relaxCore(s: State, key: Int, w: Double, from: Int, edge: Int, reverse: Boolean) {
         val isNew = !s.weight.containsKey(key)
-        if (!s.relax(key, w, from, edge)) return
+        val node = if (edgeBased) keyNode(key, reverse) else key
+        if (!s.relax(key, w, from, edge, heapKey(w, node, reverse))) return
         if (edgeBased && isNew) {
-            val node = keyNode(key, reverse)
             val map = if (reverse) cBwdAtNode else cFwdAtNode
             (map.get(node) ?: com.carrotsearch.hppc.IntArrayList().also { map.put(node, it) }).add(key)
         }
@@ -177,14 +193,14 @@ class CoreDijkstra(
     /** Chiave fittizia per un nodo del core che è sorgente diretta (nessun arco di arrivo): negativa, mai confusa con una chiave d'arco. */
     private fun virtualKey(node: Int) = -(node + 2)
 
-    /** Arco base con cui la ricerca di fase 1 è arrivata a [node] (scompattando l'ultimo arco CH), o -1. */
+    /** Arco base con cui la ricerca di fase 1 è arrivata a [node], o -1. */
     private fun lastBaseEdge(s: State, node: Int): Int {
         val chEdge = s.parentEdge.getOrDefault(node, -1)
         if (chEdge < 0) return -1
+        if (!storage.isShortcut(chEdge)) return chEdge
+        val sc = storage.shortcutIndex(chEdge)
         val parent = s.parentNode.get(node)
-        val out = ArrayList<Int>()
-        ch.unpack(chEdge, parent, out)
-        return out.last()
+        return if (storage.nodeA(sc) == parent) storage.origLast(sc) else storage.origFirst(sc)
     }
 
     /** Chiave d'arco di [edge] nel verso di percorrenza del viaggio che arriva a (fwd) o parte da (bwd) [node]. */
@@ -204,9 +220,6 @@ class CoreDijkstra(
     }
 
     private val coreIt = ch.iterator()
-    private val unpackBuf = ArrayList<Int>()
-    /** Cache (arco CH, nodo di partenza) → (primo arco base, ultimo arco base) per i costi di svolta sugli shortcut. */
-    private val endsCache = HashMap<Long, Long>()
 
     /**
      * Fase 2: dal nodo del core espande gli archi base verso altri nodi del core (con il filtro della
@@ -227,7 +240,12 @@ class CoreDijkstra(
             var ew = coreIt.weight
             var firstBase = chEdge; var lastBase = chEdge
             if (coreIt.isShortcut) {
-                if (edgeBased) { val ends = shortcutEnds(chEdge, node); firstBase = (ends ushr 32).toInt(); lastBase = ends.toInt() }
+                if (edgeBased) {
+                    // primo/ultimo arco base memorizzati nell'orientamento nodeA→nodeB del record
+                    val sc = storage.shortcutIndex(chEdge)
+                    if (storage.nodeA(sc) == node) { firstBase = storage.origFirst(sc); lastBase = storage.origLast(sc) }
+                    else { firstBase = storage.origLast(sc); lastBase = storage.origFirst(sc) }
+                }
             } else {
                 baseIt.setEdge(chEdge, node)
                 if (!filter.accept(baseIt)) continue
@@ -245,14 +263,6 @@ class CoreDijkstra(
         }
     }
 
-    /** Primo e ultimo arco base di uno shortcut percorso da [fromNode], impacchettati in un long. */
-    private fun shortcutEnds(chEdge: Int, fromNode: Int): Long {
-        val k = (chEdge.toLong() shl 32) or (fromNode.toLong() and 0xFFFFFFFFL)
-        return endsCache.getOrPut(k) {
-            unpackBuf.clear(); ch.unpack(chEdge, fromNode, unpackBuf)
-            (unpackBuf.first().toLong() shl 32) or (unpackBuf.last().toLong() and 0xFFFFFFFFL)
-        }
-    }
 
     /** Chiave d'arco nel verso del viaggio: in avanti coincide con l'iteratore, all'indietro è l'opposto. */
     private fun travelKey(it: BaseGraph.EdgeIterator, reverse: Boolean): Int = (it.edge shl 1) or (if (it.reverse != reverse) 1 else 0)

@@ -320,6 +320,29 @@ class CHPreparation(
         return s
     }
 
+    /** Primo arco base dell'arc percorso nel suo verso (from→to). */
+    private fun firstBaseOf(arc: Int): Int {
+        if (pg.isBaseArc(arc)) return pg.baseEdgeOf(arc)
+        val sc = storage.shortcutIndex(pg.storedId[arc])
+        // il record è orientato nodeA→nodeB: se l'arc parte da nodeA il primo è origFirst, altrimenti origLast
+        return if (storage.nodeA(sc) == pg.from[arc]) storage.origFirst(sc) else storage.origLast(sc)
+    }
+
+    private fun lastBaseOf(arc: Int): Int {
+        if (pg.isBaseArc(arc)) return pg.baseEdgeOf(arc)
+        val sc = storage.shortcutIndex(pg.storedId[arc])
+        return if (storage.nodeA(sc) == pg.from[arc]) storage.origLast(sc) else storage.origFirst(sc)
+    }
+
+    /** Scrive un arc di shortcut u→w registrato su [nodeA] (= u se out, = w se in), con l'orientamento del record. */
+    private fun writeArc(arc: Int, nodeA: Int, fwd: Boolean, bwd: Boolean): Int {
+        val from = pg.from[arc]; val to = pg.to[arc]
+        val s1 = chEdgeOf(pg.skip1[arc]); val s2 = chEdgeOf(pg.skip2[arc])
+        val first = firstBaseOf(pg.skip1[arc]); val last = lastBaseOf(pg.skip2[arc])
+        return if (nodeA == from) storage.addShortcut(from, to, fwd, bwd, pg.weight[arc], s1, s2, first, last)
+        else storage.addShortcut(to, from, fwd, bwd, pg.weight[arc], s2, s1, last, first) // orientamento invertito
+    }
+
     /** Scrive nello storage gli shortcut (non base) incidenti a [v], unendo le coppie uguali nei due versi. */
     private fun writeShortcutsIncidentTo(v: Int) {
         // uscenti v→w: fwd
@@ -330,22 +353,18 @@ class CHPreparation(
                 // esiste il gemello w→v con stesso peso e stessi archi saltati (in ordine inverso)?
                 val twin = pg.findArc(w, v)
                 if (twin >= 0 && pg.storedId[twin] < 0 && pg.weight[twin] == pg.weight[a] && sameSkipped(a, twin)) {
-                    val id = storage.addShortcut(v, w, fwd = true, bwd = true, pg.weight[a], chEdgeOf(pg.skip1[a]), chEdgeOf(pg.skip2[a]))
+                    val id = writeArc(a, v, fwd = true, bwd = true)
                     pg.storedId[a] = id; pg.storedId[twin] = id
                 } else {
-                    pg.storedId[a] = storage.addShortcut(v, w, fwd = true, bwd = false, pg.weight[a], chEdgeOf(pg.skip1[a]), chEdgeOf(pg.skip2[a]))
+                    pg.storedId[a] = writeArc(a, v, fwd = true, bwd = false)
                 }
             }
             a = pg.nextOut(a)
         }
-        // entranti u→v non ancora scritti: bwd rispetto a nodeA = v
+        // entranti u→v non ancora scritti: bwd rispetto a nodeA = v (orientamento del record invertito)
         a = pg.headIn[v]
         while (a >= 0) {
-            if (!pg.isBaseArc(a) && pg.storedId[a] < 0) {
-                val u = pg.from[a]
-                // skip memorizzati nell'orientamento nodeA(v)→nodeB(u): cioè l'inverso dell'arc u→v
-                pg.storedId[a] = storage.addShortcut(v, u, fwd = false, bwd = true, pg.weight[a], chEdgeOf(pg.skip2[a]), chEdgeOf(pg.skip1[a]))
-            }
+            if (!pg.isBaseArc(a) && pg.storedId[a] < 0) pg.storedId[a] = writeArc(a, v, fwd = false, bwd = true)
             a = pg.nextIn(a)
         }
     }
@@ -371,20 +390,17 @@ class CHPreparation(
                     val w = pg.to[a]
                     val twin = pg.findArc(w, v)
                     if (twin >= 0 && pg.weight[twin] == pg.weight[a] && sameSkipped(a, twin)) {
-                        storage.addShortcut(v, w, fwd = true, bwd = true, pg.weight[a], chEdgeOf(pg.skip1[a]), chEdgeOf(pg.skip2[a]))
+                        writeArc(a, v, fwd = true, bwd = true)
                         handled.add(twin)
                     } else {
-                        storage.addShortcut(v, w, fwd = true, bwd = false, pg.weight[a], chEdgeOf(pg.skip1[a]), chEdgeOf(pg.skip2[a]))
+                        writeArc(a, v, fwd = true, bwd = false)
                     }
                 }
                 a = pg.nextOut(a)
             }
             a = pg.headIn[v]
             while (a >= 0) {
-                if (!pg.isBaseArc(a) && a !in handled) {
-                    val u = pg.from[a]
-                    storage.addShortcut(v, u, fwd = false, bwd = true, pg.weight[a], chEdgeOf(pg.skip2[a]), chEdgeOf(pg.skip1[a]))
-                }
+                if (!pg.isBaseArc(a) && a !in handled) writeArc(a, v, fwd = false, bwd = true)
                 a = pg.nextIn(a)
             }
         }

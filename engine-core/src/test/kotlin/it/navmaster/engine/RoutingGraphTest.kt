@@ -35,7 +35,7 @@ class RoutingGraphTest {
                 // Core (con restrizioni e divieti di svolta) vs Dijkstra edge-based filtrato: stesso peso
                 val params = VehicleParameters(height = 4.0, weight = 12.0)
                 val coreRouter = rg.router(RouteOptions(profile = "driving-hgv", vehicleParameters = params))
-                assertEquals("core_edge_based", coreRouter.algorithm)
+                assertEquals("core_alt_edge_based", coreRouter.algorithm)
                 val ebRouter = rg.router(RouteOptions(profile = "driving-hgv", vehicleParameters = params, allowCH = false))
                 assertEquals("dijkstra_edge_based", ebRouter.algorithm)
                 val c1 = coreRouter.route(coreRouter.snap(a.first, a.second, 400.0, 0), coreRouter.snap(b.first, b.second, 400.0, 1))
@@ -52,8 +52,8 @@ class RoutingGraphTest {
                 assertTrue(abs(p1.weight - p2.weight) <= 0.05 + p2.weight * 1e-4, "CH ${p1.weight} vs Dijkstra ${p2.weight}")
                 assertEquals(p2.distance, p1.distance, p2.distance * 0.01)
                 // con restrizioni del veicolo o avoid_features niente CH: Core
-                assertEquals("core_edge_based", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS)).algorithm)
-                assertEquals("core", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS, turnCosts = false)).algorithm)
+                assertEquals("core_alt_edge_based", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS)).algorithm)
+                assertEquals("core_alt", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS, turnCosts = false)).algorithm)
                 // ORS: la CH del camion è su "recommended"; una richiesta "shortest" non ha preparazioni
                 assertEquals("dijkstra_edge_based", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST)).algorithm)
                 assertEquals("ch", rg.router(RouteOptions(profile = "driving-car", weighting = WeightingMethod.FASTEST, turnCosts = false)).algorithm)

@@ -4,6 +4,7 @@ import it.navmaster.engine.ch.CHGraph
 import it.navmaster.engine.ch.CHPreparation
 import it.navmaster.engine.ch.CHStorage
 import it.navmaster.engine.ch.CoreEdgeSelector
+import it.navmaster.engine.ch.CoreLandmarks
 import it.navmaster.engine.index.LocationIndex
 import it.navmaster.engine.weighting.Weighting
 import it.navmaster.engine.osm.ImportOptions
@@ -71,6 +72,8 @@ class RoutingGraph private constructor(
 
     /** CH disponibili, per chiave `<encoder>_<weighting>` (es. `heavyvehicle_recommended`). */
     val chStorages = LinkedHashMap<String, CHStorage>()
+    /** Landmark del core, per chiave della preparazione core. */
+    val landmarks = LinkedHashMap<String, CoreLandmarks>()
 
     val profileNames: List<String> get() = encoding.profiles.map { it.profile.name }
 
@@ -83,7 +86,7 @@ class RoutingGraph private constructor(
      * Prepara per ogni profilo la CH completa (richieste "statiche") e il Core (richieste con restrizioni,
      * avoid_features o divieti di svolta), come le preparazioni `ch` e `core` di ORS, e le salva.
      */
-    fun prepareCH(log: ((String) -> Unit)? = null, withCore: Boolean = true) {
+    fun prepareCH(log: ((String) -> Unit)? = null, withCore: Boolean = true, landmarkCount: Int = 16) {
         for (pe in encoding.profiles) {
             val name = pe.profile.name
             val w = WeightingFactory.create(encoding, pe, defaultCHWeighting(name))
@@ -105,6 +108,11 @@ class RoutingGraph private constructor(
                 coreStorage.flush()
                 log?.invoke("Core $coreKey: ${coreStorage.coreNodeCount} nodi nel core (${100 * coreStorage.coreNodeCount / maxOf(1, graph.nodeCount)} %), ${coreStorage.shortcutCount} shortcut in ${System.currentTimeMillis() - t0} ms")
                 chStorages[coreKey] = coreStorage
+                t0 = System.currentTimeMillis()
+                val lm = CoreLandmarks.prepare(CHGraph(graph, coreStorage, w), w, landmarkCount)
+                lm.save(GraphDirectory(dir, mmap = false), coreKey)
+                landmarks[coreKey] = lm
+                log?.invoke("Landmark $coreKey: ${lm.landmarkCount} in ${System.currentTimeMillis() - t0} ms")
             }
         }
         GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); set("ch", chStorages.keys.joinToString(",")); save() }
@@ -127,7 +135,8 @@ class RoutingGraph private constructor(
         // come `RoutingRequest.setSpeedups` di ORS: CH per le richieste statiche, altrimenti Core se preparato, altrimenti Dijkstra
         val ch = if (options.allowCH && options.isStatic) chStorages[key]?.let { CHGraph(graph, it, weighting) } else null
         val core = if (ch == null && options.allowCH && !options.needsFullSearch) chStorages["${key}_core"]?.let { CHGraph(graph, it, weighting) } else null
-        return Router(graph, index, weighting, filter, tcp, ch, core)
+        val lm = if (core != null) landmarks["${key}_core"] else null
+        return Router(graph, index, weighting, filter, tcp, ch, core, lm)
     }
 
     fun flush() { graph.flush(); turnCosts.flush(); GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); save() } }
@@ -151,6 +160,7 @@ class RoutingGraph private constructor(
             val stats = OsmGraphImporter(graph, encoding, tc, importOptions).import(pbf)
             rg.flush()
             rg.index = LocationIndex.build(graph)
+            rg.index.save(gdir)
             return rg to stats
         }
 
@@ -169,8 +179,9 @@ class RoutingGraph private constructor(
             for (key in (props.get("ch") ?: "").split(',').filter { it.isNotBlank() }) {
                 val st = CHStorage(gdir, key, graph.edgeCount, graph.nodeCount)
                 if (st.loadExisting()) rg.chStorages[key] = st else st.close()
+                if (key.endsWith("_core")) CoreLandmarks.load(gdir, key, graph.nodeCount)?.let { rg.landmarks[key] = it }
             }
-            rg.index = LocationIndex.build(graph)
+            rg.index = LocationIndex.load(graph, gdir) ?: LocationIndex.build(graph)
             return rg
         }
     }

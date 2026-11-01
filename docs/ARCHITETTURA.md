@@ -65,7 +65,8 @@ con ORS vanno documentati con numeri, non promesse.
 | 1g | Via-point, bearings, percorsi alternativi, round trip | |
 | 2a | Contraction Hierarchies node-based: preparazione (ordinamento euristico GraphHopper), storage, query con stall-on-demand, scompattamento | ✅ Heidelberg: 10.059 shortcut, preparazione 0,15 s, query 0,05 ms vs 2,7 ms (−98 % nodi visitati), pesi identici |
 | 2b | Core: archi con restrizioni, pedaggi, autostrade, velocità > 80, divieti di svolta non contratti; query CH fuori dal core + Dijkstra filtrato dentro, node- o edge-based | ✅ Heidelberg: core 14 % dei nodi, pesi identici al Dijkstra filtrato (3 scenari), −76 % nodi visitati. Vedi [verifiche-stranezze.md](analisi/verifiche-stranezze.md) per i due errori trovati dai test |
-| 2c | Landmarks (ALT) e selezione algoritmo per richiesta come `RoutingRequest.setSpeedups` | |
+| 2c | Landmark nel core (core-ALT): 16 landmark "farthest", distanze per i nodi del core, A* bidirezionale bilanciato in fase 2 con arresto esatto (`key_f + key_b ≥ best`); selezione algoritmo per richiesta come `setSpeedups` | ✅ Heidelberg: 229 nodi visitati vs 968 (Core) vs 4.081 (Dijkstra), pesi identici |
+| — | Benchmark Lombardia (936.496 nodi, 1.127.802 archi, import 32 s): CH 0,8 ms (camion) / 0,4 ms (auto) per percorsi di ~100 km; Core **senza** landmark 567 ms (più lento del Dijkstra edge-based, 374 ms): è il motivo dei landmark. Da ripetere con core-ALT appena c'è spazio su disco | in corso |
 | 3 | Matrici (RPHAST), isocrone, snapping API | |
 | 1h | `avoid_polygons`, `maximum_speed`, `extra_info` (tollways, waycategory, waytype, surface, roadaccessrestrictions, osmid, avgspeed), opzione `--no-width-from-carriageway`, chiave API, Docker | ✅ |
 | — | Benchmark su estratto regionale/nazionale, confronto numerico con un'istanza ORS | Lombardia in corso |
