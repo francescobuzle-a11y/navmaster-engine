@@ -1,0 +1,14 @@
+services:
+  navmaster-engine:
+    build: .
+    image: navmaster-engine:latest
+    restart: unless-stopped
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./graphs/lombardia:/graph
+      - ./data:/data
+    environment:
+      JAVA_OPTS: "-Xmx3g"
+      IMPORT_PBF: /data/lombardia.osm.pbf   # usato solo se /graph è vuoto
+      NAVMASTER_API_KEY: ""                  # vuoto = nessuna chiave richiesta

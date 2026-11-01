@@ -1,0 +1,15 @@
+.gradle/
+build/
+out/
+*.class
+*.log
+.DS_Store
+.idea/
+*.iml
+.kotlin/
+
+# graphs and map data are never committed
+graphs/
+data/*.pbf
+data/*.osm
+data/*.ghz

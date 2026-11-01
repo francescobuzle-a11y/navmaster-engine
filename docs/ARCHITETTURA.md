@@ -1,0 +1,77 @@
+# navmaster-engine — architettura
+
+Motore di routing scritto da zero in Kotlin che riproduce la logica di calcolo di
+openrouteservice (ORS 10.2) e del suo fork di GraphHopper (GIScience v4.16), con l'obiettivo
+di essere più compatto ed efficiente su scala continentale.
+
+Le analisi dei due progetti sorgente sono in [`docs/analisi/`](analisi/).
+
+## Vincoli di progetto
+
+| Vincolo | Scelta |
+|---|---|
+| Deve girare sul server (continenti) **e** dentro l'app Android NavMaster (singole regioni) | Kotlin/JVM, target JVM 17, modulo `engine-core` senza dipendenze da server |
+| Grafi da decine di GB | Storage a segmenti memory-mapped, nessun oggetto per nodo/arco, collezioni primitive (hppc) |
+| Compatibilità con il client ORS già presente in OsmAnd | `engine-server` espone `/ors/v2/directions/{profile}` con lo stesso JSON/GeoJSON |
+| Licenza | Il codice segue da vicino ORS/GraphHopper (LGPL/Apache): il progetto resta sotto licenza compatibile (LGPL-3.0) |
+
+## Moduli
+
+```
+engine-core    grafo, import OSM, valori codificati, profili, pesi, algoritmi, servizi
+engine-cli     import <pbf> <graph-dir>, route, benchmark
+engine-server  HTTP (Ktor) compatibile ORS v2
+```
+
+## Strati di `engine-core`
+
+```
+ osm/        OsmWay, OsmValues (parsing tag), lettore PBF (2 passate)
+ profile/    VehicleProfile → CarProfile, HgvProfile: accesso, velocità, priorità, barriere
+             WayAttributeParser → WayAttributes (dimensioni, accessi hgv, hazmat, pedaggi, …)
+             SpeedTables (generate dai JSON di ORS)
+ storage/    DataAccess (RAM / MMAP, segmenti, little-endian)
+             EncodedValue* (bit packing per arco, due direzioni)
+             BaseGraph (nodi, archi, geometria, bbox), TurnCostStorage, LocationIndex
+ weighting/  Fastest, Shortest, Priority(recommended), LimitedAccess, filtri archi (HGV, avoid_*)
+ routing/    Dijkstra/A* bidirezionali, CH, Core (core-ALT), Landmarks, istruzioni
+ api/        modello richiesta/risposta ORS, codici errore
+```
+
+## Decisioni che differiscono da GraphHopper/ORS (per efficienza)
+
+1. **Un solo formato di file** con intestazione fissa e versione (`GRAPH_FORMAT_VERSION`); i dati sono
+   little-endian anche nell'intestazione (GraphHopper mescola big e little endian).
+2. **Coda di priorità con decrease-key** (heap indicizzato su array) invece di `PriorityQueue` con
+   `remove()` lineare.
+3. **Nessuna allocazione per nodo visitato**: le ricerche usano array paralleli (peso, genitore,
+   arco) indicizzati per nodo/arco invece di oggetti `SPTEntry`.
+4. **Core-ALT nativo**: il "core" è un attributo del formato CH, non un adattamento a posteriori.
+5. **Costruzione parallela** del grafo e delle preparazioni per regione.
+
+Ogni scelta va misurata: il modulo `engine-cli` include un benchmark riproducibile e i confronti
+con ORS vanno documentati con numeri, non promesse.
+
+## Fasi
+
+| Fase | Contenuto | Stato |
+|---|---|---|
+| 1a | Tag OSM, tabelle velocità, profili auto/camion, attributi per arco | ✅ |
+| 1b | Storage: DataAccess (RAM/MMAP), valori codificati, BaseGraph, geometria, nomi | ✅ |
+| 1c | Import PBF a due passate, torri/pillar, barriere sdoppiate, raccolta divieti di svolta | ✅ Heidelberg: 221k nodi OSM → 17k nodi / 21k archi in 0,7 s |
+| 1d | Indice spaziale a griglia, snapping, pesi fastest/shortest/recommended + accesso limitato, filtri HGV e avoid_features, Dijkstra bidirezionale, ricostruzione percorso | ✅ 52 test |
+| 1e | Istruzioni (porting di `InstructionsFromEdges`: svolte, rotatorie con uscite, keep left/right, inversioni), passi ORS con testi it/en e manovre, via-point, risposta JSON/GeoJSON con `metadata`, codici errore 2xxx, server Ktor `/ors/v2/directions|health|status` | ✅ compatibile con il client ORS di OsmAnd |
+| 1f | Divieti di svolta (turn cost storage, ricerca edge-based, u-turn vietati) | ✅ Heidelberg: 453/476 relazioni applicate, 3 percorsi su 12 cambiano |
+| 1g | Via-point, bearings, percorsi alternativi, round trip | |
+| 2a | Contraction Hierarchies node-based: preparazione (ordinamento euristico GraphHopper), storage, query con stall-on-demand, scompattamento | ✅ Heidelberg: 10.059 shortcut, preparazione 0,15 s, query 0,05 ms vs 2,7 ms (−98 % nodi visitati), pesi identici |
+| 2b | Core: archi con restrizioni, pedaggi, autostrade, velocità > 80, divieti di svolta non contratti; query CH fuori dal core + Dijkstra filtrato dentro, node- o edge-based | ✅ Heidelberg: core 14 % dei nodi, pesi identici al Dijkstra filtrato (3 scenari), −76 % nodi visitati. Vedi [verifiche-stranezze.md](analisi/verifiche-stranezze.md) per i due errori trovati dai test |
+| 2c | Landmarks (ALT) e selezione algoritmo per richiesta come `RoutingRequest.setSpeedups` | |
+| 3 | Matrici (RPHAST), isocrone, snapping API | |
+| 1h | `avoid_polygons`, `maximum_speed`, `extra_info` (tollways, waycategory, waytype, surface, roadaccessrestrictions, osmid, avgspeed), opzione `--no-width-from-carriageway`, chiave API, Docker | ✅ |
+| — | Benchmark su estratto regionale/nazionale, confronto numerico con un'istanza ORS | Lombardia in corso |
+| 4 | Profili bici/pedoni/sedia a rotelle, dati esterni (confini, altimetria), traffico | |
+
+## Ambiente di sviluppo
+
+Mac M1, 8 GB RAM, poco disco: i test usano `data/heidelberg.test.pbf` (2,4 MB, lo stesso di ORS).
+I grafi nazionali/continentali vanno costruiti su un server.
