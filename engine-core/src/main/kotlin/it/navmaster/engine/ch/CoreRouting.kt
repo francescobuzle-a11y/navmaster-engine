@@ -16,8 +16,14 @@ import it.navmaster.engine.weighting.TurnCostProvider
 import it.navmaster.engine.weighting.Weighting
 
 /**
- * Decide quali archi finiscono nel "core" (ORS `*CoreEdgeFilter`): un arco è nel core se potrà
- * essere escluso o pesato diversamente da una richiesta. Entrambi i suoi nodi non vengono contratti.
+ * Decide quali archi finiscono nel "core": un arco è nel core se potrà essere escluso da una
+ * richiesta con le misure del mezzo (limiti, merci pericolose, tipi di mezzo pesante) o se ha un
+ * divieto di svolta a un estremo. Entrambi i suoi nodi non vengono contratti.
+ *
+ * A differenza del core di ORS, autostrade, pedaggi, traghetti, guadi e le strade oltre gli 80 km/h
+ * restano fuori: metterli nel core (che nella preparazione non può usarli come testimoni) fa
+ * esplodere il numero di shortcut e i tempi di costruzione sui Paesi grandi. Le richieste con
+ * `avoid_features` o `maximum_speed` usano la ricerca piena (stessi risultati, più lenta).
  */
 class CoreEdgeSelector(
     private val encoding: GraphEncoding,
@@ -31,20 +37,12 @@ class CoreEdgeSelector(
     private val isHgv = profileName == "heavyvehicle"
 
     fun isCoreEdge(it: BaseGraph.EdgeIterator): Boolean {
-        // avoid_features: autostrade, pedaggi, traghetti, guadi
-        if (it.get(sh.motorway) || it.get(sh.ford)) return true
-        val wt = it.get(sh.wayType)
-        if (wt == WayType.FERRY || wt == WayType.STEPS) return true
-        val toll = it.get(sh.toll)
-        if (toll == Toll.ALL || (isHgv && toll == Toll.HGV)) return true
         // restrizioni per mezzi pesanti
         if (isHgv) {
             if (it.get(sh.hgvBlocked) != 0 || it.get(sh.hazmatForbidden)) return true
             if (it.get(sh.maxHeight).isFinite() || it.get(sh.maxWidth).isFinite() || it.get(sh.maxLength).isFinite() ||
                 it.get(sh.maxWeight).isFinite() || it.get(sh.maxAxleLoad).isFinite()) return true
         }
-        // velocità massima impostabile dalla richiesta
-        if (it.get(pe.speed) > maximumSpeedLowerBound || it.getReverse(pe.speed) > maximumSpeedLowerBound) return true
         // divieti di svolta a uno dei due estremi
         if (turnCosts != null && (turnCosts.hasEntries(it.baseNode) || turnCosts.hasEntries(it.adjNode))) return true
         return false

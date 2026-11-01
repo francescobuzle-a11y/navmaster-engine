@@ -52,8 +52,9 @@ class RoutingGraphTest {
                 assertTrue(abs(p1.weight - p2.weight) <= 0.05 + p2.weight * 1e-4, "CH ${p1.weight} vs Dijkstra ${p2.weight}")
                 assertEquals(p2.distance, p1.distance, p2.distance * 0.01)
                 // con restrizioni del veicolo o avoid_features niente CH: Core
-                assertEquals("core_alt_edge_based", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS)).algorithm)
-                assertEquals("core_alt", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS, turnCosts = false)).algorithm)
+                // avoid_features tocca archi fuori dal core: ricerca piena
+                assertEquals("dijkstra_edge_based", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS)).algorithm)
+                assertEquals("dijkstra", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS, turnCosts = false)).algorithm)
                 // anche "shortest" ha le sue preparazioni (CH statica, core con restrizioni)
                 assertEquals("ch", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST)).algorithm)
                 assertEquals("core_alt_edge_based", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST, vehicleParameters = VehicleParameters(height = 4.0))).algorithm)

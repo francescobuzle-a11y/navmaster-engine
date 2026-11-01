@@ -58,8 +58,11 @@ data class RouteOptions(
     val isStatic: Boolean get() = avoidFeatures == 0 && (vehicleParameters == null || !vehicleParameters.hasAttributes) &&
         vehicleType == HeavyVehicleAttributes.HGV && avoidPolygons.isEmpty() && maximumSpeed.isInfinite() && !continueStraight
 
-    /** ORS "non decreasing weights": i poligoni possono toccare qualunque arco, quindi niente CH né Core. */
-    val needsFullSearch: Boolean get() = avoidPolygons.isNotEmpty()
+    /**
+     * Niente CH né Core: i poligoni possono toccare qualunque arco (ORS "non decreasing weights");
+     * `avoid_features` e `maximum_speed` toccano archi fuori dal nostro core (vedi [CoreEdgeSelector]).
+     */
+    val needsFullSearch: Boolean get() = avoidPolygons.isNotEmpty() || avoidFeatures != 0 || maximumSpeed.isFinite()
 }
 
 /**

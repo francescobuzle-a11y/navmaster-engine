@@ -54,7 +54,7 @@ class CoreTest {
                 val scenarios = listOf(
                     "nessun filtro" to EdgeFilterFactory.create(encoding, "heavyvehicle"),
                     "altezza 4 m, peso 12 t" to EdgeFilterFactory.create(encoding, "heavyvehicle", params = VehicleParameters(height = 4.0, weight = 12.0)),
-                    "evita pedaggi e autostrade" to EdgeFilterFactory.create(encoding, "heavyvehicle", avoidFeatures = AvoidFeatureFlags.TOLLWAYS or AvoidFeatureFlags.HIGHWAYS),
+                    "mezzo da 3 m e 7,5 t" to EdgeFilterFactory.create(encoding, "heavyvehicle", params = VehicleParameters(height = 3.0, weight = 7.5)),
                 )
                 for ((label, filter) in scenarios) {
                     var pairs = 0; var coreVisited = 0L; var altVisited = 0L; var plainVisited = 0L
