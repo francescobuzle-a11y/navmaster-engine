@@ -95,9 +95,9 @@ class RoutingGraph private constructor(
      * avoid_features o divieti di svolta), come le preparazioni `ch` e `core` di ORS, e le salva.
      */
     fun prepareCH(log: ((String) -> Unit)? = null, withCore: Boolean = true, landmarkCount: Int = 16) {
-        for (pe in encoding.profiles) {
+        for (pe in encoding.profiles) for (method in listOf(defaultCHWeighting(pe.profile.name), WeightingMethod.SHORTEST)) {
             val name = pe.profile.name
-            val w = WeightingFactory.create(encoding, pe, defaultCHWeighting(name))
+            val w = WeightingFactory.create(encoding, pe, method)
             val key = chKey(name, w)
             val storage = CHStorage(GraphDirectory(dir, mmap = false), key, graph.edgeCount, graph.nodeCount)
             var t0 = System.currentTimeMillis()

@@ -197,6 +197,8 @@ data class DirectionsLimits(
     val maximumDistance: Double = 100_000.0,
     val maximumDistanceDynamicWeights: Double = 100_000.0,
     val maximumSnappingRadius: Double = 400.0,
+    /** ORS `maximum_distance_alternative_routes`: oltre questa distanza in linea d'aria niente alternative. */
+    val maximumDistanceAlternativeRoutes: Double = 100_000.0,
 )
 
 /**
@@ -225,6 +227,7 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         }
         val maxDist = if (routeOptions.isStatic) limits.maximumDistance else limits.maximumDistanceDynamicWeights
         if (beeline > maxDist) throw ApiException(400, RoutingErrorCodes.REQUEST_EXCEEDS_SERVER_LIMIT, "The approximated route distance must not be greater than ${maxDist.toLong()} meters.")
+        if (request.alternatives != null && beeline > limits.maximumDistanceAlternativeRoutes) throw ApiException(400, RoutingErrorCodes.REQUEST_EXCEEDS_SERVER_LIMIT, "The approximated route distance must not be greater than ${limits.maximumDistanceAlternativeRoutes.toLong()} meters for alternative routes.")
 
         val router = graphs.router(routeOptions)
         val snaps = request.coordinates.mapIndexed { i, (lat, lon) ->
