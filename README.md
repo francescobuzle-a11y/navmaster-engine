@@ -54,6 +54,25 @@ Con Docker: `docker compose up` (costruisce il grafo al primo avvio da `data/lom
 3. Con la patch `docs/navmaster-app/navmaster_ors_patch.py` applicata alla build, l'app invia anche
    altezza/peso/larghezza/lunghezza del profilo camion; senza patch calcola come camion generico.
 
+## Integrazione offline nell'app NavMaster (OsmAnd)
+
+Il motore gira dentro l'APK, senza server. Serve il jar unico del modulo core:
+
+```bash
+./gradlew :engine-core:androidJar
+cp engine-core/build/libs/navmaster-engine-core.jar ../navmaster/libs/
+```
+
+Nella cartella `navmaster/` del fork di OsmAnd ci sono `NavMasterLocalEngine.java` (un "motore online"
+di tipo openrouteservice che calcola in locale e produce lo stesso GeoJSON) e `patch_engine.py`, chiamato
+da `apply.sh` alla build: aggiunge il jar alle dipendenze, registra il motore in `EngineType`, fa calcolare
+in locale `OnlineRoutingHelper` e la scheda "Prova", e invia al motore le misure del camion del profilo.
+
+Sul tablet il grafo va copiato nella cartella dati di OsmAnd, sottocartella `navmaster/graph/`
+(tutti i file della cartella prodotta da `engine-cli import`). Nell'app: *Impostazioni → profilo Camion →
+Impostazioni di navigazione → Tipo di navigazione → Aggiungi motore di routing online → tipo "NavMaster (offline)"*,
+veicolo HGV. Se il grafo manca, il messaggio d'errore riporta il percorso esatto in cui copiarlo.
+
 ## Test
 
 ```bash

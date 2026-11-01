@@ -77,21 +77,23 @@ abstract class DataAccess(val name: String, segmentSize: Int) : Closeable {
     fun getLong(pos: Long): Long = (getInt(pos).toLong() and 0xFFFFFFFFL) or (getInt(pos + 4).toLong() shl 32)
     fun setLong(pos: Long, value: Long) { setInt(pos, value.toInt()); setInt(pos + 4, (value ushr 32).toInt()) }
 
-    /** Copia [length] byte da [pos]; può attraversare al massimo un confine di segmento. */
+    /** Copia [length] byte da [pos]; può attraversare al massimo un confine di segmento. (Accessi assoluti byte per byte: compatibili con Android.) */
     fun getBytes(pos: Long, dst: ByteArray, length: Int) {
         val seg = (pos ushr segmentSizePower).toInt()
         val off = (pos and segmentMask.toLong()).toInt()
         val first = minOf(length, segmentSize - off)
-        segment(seg).get(off, dst, 0, first)
-        if (first < length) segment(seg + 1).get(0, dst, first, length - first)
+        val b0 = segment(seg)
+        for (i in 0 until first) dst[i] = b0.get(off + i)
+        if (first < length) { val b1 = segment(seg + 1); for (i in first until length) dst[i] = b1.get(i - first) }
     }
 
     fun setBytes(pos: Long, src: ByteArray, length: Int) {
         val seg = (pos ushr segmentSizePower).toInt()
         val off = (pos and segmentMask.toLong()).toInt()
         val first = minOf(length, segmentSize - off)
-        segment(seg).put(off, src, 0, first)
-        if (first < length) segment(seg + 1).put(0, src, first, length - first)
+        val b0 = segment(seg)
+        for (i in 0 until first) b0.put(off + i, src[i])
+        if (first < length) { val b1 = segment(seg + 1); for (i in first until length) b1.put(i - first, src[i]) }
     }
 
     abstract fun flush()
