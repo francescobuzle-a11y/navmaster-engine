@@ -61,10 +61,13 @@ class AlternativeRoutes(
         }
         // i candidati con il plateau più lungo rispetto al peso prima (come GraphHopper: plateau e peso insieme)
         candidates.sortBy { it.weight - it.plateau * 0.5 }
+        val seenPaths = HashSet<Int>()
         for (cand in candidates) {
             if (out.size >= targetCount) break
             val path = pathVia(cand.node)
             if (path.isEmpty) continue
+            // lo stesso percorso raggiunto da più nodi del plateau: valutato una volta sola
+            if (!seenPaths.add(path.edges.contentHashCode())) continue
             val edges = IntHashSet(path.edges.size).also { s -> path.edges.forEach { s.add(it) } }
             // condivisione con i percorsi già scelti, in peso (gli archi in comune sul peso del candidato)
             var tooSimilar = false

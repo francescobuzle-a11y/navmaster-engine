@@ -18,9 +18,12 @@ class EdgeBasedBidirectionalDijkstra(
     private val turnCosts: TurnCostProvider,
     private val filter: EdgeFilter = EdgeFilter.ALL,
     private val maxVisitedNodes: Int = Int.MAX_VALUE,
+    /** > 1: la ricerca continua oltre il percorso migliore fino a questo multiplo del suo peso (percorsi alternativi). */
+    private val explorationFactor: Double = 1.0,
 ) {
-    private val fwd = SearchState(1024)   // chiave: edgeKey percorso in avanti
-    private val bwd = SearchState(1024)   // chiave: edgeKey nel verso in cui lo percorrerebbe il viaggio (stessa chiave di fwd)
+    val fwd = SearchState(1024)   // chiave: edgeKey percorso in avanti; parentNode = chiave precedente (o nodo sorgente se parentEdge < 0)
+    val bwd = SearchState(1024)   // chiave: edgeKey nel verso del viaggio; parentNode = chiave successiva (o nodo destinazione se parentEdge < 0)
+    private val weightIt = graph.createEdgeIterator()
     private val fwdIt = graph.createEdgeIterator()
     private val bwdIt = graph.createEdgeIterator()
     private val fwdSources = IntHashSet(); private val bwdTargets = IntHashSet()
@@ -79,7 +82,20 @@ class EdgeBasedBidirectionalDijkstra(
         if (bestWeight.isInfinite()) return false
         val fk = if (fwd.heap.isEmpty) Double.POSITIVE_INFINITY else fwd.heap.peekKey()
         val bk = if (bwd.heap.isEmpty) Double.POSITIVE_INFINITY else bwd.heap.peekKey()
-        return fk + bk >= bestWeight
+        return fk + bk >= bestWeight * explorationFactor
+    }
+
+    /** Peso dell'arco della chiave [key] nel verso del viaggio. */
+    fun edgeWeightOf(key: Int): Double {
+        val edge = key ushr 1
+        weightIt.setEdge(edge, if (key and 1 == 0) graph.nodeA(edge) else graph.nodeB(edge))
+        return weighting.edgeWeight(weightIt, false)
+    }
+
+    /** Peso dell'arco [edge] nel verso in cui gli alberi lo hanno percorso (la chiave presente negli alberi). */
+    fun edgeWeightOfEdge(edge: Int): Double {
+        val k0 = edge shl 1; val k1 = k0 or 1
+        return if (fwd.weight.containsKey(k0) || bwd.weight.containsKey(k0)) edgeWeightOf(k0) else if (fwd.weight.containsKey(k1) || bwd.weight.containsKey(k1)) edgeWeightOf(k1) else 0.0
     }
 
     private fun settleForward() {
@@ -136,9 +152,15 @@ class EdgeBasedBidirectionalDijkstra(
     fun extractPath(): SearchPath? {
         if (meetingNode >= 0 && meetingKey < 0) return SearchPath(intArrayOf(meetingNode), IntArray(0), bestWeight)
         if (meetingKey < 0) return null
+        return pathVia(meetingKey)
+    }
+
+    /** Il percorso che passa per la chiave [viaKey] (raggiunta da entrambe le direzioni): catena avanti fino a essa, poi catena indietro. */
+    fun pathVia(viaKey: Int): SearchPath? {
+        if (!fwd.weight.containsKey(viaKey) || !bwd.weight.containsKey(viaKey)) return null
         val edges = ArrayList<Int>(); val nodes = ArrayList<Int>()
         // all'indietro lungo la catena avanti: ogni chiave → arco; parentNode della prima voce è il nodo sorgente
-        var k = meetingKey
+        var k = viaKey
         while (true) {
             edges.add(k ushr 1)
             val pe = fwd.parentEdge.getOrDefault(k, -1)
@@ -153,16 +175,18 @@ class EdgeBasedBidirectionalDijkstra(
         nodeList.add(n)
         for (e in edges) { n = if (graph.nodeA(e) == n) graph.nodeB(e) else graph.nodeA(e); nodeList.add(n) }
         // poi in avanti lungo la catena indietro, saltando l'arco d'incontro già incluso
-        k = bwd.parentNode.getOrDefault(meetingKey, Int.MIN_VALUE)
-        var pe = bwd.parentEdge.getOrDefault(meetingKey, -1)
+        k = bwd.parentNode.getOrDefault(viaKey, Int.MIN_VALUE)
+        var pe = bwd.parentEdge.getOrDefault(viaKey, -1)
+        val seen = IntHashSet(edges.size).also { s -> edges.forEach { s.add(it) } }
         while (pe >= 0 && k != Int.MIN_VALUE) {
             val e = k ushr 1
+            if (!seen.add(e)) return null // un anello: scartato
             edges.add(e)
             n = if (graph.nodeA(e) == n) graph.nodeB(e) else graph.nodeA(e)
             nodeList.add(n)
             pe = bwd.parentEdge.getOrDefault(k, -1)
             k = bwd.parentNode.getOrDefault(k, Int.MIN_VALUE)
         }
-        return SearchPath(nodeList.toIntArray(), edges.toIntArray(), bestWeight)
+        return SearchPath(nodeList.toIntArray(), edges.toIntArray(), fwd.weightOf(viaKey) + bwd.weightOf(viaKey) - edgeWeightOf(viaKey))
     }
 }

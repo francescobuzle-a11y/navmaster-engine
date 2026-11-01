@@ -133,14 +133,51 @@ class Router(
      * flessibile di ORS: niente CH, costi di svolta non considerati.
      */
     fun alternatives(from: Snap, to: Snap, targetCount: Int, weightFactor: Double, shareFactor: Double): List<RoutePath> {
+        // il percorso migliore con l'algoritmo normale (divieti di svolta compresi)
+        val best = route(from, to)
+        val out = ArrayList<RoutePath>().also { it += best }
+        if (targetCount <= 1) return out
         val fromParts = splitEdge(from, asTarget = false)
         val toParts = splitEdge(to, asTarget = true)
-        val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes, explorationFactor = weightFactor)
-        for (p in fromParts) algo.addSource(p.node, p.weight)
-        for (p in toParts) algo.addTarget(p.node, p.weight)
-        val paths = AlternativeRoutes(algo, targetCount, weightFactor, shareFactor).run()
-        if (paths.isEmpty()) throw RouteNotFoundException("Nessun percorso trovato fra i punti richiesti")
-        return paths.map { sp -> assemble(sp, fromParts.first { it.node == sp.startNode }, toParts.first { it.node == sp.endNode }) }
+        // le alternative dalla ricerca piena (edge-based con i divieti di svolta, altrimenti node-based):
+        // valgono solo se non ricalcano il percorso migliore
+        val candidates = if (turnCosts != null) {
+            val algo = EdgeBasedBidirectionalDijkstra(graph, weighting, turnCosts, filter, maxVisitedNodes, explorationFactor = weightFactor)
+            for (p in fromParts) algo.addSource(p.node, p.weight)
+            for (p in toParts) algo.addTarget(p.node, p.weight)
+            EdgeBasedAlternatives(algo, targetCount + 2, weightFactor, shareFactor).run()
+        } else {
+            val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes, explorationFactor = weightFactor)
+            for (p in fromParts) algo.addSource(p.node, p.weight)
+            for (p in toParts) algo.addTarget(p.node, p.weight)
+            AlternativeRoutes(algo, targetCount + 2, weightFactor, shareFactor).run()
+        }
+        val bestEdges = best.edges.map { it.edge }.toHashSet()
+        for (sp in candidates) {
+            if (out.size >= targetCount) break
+            val startPart = fromParts.firstOrNull { it.node == sp.startNode } ?: continue
+            val endPart = toParts.firstOrNull { it.node == sp.endNode } ?: continue
+            val path = assemble(sp, startPart, endPart)
+            if (!isLegal(path)) continue
+            if (path.weight > best.weight * weightFactor) continue
+            var shared = 0.0
+            for (e in path.edges) if (e.edge in bestEdges) shared += e.distance
+            if (shared > shareFactor * path.distance) continue
+            if (out.drop(1).any { o -> val oe = o.edges.map { it.edge }.toHashSet(); path.edges.sumOf { e -> if (e.edge in oe) e.distance else 0.0 } > shareFactor * path.distance }) continue
+            out += path
+        }
+        return out
+    }
+
+    /** Vero se ogni svolta del percorso è consentita (con i costi di svolta del profilo; sempre vero senza). */
+    fun isLegal(path: RoutePath): Boolean {
+        val tc = turnCosts ?: return true
+        for (i in 1 until path.edges.size) {
+            val prev = path.edges[i - 1]; val cur = path.edges[i]
+            if (prev.edge == cur.edge) continue
+            if (tc.turnWeight(prev.edge, prev.adjNode, cur.edge).isInfinite()) return false
+        }
+        return true
     }
 
     /** Tratto parziale di un arco agganciato: dal punto agganciato alla torre [node] (o viceversa). */

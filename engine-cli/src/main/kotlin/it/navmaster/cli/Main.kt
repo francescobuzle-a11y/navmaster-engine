@@ -97,13 +97,19 @@ private fun route(args: List<String>) {
         val loadMs = (System.nanoTime() - t0) / 1e6
         val router = rg.router(options)
         val t1 = System.nanoTime()
-        val path = router.route(router.snap(fromLat, fromLon, options.maximumSnappingRadius, 0), router.snap(toLat, toLon, options.maximumSnappingRadius, 1))
+        val from = router.snap(fromLat, fromLon, options.maximumSnappingRadius, 0); val to = router.snap(toLat, toLon, options.maximumSnappingRadius, 1)
+        val alternatives = opt(args, "alternatives")?.toInt() ?: 0
+        val paths = if (alternatives > 0) router.alternatives(from, to, 1 + alternatives, 1.4, 0.6) else listOf(router.route(from, to))
         val routeMs = (System.nanoTime() - t1) / 1e6
-        println("profilo ${options.profile} (${options.weighting.name.lowercase()}, ${router.algorithm}): %.1f km, %d min %d s, peso %.1f, %d archi".format(
-            path.distance / 1000, path.millis / 60000, path.millis / 1000 % 60, path.weight, path.edges.size))
+        for ((i, path) in paths.withIndex()) {
+            println("percorso ${i + 1}/${paths.size}, profilo ${options.profile} (${options.weighting.name.lowercase()}, ${if (alternatives > 0) "alternative" else router.algorithm}): %.1f km, %d min %d s, peso %.1f, %d archi".format(
+                path.distance / 1000, path.millis / 60000, path.millis / 1000 % 60, path.weight, path.edges.size))
+            if (!args.contains("--quiet")) {
+                var last = ""
+                for (e in path.edges) if (e.name != last && e.name.isNotEmpty()) { println("  - ${e.name}"); last = e.name }
+            }
+        }
         println("caricamento %.0f ms, calcolo %.1f ms".format(loadMs, routeMs))
-        var last = ""
-        for (e in path.edges) if (e.name != last && e.name.isNotEmpty()) { println("  - ${e.name}"); last = e.name }
     }
 }
 
