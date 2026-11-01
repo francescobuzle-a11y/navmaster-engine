@@ -157,6 +157,9 @@ class WitnessPathSearcher(private val g: PrepareGraph) {
  * + `NodeBasedNodeContractor`): ordinamento euristico (differenza archi ×10 + archi originali ×1),
  * aggiornamenti periodici (20 %), pigri (ultimo 10 %) e dei vicini (20 %, `Random(123)`).
  */
+/** Budget minimo di nodi sistemati per ogni ricerca dei testimoni (prova: proprietà `nm.witness`). */
+private val WITNESS_MIN_SETTLED: Int = System.getProperty("nm.witness")?.toIntOrNull() ?: 0
+
 class CHPreparation(
     private val graph: BaseGraph,
     private val weighting: Weighting,
@@ -273,7 +276,7 @@ class CHPreparation(
 
     /** Cerca gli shortcut necessari attorno a [v]; se [countOnly] li conta soltanto. */
     private fun findAndHandleShortcuts(v: Int, countOnly: Boolean) {
-        val maxSettled = (meanDegree.toInt() * 100)
+        val maxSettled = maxOf(meanDegree.toInt() * 100, WITNESS_MIN_SETTLED)
         var degree = 0
         var inArc = pg.headIn[v]
         while (inArc >= 0) {

@@ -108,7 +108,8 @@ class RoutingGraph private constructor(
             storage.flush()
             log?.invoke("CH $key: ${storage.shortcutCount} shortcut in ${System.currentTimeMillis() - t0} ms")
             chStorages[key] = storage
-            if (withCore) {
+            // il core solo per il peso principale del profilo (come ORS): "shortest" con restrizioni usa la ricerca piena
+            if (withCore && method != WeightingMethod.SHORTEST) {
                 val selector = CoreEdgeSelector(encoding, name, turnCosts)
                 val coreNodes = selector.coreNodes(graph)
                 val coreKey = "${key}_core"
