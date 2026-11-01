@@ -57,7 +57,7 @@ patch(orh, '\t\t\tString body = engine.getRequestBody(path, startBearing);\n'
       '\t\t\tString content = engine instanceof net.osmand.plus.onlinerouting.engine.NavMasterLocalEngine\n'
       '\t\t\t\t\t? net.osmand.plus.onlinerouting.engine.NavMasterLocalEngine.compute(app, engine.getVehicleKeyForUrl(), body)\n'
       '\t\t\t\t\t: makeRequest(url, method, body, headers);\n')
-patch(orh, '\tpublic String makeRequest(@NonNull String url) throws IOException {\n',
+patch(orh, '\t@NonNull\n\tpublic String makeRequest(@NonNull String url) throws IOException {\n',
       '''	// NavMaster: parametri camion del profilo (routing.xml: height/width/length/weight/hazmat_category, avoid_*) -> opzioni openrouteservice
 	@NonNull
 	private org.json.JSONObject navmasterTruckOptions(@Nullable net.osmand.plus.settings.backend.ApplicationMode mode) throws JSONException {
@@ -87,6 +87,7 @@ patch(orh, '\tpublic String makeRequest(@NonNull String url) throws IOException 
 		return options;
 	}
 
+	@NonNull
 	public String makeRequest(@NonNull String url) throws IOException {
 ''')
 
