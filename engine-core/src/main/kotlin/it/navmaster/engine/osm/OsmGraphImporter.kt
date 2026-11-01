@@ -1,7 +1,10 @@
 package it.navmaster.engine.osm
 
 import com.carrotsearch.hppc.LongIntHashMap
+import com.carrotsearch.hppc.LongArrayList
 import com.carrotsearch.hppc.LongObjectHashMap
+import it.navmaster.engine.profile.GuidanceParser
+import it.navmaster.engine.storage.GuidanceStore
 import it.navmaster.engine.profile.Access
 import it.navmaster.engine.profile.WayAttributeParser
 import it.navmaster.engine.storage.BaseGraph
@@ -39,10 +42,19 @@ data class ImportStats(
 data class ImportOptions(
     /** Vedi [WayAttributeParser.parse]: con `false` il tag `width` non diventa un limite di larghezza. */
     val widthFromCarriageway: Boolean = true,
+    /** Scrive il file `guidance` (limiti di velocità, corsie, destinazioni, svincoli, caselli): solo dati, nessun effetto sul calcolo. */
+    val guidance: Boolean = true,
 )
 
-class OsmGraphImporter(private val graph: BaseGraph, private val encoding: GraphEncoding, private val turnCosts: TurnCostStorage? = null, private val options: ImportOptions = ImportOptions()) {
+class OsmGraphImporter(
+    private val graph: BaseGraph, private val encoding: GraphEncoding, private val turnCosts: TurnCostStorage? = null,
+    private val options: ImportOptions = ImportOptions(),
+    /** Se presente, riceve i dati di guida di ogni arco (file `guidance`). */
+    private val guidance: GuidanceStore? = null,
+) {
     private val profiles = encoding.profiles
+    private val junctions = LongObjectHashMap<String>()   // id OSM → svincolo "ref|nome"
+    private val specialNodes = LongObjectHashMap<String>() // id OSM → casello / portale / dogana
     private val nodeUse = LongIntHashMap()       // id OSM → bit: 1 = visto una volta, 2 = più volte, 4 = estremo di way
     private val towers = LongIntHashMap()        // id OSM → id nodo del grafo
     private val pillars = LongIntHashMap()       // id OSM → indice pillar
@@ -118,6 +130,10 @@ class OsmGraphImporter(private val graph: BaseGraph, private val encoding: Graph
             val use = nodeUse.getOrDefault(id, 0)
             if (use == 0) return
             var isBarrier = false
+            if (tags != null && guidance != null) {
+                GuidanceParser.junction(tags)?.let { junctions.put(id, it) }
+                GuidanceParser.specialNode(tags)?.let { specialNodes.put(id, it) }
+            }
             if (tags != null && (tags.containsKey("barrier") || tags["ford"] == "yes" || tags["highway"] == "ford")) {
                 isBarrier = profiles.any { it.profile.isBarrier(tags) }
                 if (isBarrier) barrierTags.put(id, tags)
@@ -136,13 +152,14 @@ class OsmGraphImporter(private val graph: BaseGraph, private val encoding: Graph
 
     private inner class Pass2Ways : OsmSink {
         private val lats = DoubleArrayList(); private val lons = DoubleArrayList()
+        private val segIds = LongArrayList() // id OSM dei punti del segmento corrente, in parallelo a lats/lons
         private var segmentStart = -1 // nodo del grafo in cui inizia il segmento corrente
 
         override fun way(way: OsmWay) {
             if (!acceptWay(way)) return
             val ids = way.nodeIds
             segmentStart = -1
-            lats.clear(); lons.clear()
+            lats.clear(); lons.clear(); segIds.clear()
             for (i in ids.indices) {
                 val id = ids[i]
                 var tower = towers.getOrDefault(id, -1)
@@ -155,19 +172,19 @@ class OsmGraphImporter(private val graph: BaseGraph, private val encoding: Graph
                     if (segmentStart < 0) { // il segmento deve iniziare da una torre: promuovi il pillar
                         tower = promote(id, p)
                     } else {
-                        lats.add(pillarLat[p]); lons.add(pillarLon[p]); continue
+                        lats.add(pillarLat[p]); lons.add(pillarLon[p]); segIds.add(id); continue
                     }
                 }
                 if (segmentStart >= 0) {
-                    lats.add(graph.lat(tower)); lons.add(graph.lon(tower))
+                    lats.add(graph.lat(tower)); lons.add(graph.lon(tower)); segIds.add(id)
                     addEdge(way, segmentStart, tower)
                 }
                 // nodo barriera interno: sdoppia e collega con un arco di lunghezza zero
                 val bt = if (i in 1 until ids.size - 1) barrierTags.get(id) else null
                 val next = if (bt != null) splitBarrier(way, tower, bt) else tower
                 segmentStart = next
-                lats.clear(); lons.clear()
-                lats.add(graph.lat(next)); lons.add(graph.lon(next))
+                lats.clear(); lons.clear(); segIds.clear()
+                lats.add(graph.lat(next)); lons.add(graph.lon(next)); segIds.add(id)
             }
         }
 
@@ -178,7 +195,7 @@ class OsmGraphImporter(private val graph: BaseGraph, private val encoding: Graph
                 addEdge(way, segmentStart, end)
             }
             segmentStart = -1
-            lats.clear(); lons.clear()
+            lats.clear(); lons.clear(); segIds.clear()
         }
 
         private fun promote(id: Long, pillarIndex: Int): Int {
@@ -212,10 +229,12 @@ class OsmGraphImporter(private val graph: BaseGraph, private val encoding: Graph
                 // anello chiuso: l'ultimo pillar diventa torre e si creano due archi
                 val mid = graph.addNode(lats[n - 2], lons[n - 2])
                 val savedLat = lats[n - 1]; val savedLon = lons[n - 1]
-                lats.size = n - 1; lons.size = n - 1
+                val midId = segIds.get(n - 2); val savedId = segIds.get(n - 1)
+                lats.size = n - 1; lons.size = n - 1; segIds.elementsCount = n - 1
                 addEdge(way, from, mid)
-                lats.clear(); lons.clear()
+                lats.clear(); lons.clear(); segIds.clear()
                 lats.add(graph.lat(mid)); lons.add(graph.lon(mid)); lats.add(savedLat); lons.add(savedLon)
+                segIds.add(midId); segIds.add(savedId)
                 addEdge(way, mid, to)
                 return
             }
@@ -237,6 +256,19 @@ class OsmGraphImporter(private val graph: BaseGraph, private val encoding: Graph
             graph.setFlags(edge, flags)
             val name = wayName(way)
             if (name.isNotEmpty()) graph.setName(edge, name)
+            guidance?.let { g ->
+                var special: StringBuilder? = null
+                if (!specialNodes.isEmpty && segIds.size() == n) {
+                    for (k in 0 until n) {
+                        val t = specialNodes.get(segIds.get(k)) ?: continue
+                        if (special == null) special = StringBuilder() else special.append(';')
+                        special.append(t).append('@').append(k)
+                    }
+                }
+                val jA = if (segIds.size() == n) junctions.get(segIds.get(0)) else null
+                val jB = if (segIds.size() == n) junctions.get(segIds.get(n - 1)) else null
+                g.set(edge, GuidanceParser.parse(way), jA, jB, special?.toString())
+            }
         }
     }
 

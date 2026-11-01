@@ -5,7 +5,7 @@ import kotlin.test.assertEquals
 
 class EngineTest {
     @Test
-    fun `format version is 2`() {
-        assertEquals(2, GRAPH_FORMAT_VERSION)
+    fun `format version is 3`() {
+        assertEquals(3, GRAPH_FORMAT_VERSION)
     }
 }

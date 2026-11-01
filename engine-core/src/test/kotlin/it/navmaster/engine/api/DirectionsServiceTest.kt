@@ -134,4 +134,39 @@ class DirectionsServiceTest {
             assertEquals(2, segs.size)
         }
     }
+    @Test
+    fun `navmaster road facts along the route and around a point`() {
+        val dir = Files.createTempDirectory("nme-rf").toFile().also { it.deleteOnExit() }
+        RoutingGraph.build(File("../data/heidelberg.test.pbf"), dir, listOf(CarProfile(), HgvProfile())).first.close()
+        RoutingGraph.load(dir, mmap = false).use { g ->
+            assertTrue(g.guidance != null, "il grafo ricaricato ha il file guidance")
+            val service = DirectionsService(g)
+            val body = Json.parse("""{"coordinates":[[8.6937,49.4094],[8.7606,49.4186]],"navmaster":{"roads":true},"extra_info":["tollways"]}""") as Map<String, Any?>
+            val r = service.handle(DirectionsRequest.fromJson("driving-hgv", body), ResponseFormat.GEOJSON)
+            val text = Json.stringify(r)
+            val props = ((Json.parse(text) as Map<*, *>)["features"] as List<*>)[0].let { (it as Map<*, *>)["properties"] as Map<*, *> }
+            val coords = ((Json.parse(text) as Map<*, *>)["features"] as List<*>)[0].let { ((it as Map<*, *>)["geometry"] as Map<*, *>)["coordinates"] as List<*> }
+            val roads = (props["navmaster"] as Map<*, *>)["roads"] as List<*>
+            assertTrue(roads.size > 10)
+            // gli intervalli coprono la geometria senza buchi
+            var prev = 0L
+            for (e in roads) {
+                val m = e as Map<*, *>
+                assertEquals(prev, m["from"]); prev = m["to"] as Long
+                assertTrue(m["class"] is String && m["name"] is String && m["access"] == true)
+            }
+            assertEquals((coords.size - 1).toLong(), prev)
+            assertTrue(roads.any { (it as Map<*, *>)["maxspeed"] != null }, "almeno un limite di velocità")
+            assertTrue(roads.any { (it as Map<*, *>)["lanes"] != null }, "almeno un numero di corsie")
+            assertTrue(roads.any { (it as Map<*, *>)["ref"] != null }, "almeno un ref")
+            // strade intorno a un punto
+            val around = (RoadsService(g).around("driving-car", 49.4094, 8.6937, 150.0)["roads"] as List<*>)
+            assertTrue(around.size in 2..400, "strade intorno: ${around.size}")
+            val first = around[0] as Map<*, *>
+            assertTrue((first["coordinates"] as List<*>).size >= 2 && first["oneway"] is Int && first["access_ab"] is Boolean)
+            // senza l'estensione la risposta resta quella di ORS
+            val plain = service.handle(DirectionsRequest.fromJson("driving-hgv", Json.parse("""{"coordinates":[[8.6937,49.4094],[8.7606,49.4186]]}""") as Map<String, Any?>), ResponseFormat.JSON)
+            assertTrue(((plain["routes"] as List<*>)[0] as Map<*, *>)["navmaster"] == null)
+        }
+    }
 }

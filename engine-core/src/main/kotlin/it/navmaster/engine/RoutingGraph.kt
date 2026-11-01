@@ -15,6 +15,7 @@ import it.navmaster.engine.profile.HgvProfile
 import it.navmaster.engine.profile.VehicleProfile
 import it.navmaster.engine.routing.Router
 import it.navmaster.engine.storage.BaseGraph
+import it.navmaster.engine.storage.GuidanceStore
 import it.navmaster.engine.storage.GraphDirectory
 import it.navmaster.engine.storage.GraphEncoding
 import it.navmaster.engine.storage.GraphProperties
@@ -69,6 +70,8 @@ class RoutingGraph private constructor(
     val encoding: GraphEncoding,
     val graph: BaseGraph,
     val turnCosts: TurnCostStorage,
+    /** Dati di guida per arco (file `guidance`), assenti nei grafi costruiti senza. */
+    val guidance: GuidanceStore?,
 ) : Closeable {
     lateinit var index: LocationIndex; private set
 
@@ -141,9 +144,9 @@ class RoutingGraph private constructor(
         return Router(graph, index, weighting, filter, tcp, ch, core, lm)
     }
 
-    fun flush() { graph.flush(); turnCosts.flush(); GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); save() } }
+    fun flush() { graph.flush(); turnCosts.flush(); guidance?.flush(graph.edgeCount); GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); save() } }
 
-    override fun close() { graph.close(); turnCosts.close(); chStorages.values.forEach { it.close() } }
+    override fun close() { graph.close(); turnCosts.close(); guidance?.close(); chStorages.values.forEach { it.close() } }
 
     companion object {
         fun profileByName(name: String): VehicleProfile = when (name) {
@@ -158,8 +161,9 @@ class RoutingGraph private constructor(
             val gdir = GraphDirectory(dir, mmap)
             val graph = BaseGraph(gdir, encoding.registry)
             val tc = TurnCostStorage(gdir, TurnCostEncoding(profiles.map { it.name }))
-            val rg = RoutingGraph(dir, encoding, graph, tc)
-            val stats = OsmGraphImporter(graph, encoding, tc, importOptions).import(pbf)
+            val guidance = if (importOptions.guidance) GuidanceStore(gdir.create("guidance"), graph.names) else null
+            val rg = RoutingGraph(dir, encoding, graph, tc, guidance)
+            val stats = OsmGraphImporter(graph, encoding, tc, importOptions, guidance).import(pbf)
             rg.flush()
             rg.index = LocationIndex.build(graph)
             rg.index.save(gdir)
@@ -177,7 +181,7 @@ class RoutingGraph private constructor(
             check(graph.loadExisting()) { "grafo non caricabile da $dir" }
             val tc = TurnCostStorage(gdir, TurnCostEncoding(profiles.map { it.name }))
             check(tc.loadExisting()) { "costi di svolta non caricabili da $dir" }
-            val rg = RoutingGraph(dir, encoding, graph, tc)
+            val rg = RoutingGraph(dir, encoding, graph, tc, GuidanceStore.load(gdir, graph.names))
             for (key in (props.get("ch") ?: "").split(',').filter { it.isNotBlank() }) {
                 val st = CHStorage(gdir, key, graph.edgeCount, graph.nodeCount)
                 if (st.loadExisting()) rg.chStorages[key] = st else st.close()

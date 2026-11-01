@@ -63,6 +63,8 @@ class DirectionsRequest(
     val maximumSpeed: Double,
     /** ORS `continue_straight`: ai via-point si prosegue nel verso d'arrivo (niente inversione), ricerca non "static". */
     val continueStraight: Boolean,
+    /** Estensione NavMaster `{"navmaster": {"roads": true}}`: i fatti sulle strade del percorso ([RoadFactsBuilder]). */
+    val navmasterRoads: Boolean,
     /** Raggio di aggancio per punto in metri (-1 = illimitato → raggio massimo del profilo). */
     val radiuses: DoubleArray?,
     val id: String?,
@@ -74,7 +76,7 @@ class DirectionsRequest(
     companion object {
         private val KNOWN = setOf("coordinates", "preference", "units", "language", "instructions", "instructions_format", "geometry", "maneuvers",
             "options", "radiuses", "id", "attributes", "elevation", "extra_info", "continue_straight", "roundabout_exits", "geometry_simplify",
-            "suppress_warnings", "skip_segments", "alternative_routes", "bearings", "maximum_speed", "schedule", "custom_model")
+            "suppress_warnings", "skip_segments", "alternative_routes", "bearings", "maximum_speed", "schedule", "custom_model", "navmaster")
 
         /** Costruisce la richiesta dal JSON del corpo (già analizzato in mappa). */
         fun fromJson(profile: String, body: Map<String, Any?>): DirectionsRequest {
@@ -139,6 +141,7 @@ class DirectionsRequest(
                 avoidFeatures = avoid, vehicleType = vehicleType, vehicleParameters = params?.takeIf { it.hasAttributes },
                 avoidPolygons = polygons, maximumSpeed = maximumSpeed,
                 continueStraight = body["continue_straight"] as? Boolean ?: false,
+                navmasterRoads = (body["navmaster"] as? Map<*, *>)?.get("roads") == true,
                 radiuses = radiuses, id = body["id"]?.toString(), attributes = attributes, extraInfo = extraInfo, echo = body,
             )
         }
@@ -281,6 +284,7 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
                     route["way_points"] = wayPoints
                 }
                 if (request.extraInfo.isNotEmpty()) route["extras"] = ExtraInfoBuilder(graphs.graph, graphs.encoding, pe).build(request.extraInfo, legs, request.units.perMeter, request.units.decimals)
+                if (request.navmasterRoads) route["navmaster"] = linkedMapOf("roads" to RoadFactsBuilder(graphs.graph, graphs.encoding, pe, graphs.guidance).build(legs))
                 linkedMapOf("bbox" to bboxArr, "routes" to listOf(route), "metadata" to metadata)
             }
             ResponseFormat.GEOJSON -> {
@@ -288,6 +292,7 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
                 for (i in 0 until geometry.size) coords.add(doubleArrayOf(r6(geometry.lon(i)), r6(geometry.lat(i))))
                 val properties = linkedMapOf<String, Any?>("segments" to segments, "way_points" to wayPoints, "summary" to summary)
                 if (request.extraInfo.isNotEmpty()) properties["extras"] = ExtraInfoBuilder(graphs.graph, graphs.encoding, pe).build(request.extraInfo, legs, request.units.perMeter, request.units.decimals)
+                if (request.navmasterRoads) properties["navmaster"] = linkedMapOf("roads" to RoadFactsBuilder(graphs.graph, graphs.encoding, pe, graphs.guidance).build(legs))
                 val feature = linkedMapOf<String, Any?>(
                     "bbox" to bboxArr, "type" to "Feature",
                     "properties" to properties,
@@ -360,5 +365,17 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         val BUILD_DATE: String = Instant.now().toString()
         fun r6(v: Double) = Math.round(v * 1e6) / 1e6
         fun roundForUnits(v: Double, units: DistanceUnit): Double { val f = Math.pow(10.0, units.decimals.toDouble()); return Math.round(v * f) / f }
+    }
+}
+
+/** Estensione NavMaster: le strade intorno a un punto, dal grafo (vedi [RoadFactsBuilder.around]). */
+class RoadsService(private val graphs: RoutingGraph) {
+    fun around(profile: String, lat: Double, lon: Double, radiusMeters: Double): Map<String, Any?> {
+        val encoder = try { graphs.encoderName(profile) } catch (e: IllegalArgumentException) {
+            throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'profile' has incorrect value of '$profile'.")
+        }
+        val pe = graphs.encoding.profile(encoder)
+        val r = radiusMeters.coerceIn(10.0, 5000.0)
+        return linkedMapOf("roads" to RoadFactsBuilder(graphs.graph, graphs.encoding, pe, graphs.guidance).around(graphs.index, lat, lon, r))
     }
 }
