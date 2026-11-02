@@ -45,7 +45,8 @@ class CoreTest {
                 // (né come shortcut né come testimoni), perché una richiesta potrebbe escluderli
                 CHPreparation(g, w, storage, filter = EdgeFilter { !selector.isCoreEdge(it) }).apply { doNotContract = { core[it] } }.prepare()
                 println("core: $coreCount nodi su ${g.nodeCount} (${100 * coreCount / g.nodeCount} %), ${storage.shortcutCount} shortcut, ${System.currentTimeMillis() - t0} ms")
-                assertEquals(coreCount, storage.coreNodeCount)
+                // i nodi del core: quelli con archi ristretti, più i pochi lasciati dentro perché avrebbero creato troppi shortcut
+                assertTrue(storage.coreNodeCount >= coreCount && storage.coreNodeCount <= coreCount + coreCount / 20, "core: ${storage.coreNodeCount} vs ${coreCount}")
                 assertTrue(coreCount in 1 until g.nodeCount)
                 val ch = CHGraph(g, storage, w)
                 val lm = CoreLandmarks.prepare(ch, w, 8)
