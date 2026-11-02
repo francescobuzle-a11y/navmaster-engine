@@ -175,6 +175,12 @@ class CHPreparation(
         val originalEdgesCountWeight: Double = 1.0,
         /** Frazione di nodi da NON contrarre (il "core"); 0 = CH completa. */
         val uncontractedPercent: Double = 0.0,
+        /**
+         * Un nodo la cui contrazione creerebbe più di tanti shortcut non viene contratto e resta nel
+         * core (prova: proprietà `nm.maxsc`; 0 = nessun limite). Evita l'esplosione degli shortcut
+         * attorno ai nodi del core: lasciare un nodo nel core è sempre corretto, solo più lento.
+         */
+        val maxShortcutsPerNode: Int = System.getProperty("nm.maxsc")?.toIntOrNull() ?: 200,
         val log: ((String) -> Unit)? = null,
     )
 
@@ -187,6 +193,8 @@ class CHPreparation(
     private val random = Random(123)
     var shortcutsAdded = 0; private set
     var contracted = 0; private set
+    /** Nodi lasciati nel core perché avrebbero creato troppi shortcut (vedi [Params.maxShortcutsPerNode]). */
+    var keptInCore = 0; private set
 
     /** Nodi che non devono essere contratti (per il Core di ORS); default nessuno. */
     var doNotContract: (Int) -> Boolean = { false }
@@ -222,6 +230,10 @@ class CHPreparation(
                 val prio = calculatePriority(node)
                 priorities[node] = prio
                 if (!heap.isEmpty && prio > heap.peekKey()) { heap.push(node, prio); continue }
+            }
+            if (p.maxShortcutsPerNode > 0) {
+                calculatePriority(node)
+                if (shortcutsCount > p.maxShortcutsPerNode) { candidate[node] = false; remaining--; keptInCore++; continue }
             }
             contractNode(node, level++)
             contractedFlag[node] = true

@@ -115,8 +115,10 @@ class RoutingGraph private constructor(
                 val coreKey = "${key}_core"
                 val coreStorage = CHStorage(GraphDirectory(dir, mmap = false), coreKey, graph.edgeCount, graph.nodeCount)
                 t0 = System.currentTimeMillis()
-                CHPreparation(graph, w, coreStorage, filter = EdgeFilter { !selector.isCoreEdge(it) }, params = CHPreparation.Params(log = log))
-                    .apply { doNotContract = { coreNodes[it] } }.prepare()
+                val prep = CHPreparation(graph, w, coreStorage, filter = EdgeFilter { !selector.isCoreEdge(it) }, params = CHPreparation.Params(log = log))
+                    .apply { doNotContract = { coreNodes[it] } }
+                prep.prepare()
+                if (prep.keptInCore > 0) log?.invoke("Core $coreKey: ${prep.keptInCore} nodi lasciati nel core per troppi shortcut")
                 coreStorage.flush()
                 log?.invoke("Core $coreKey: ${coreStorage.coreNodeCount} nodi nel core (${100 * coreStorage.coreNodeCount / maxOf(1, graph.nodeCount)} %), ${coreStorage.shortcutCount} shortcut in ${System.currentTimeMillis() - t0} ms")
                 chStorages[coreKey] = coreStorage
