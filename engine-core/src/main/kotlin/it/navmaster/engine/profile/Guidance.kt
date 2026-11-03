@@ -29,6 +29,11 @@ class GuidanceAttributes(
     val conditional: String = "",
     /** Cartelli sulle corsie: `destination:lanes`, `destination:ref:lanes`, `destination:colour:lanes` separati da [SEP_FIELD]. */
     val laneSignsFwd: String = "", val laneSignsBwd: String = "",
+    /**
+     * La larghezza massima dell'arco viene da un cartello (`maxwidth`, `maxwidth:physical`) e non
+     * dalla larghezza della carreggiata (`width`, che ORS usa come limite): solo allora è un divieto.
+     */
+    val widthSigned: Boolean = false,
 ) {
     companion object {
         const val NO_LIMIT = 255
@@ -78,6 +83,7 @@ object GuidanceParser {
             conditional = conditional(way),
             laneSignsFwd = laneSigns(way, "forward", oneway != -1),
             laneSignsBwd = laneSigns(way, "backward", oneway == -1),
+            widthSigned = way.hasTag("maxwidth") || way.hasTag("maxwidth:physical"),
         )
     }
 

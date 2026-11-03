@@ -24,7 +24,7 @@ import it.navmaster.engine.util.DistanceCalc
  * verso), `maxspeed`, `maxspeed_hgv`, `lanes`, `turn_lanes`, `ref`, `name`, `destination`,
  * `destination_ref`, `exit` (svincolo "ref|nome" al nodo d'ingresso), `sign` (cartello di una
  * relazione `destination_sign` all'imbocco: destination, ref, colour), `lane_signs` (cartelli sulle
- * corsie: destination, ref, colour, campi `:lanes`), `limits` (altezza, larghezza, lunghezza, peso,
+ * corsie: destination, ref, colour, campi `:lanes`), `limits` (i limiti dei cartelli: altezza, larghezza solo da `maxwidth`, lunghezza, peso,
  * carico per asse in m/t, solo quelli presenti), `hazmat` (vietato alle merci pericolose),
  * `adr_tunnel` (categoria B…E), `conditional` (restrizioni a orario "chiave=valore"), `nodes`
  * (caselli, portali, dogane: tipo e indice del punto) e `branches` (le altre strade che lasciano il
@@ -150,9 +150,10 @@ class RoadFactsBuilder(private val graph: BaseGraph, private val encoding: Graph
         } else {
             m["tunnel"] = false; m["bridge"] = false; m["oneway"] = false
         }
+        // i limiti segnalati (cartelli): la larghezza solo se viene da `maxwidth`, non dalla carreggiata (`width`)
         val limits = LinkedHashMap<String, Any?>()
         it.get(sh.maxHeight).takeIf { v -> v.isFinite() }?.let { v -> limits["height"] = v }
-        it.get(sh.maxWidth).takeIf { v -> v.isFinite() }?.let { v -> limits["width"] = v }
+        if (g != null && g.widthSigned(edge)) it.get(sh.maxWidth).takeIf { v -> v.isFinite() }?.let { v -> limits["width"] = v }
         it.get(sh.maxLength).takeIf { v -> v.isFinite() }?.let { v -> limits["length"] = v }
         it.get(sh.maxWeight).takeIf { v -> v.isFinite() }?.let { v -> limits["weight"] = v }
         it.get(sh.maxAxleLoad).takeIf { v -> v.isFinite() }?.let { v -> limits["axleload"] = v }

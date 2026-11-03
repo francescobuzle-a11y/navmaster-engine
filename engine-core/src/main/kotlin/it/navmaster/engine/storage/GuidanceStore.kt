@@ -15,7 +15,8 @@ import java.io.Closeable
  * 24 destination B→A     28 destination:ref A→B 32 destination:ref B→A  36 svincolo al nodo A
  * 40 svincolo al nodo B  44 nodi speciali lungo l'arco ("tipo@indice;…", indice nella geometria completa A→B)
  * 48 restrizioni a orario 52 cartelli corsie A→B 56 cartelli corsie B→A 60 cartello (relazione) partendo da A
- * 64 cartello (relazione) partendo da B           68 u8 categoria ADR galleria, 3 byte liberi
+ * 64 cartello (relazione) partendo da B           68 u8 categoria ADR galleria   69 u8 origine dei limiti (bit 0: larghezza da cartello)
+ * 70-71 liberi
  * ```
  * Le stringhe stanno nel deposito dei nomi del grafo (puntatore 0 = vuota).
  */
@@ -44,6 +45,7 @@ class GuidanceStore(private var da: DataAccess, private val names: StringStore) 
         da.setInt(p + 52, names.put(g.laneSignsFwd)); da.setInt(p + 56, names.put(g.laneSignsBwd))
         da.setInt(p + 60, names.put(signA ?: "")); da.setInt(p + 64, names.put(signB ?: ""))
         da.setByte(p + 68, g.adrTunnel.toByte())
+        da.setByte(p + 69, (if (g.widthSigned) 1 else 0).toByte())
     }
 
     /** Spazio per gli archi fino a [edge] compreso (gli archi senza dati di guida restano a zero). */
@@ -83,6 +85,8 @@ class GuidanceStore(private var da: DataAccess, private val names: StringStore) 
     fun relationSign(edge: Int, reverse: Boolean): String = if (!has(edge)) "" else str(edge, if (reverse) 64 else 60)
     /** Categoria ADR della galleria: 0 nessuna, 2 = B … 5 = E. */
     fun adrTunnel(edge: Int): Int = if (!has(edge)) 0 else u8(edge, 68)
+    /** La larghezza massima dell'arco viene da un cartello (`maxwidth`), non dalla carreggiata (`width`). */
+    fun widthSigned(edge: Int): Boolean = has(edge) && u8(edge, 69) and 1 != 0
 
     /**
      * Corsie percorrendo l'arco: quelle esplicite del verso; altrimenti tutte su un senso unico,
