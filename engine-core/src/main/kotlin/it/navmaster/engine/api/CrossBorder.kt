@@ -138,7 +138,8 @@ class CrossBorderDirections(
 
     /** Un pezzo del viaggio dentro un grafo: i suoi punti (le tappe e i passaggi di confine). */
     private class Piece(val graph: CountryGraph, val points: MutableList<Pair<Double, Double>>, val radiuses: MutableList<Double>,
-                        val exact: MutableList<Boolean> = MutableList(points.size) { false })
+                        val exact: MutableList<Boolean> = MutableList(points.size) { false },
+                        val bearings: MutableList<Double?> = MutableList(points.size) { null })
 
     /** Lo stato di una richiesta: router e agganci per grafo, pesi già calcolati. */
     private inner class Ctx(val request: DirectionsRequest) {
@@ -147,7 +148,8 @@ class CrossBorderDirections(
         private val weights = HashMap<String, Double>()
         var queries = 0
 
-        fun router(g: CountryGraph): Router = routers.getOrPut(g.id) { g.graph.router(g.service.routeOptions(request)) }
+        // the choice of the crossings without the bearings (they only touch the ends): the quick search
+        fun router(g: CountryGraph): Router = routers.getOrPut(g.id) { g.graph.router(g.service.routeOptions(request).copy(hasBearings = false)) }
 
         /** L'aggancio di un punto ([exact]: un passaggio di confine, senza il controllo delle reti isolate). */
         fun snap(g: CountryGraph, p: LL, radius: Double, exact: Boolean = radius == TRANSFER_RADIUS): Snap? = snaps.getOrPut("${g.id}:${p.lat}:${p.lon}:$radius") {
@@ -185,23 +187,23 @@ class CrossBorderDirections(
 
         // i pezzi del viaggio: le tappe nello stesso grafo restano insieme, ai confini il passaggio migliore
         val pieces = ArrayList<Piece>()
-        var cur = Piece(of[0], mutableListOf(request.coordinates[0]), mutableListOf(radius(0)))
+        var cur = Piece(of[0], mutableListOf(request.coordinates[0]), mutableListOf(radius(0)), bearings = mutableListOf(request.bearings?.getOrNull(0)))
         for (i in 1 until pts.size) {
             if (of[i] !== cur.graph) {
                 val chain = chain(ctx, pts[i - 1], radius(i - 1), cur.graph, pts[i], radius(i), of[i])
                     ?: throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points ${i - 1} (%.7f %.7f) and $i (%.7f %.7f).".format(
                         pts[i - 1].lon, pts[i - 1].lat, pts[i].lon, pts[i].lat))
                 for ((t, next) in chain) {
-                    cur.points += t.lat to t.lon; cur.radiuses += TRANSFER_RADIUS; cur.exact += true
+                    cur.points += t.lat to t.lon; cur.radiuses += TRANSFER_RADIUS; cur.exact += true; cur.bearings += null
                     pieces += cur
-                    cur = Piece(next, mutableListOf(t.lat to t.lon), mutableListOf(TRANSFER_RADIUS), mutableListOf(true))
+                    cur = Piece(next, mutableListOf(t.lat to t.lon), mutableListOf(TRANSFER_RADIUS), mutableListOf(true), mutableListOf(null))
                 }
             }
-            cur.points += request.coordinates[i]; cur.radiuses += radius(i); cur.exact += false
+            cur.points += request.coordinates[i]; cur.radiuses += radius(i); cur.exact += false; cur.bearings += request.bearings?.getOrNull(i)
         }
         pieces += cur
         val docs = pieces.map { p ->
-            val r = p.graph.service.handle(request.withPoints(p.points, p.radiuses.toDoubleArray(), p.exact.toBooleanArray()), ResponseFormat.GEOJSON)
+            val r = p.graph.service.handle(request.withPoints(p.points, p.radiuses.toDoubleArray(), p.exact.toBooleanArray(), p.bearings), ResponseFormat.GEOJSON)
             @Suppress("UNCHECKED_CAST")
             (r["features"] as List<Map<String, Any?>>).first()
         }

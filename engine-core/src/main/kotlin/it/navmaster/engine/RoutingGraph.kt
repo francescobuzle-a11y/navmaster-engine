@@ -53,10 +53,12 @@ data class RouteOptions(
     val maximumSnappingRadius: Double = 400.0,
     /** ORS `continue_straight`: come in ORS forza la modalità flessibile (niente CH node-based). */
     val continueStraight: Boolean = false,
+    /** ORS `bearings`: come in ORS (`requiresNonDecreasingWeights`) niente CH node-based. */
+    val hasBearings: Boolean = false,
 ) {
     /** Richiesta "statica" nel senso di ORS: nessun filtro dipendente dalla richiesta. */
     val isStatic: Boolean get() = avoidFeatures == 0 && (vehicleParameters == null || !vehicleParameters.hasAttributes) &&
-        vehicleType == HeavyVehicleAttributes.HGV && avoidPolygons.isEmpty() && maximumSpeed.isInfinite() && !continueStraight
+        vehicleType == HeavyVehicleAttributes.HGV && avoidPolygons.isEmpty() && maximumSpeed.isInfinite() && !continueStraight && !hasBearings
 
     /**
      * Niente CH né Core: i poligoni possono toccare qualunque arco (ORS "non decreasing weights");

@@ -73,10 +73,23 @@ class Router(
      * [MIN_NETWORK_SIZE] nodi. Altrimenti un punto in una zona pedonale o su un tratto staccato
      * dal resto delle strade non avrebbe nessun percorso.
      */
-    fun snap(lat: Double, lon: Double, maxDistance: Double, pointIndex: Int, checkNetwork: Boolean = true): Snap {
+    fun snap(lat: Double, lon: Double, maxDistance: Double, pointIndex: Int, checkNetwork: Boolean = true, heading: Double = Double.NaN): Snap {
         val excluded = HashSet<Int>()
         val snapFilter = EdgeFilter { e ->
             e.edge !in excluded && filter.accept(e) && (weighting.edgeWeight(e, false).isFinite() || weighting.edgeWeight(e, true).isFinite())
+        }
+        // GraphHopper `HeadingEdgeFilter` (ORS bearings): first a road within 20 m that goes the
+        // given way (30°) in a direction the vehicle may drive; else the nearest road, as without
+        // (a lorry on the motorway: its own carriageway, not the opposite one a few metres nearer)
+        if (!heading.isNaN()) {
+            val withHeading = EdgeFilter { e -> snapFilter.accept(e) && headingMatches(e, lat, lon, heading) }
+            for (attempt in 0 until 4) {
+                val s = index.findClosest(lat, lon, withHeading)
+                if (!s.isValid || s.distance > minOf(maxDistance, HEADING_SNAP_DISTANCE)) break
+                if (!checkNetwork) return s
+                val small = smallNetwork(s.edge) ?: return s
+                excluded.addAll(small)
+            }
         }
         for (attempt in 0 until 8) {
             val s = index.findClosest(lat, lon, snapFilter)
@@ -86,6 +99,29 @@ class Router(
             excluded.addAll(small)
         }
         throw PointNotFoundException("Nessuna strada percorribile entro %.0f m dal punto %d (%.6f, %.6f)".format(maxDistance, pointIndex, lon, lat), pointIndex)
+    }
+
+    /** L'arco, vicino al punto (20 m), va nella direzione [heading] (30°) in un verso percorribile. */
+    private fun headingMatches(e: it.navmaster.engine.storage.BaseGraph.EdgeIterator, lat: Double, lon: Double, heading: Double): Boolean {
+        val g = graph.fetchWayGeometry(e.edge, false, FetchMode.ALL)
+        val k = Math.cos(Math.toRadians(lat))
+        var best = HEADING_SNAP_DISTANCE
+        var bearing = Double.NaN
+        for (i in 0 until g.size - 1) {
+            val ax = (g.lon(i) - lon) * k * DistanceCalc.METERS_PER_DEGREE; val ay = (g.lat(i) - lat) * DistanceCalc.METERS_PER_DEGREE
+            val bx = (g.lon(i + 1) - lon) * k * DistanceCalc.METERS_PER_DEGREE; val by = (g.lat(i + 1) - lat) * DistanceCalc.METERS_PER_DEGREE
+            val dx = bx - ax; val dy = by - ay
+            val l2 = dx * dx + dy * dy
+            val t = if (l2 > 0) (-(ax * dx + ay * dy) / l2).coerceIn(0.0, 1.0) else 0.0
+            val d = Math.hypot(ax + dx * t, ay + dy * t)
+            if (d < best) { best = d; bearing = DistanceCalc.bearing(g.lat(i), g.lon(i), g.lat(i + 1), g.lon(i + 1)) }
+        }
+        if (bearing.isNaN()) return false
+        // il verso A→B dell'arco rispetto all'iteratore
+        val aToB = e.baseNode == graph.nodeA(e.edge)
+        val forwardOk = weighting.edgeWeight(e, !aToB).isFinite()
+        val backwardOk = weighting.edgeWeight(e, aToB).isFinite()
+        return (angle(bearing, heading) < HEADING_SNAP_TOLERANCE && forwardOk) || (angle((bearing + 180.0) % 360.0, heading) < HEADING_SNAP_TOLERANCE && backwardOk)
     }
 
     /** Gli archi della piccola rete isolata di [edge], o null quando l'arco è nella rete principale. */
@@ -123,6 +159,13 @@ class Router(
     companion object {
         /** ORS `min_network_size`. */
         const val MIN_NETWORK_SIZE = 200
+        /** GraphHopper `heading_penalty` (ORS `DEFAULT_HEADING_PENALTY`): 300 s. */
+        const val HEADING_PENALTY = 300.0
+        /** Oltre questa differenza (gradi) un tratto non va nella direzione chiesta (GraphHopper: 100°). */
+        const val HEADING_TOLERANCE = 100.0
+        /** GraphHopper `HeadingEdgeFilter`: entro 30° e 20 m. */
+        const val HEADING_SNAP_TOLERANCE = 30.0
+        const val HEADING_SNAP_DISTANCE = 20.0
     }
 
     /**
@@ -131,9 +174,9 @@ class Router(
      * invertire sull'arco. Per un aggancio esatto su una torre l'arco d'arrivo è già alle spalle e
      * nessuna parte viene esclusa.
      */
-    fun route(from: Snap, to: Snap, arrival: PathEdge? = null): RoutePath {
-        var fromParts = splitEdge(from, asTarget = false)
-        val toParts = splitEdge(to, asTarget = true)
+    fun route(from: Snap, to: Snap, arrival: PathEdge? = null, fromHeading: Double = Double.NaN, toHeading: Double = Double.NaN): RoutePath {
+        var fromParts = splitEdge(from, asTarget = false).map { penalised(it, from, fromHeading, asTarget = false) }
+        val toParts = splitEdge(to, asTarget = true).map { penalised(it, to, toHeading, asTarget = true) }
         var best: RoutePath? = null
         val keepDirection = arrival != null && from.position != SnapPosition.TOWER && arrival.edge == from.edge
         if (keepDirection) {
@@ -144,6 +187,12 @@ class Router(
         // caso speciale: stesso arco, tratto diretto fra i due punti
         if (from.edge == to.edge && from.position != SnapPosition.TOWER || (from.edge == to.edge && to.position != SnapPosition.TOWER)) {
             best = sameEdgeRoute(from, to)
+            // la direzione chiesta (ORS bearings) vale anche per il tratto diretto sullo stesso arco
+            if (best != null && best.edges.isNotEmpty() && (!fromHeading.isNaN() || !toHeading.isNaN())) {
+                val dir = travelBearing(from, !best.edges[0].reverse)
+                val bad = (!fromHeading.isNaN() && angle(dir, fromHeading) > HEADING_TOLERANCE) || (!toHeading.isNaN() && angle(dir, toHeading) > HEADING_TOLERANCE)
+                if (bad) best = RoutePath(best.edges, best.distance, best.millis, best.weight + HEADING_PENALTY)
+            }
             // continue_straight: il tratto diretto vale solo se prosegue nel verso d'arrivo
             if (keepDirection && best != null && best.edges.isNotEmpty() && best.edges[0].reverse != arrival!!.reverse) best = null
         }
@@ -230,6 +279,32 @@ class Router(
         }
         return true
     }
+
+    /**
+     * ORS `bearings` (GraphHopper `heading`): un tratto iniziale che parte (o finale che arriva) in
+     * una direzione diversa di oltre [HEADING_TOLERANCE] gradi da quella chiesta costa
+     * [HEADING_PENALTY] in più (`heading_penalty`, 300 s): si parte nel verso del mezzo, salvo non
+     * ci sia altra via.
+     */
+    private fun penalised(p: EdgePart, s: Snap, heading: Double, asTarget: Boolean): EdgePart {
+        if (heading.isNaN() || s.position == SnapPosition.TOWER) return p
+        // la direzione di marcia sul tratto: verso B (A→B) se la torre è B, verso A altrimenti; un
+        // arrivo percorre il tratto dalla torre verso il punto (il verso opposto)
+        val towardB = (p.node == graph.nodeB(s.edge)) != asTarget
+        val dir = travelBearing(s, towardB)
+        return if (angle(dir, heading) > HEADING_TOLERANCE) EdgePart(p.node, p.weight + HEADING_PENALTY, p.distance, p.millis, p.geometry, p.edge, p.reverse) else p
+    }
+
+    /** La direzione (gradi) del segmento dell'arco su cui sta [s], nel verso A→B ([towardB]) o B→A. */
+    private fun travelBearing(s: Snap, towardB: Boolean): Double {
+        val all = graph.fetchWayGeometry(s.edge, reverse = false, FetchMode.ALL)
+        val i = s.wayIndex.coerceIn(0, maxOf(0, all.size - 2))
+        if (all.size < 2) return 0.0
+        val b = DistanceCalc.bearing(all.lat(i), all.lon(i), all.lat(i + 1), all.lon(i + 1))
+        return if (towardB) b else (b + 180.0) % 360.0
+    }
+
+    private fun angle(a: Double, b: Double): Double = Math.abs(((a - b + 540.0) % 360.0) - 180.0)
 
     /** Tratto parziale di un arco agganciato: dal punto agganciato alla torre [node] (o viceversa). */
     private class EdgePart(val node: Int, val weight: Double, val distance: Double, val millis: Long, val geometry: PointList, val edge: Int, val reverse: Boolean)

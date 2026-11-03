@@ -82,11 +82,17 @@ class DirectionsRequest(
      * confine di un viaggio tra Paesi (dove l'estratto di un Paese finisce, la strada è un moncone).
      */
     val exactPoints: BooleanArray? = null,
+    /**
+     * ORS `bearings`: per punto la direzione (gradi) con cui partire da lì (e, per l'ultimo, con
+     * cui arrivarci); null dove non è data.
+     */
+    val bearings: List<Double?>? = null,
 ) {
     /** La stessa richiesta su altri punti (un tratto di un viaggio tra Paesi), senza alternative. */
-    fun withPoints(points: List<Pair<Double, Double>>, pointRadiuses: DoubleArray?, exact: BooleanArray? = null): DirectionsRequest = DirectionsRequest(
+    fun withPoints(points: List<Pair<Double, Double>>, pointRadiuses: DoubleArray?, exact: BooleanArray? = null, pointBearings: List<Double?>? = null): DirectionsRequest = DirectionsRequest(
         profile, points, preference, units, language, instructions, htmlFormat, geometry, maneuvers, avoidFeatures, vehicleType,
-        vehicleParameters, avoidPolygons, maximumSpeed, continueStraight, navmasterRoads, null, pointRadiuses, id, attributes, extraInfo, echo, exact)
+        vehicleParameters, avoidPolygons, maximumSpeed, continueStraight, navmasterRoads, null, pointRadiuses, id, attributes, extraInfo, echo, exact,
+        pointBearings?.takeIf { b -> b.any { it != null } })
 
     companion object {
         private val KNOWN = setOf("coordinates", "preference", "units", "language", "instructions", "instructions_format", "geometry", "maneuvers",
@@ -148,6 +154,16 @@ class DirectionsRequest(
             val extraInfo = (body["extra_info"] as? List<*>)?.map { it.toString() } ?: emptyList()
             for (x in extraInfo) if (x !in SUPPORTED_EXTRA_INFO) throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'extra_info' has incorrect value of '$x'.")
             val maximumSpeed = body["maximum_speed"]?.let { num(it, "maximum_speed") } ?: Double.POSITIVE_INFINITY
+            // ORS `bearings`: [[gradi, deviazione], …] per punto (o per tutti salvo l'ultimo); [] per nessuna
+            val bearings = (body["bearings"] as? List<*>)?.let { list ->
+                if (list.size != coordinates.size && list.size != coordinates.size - 1) throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'bearings' must have one entry per coordinate (or one less).")
+                List(coordinates.size) { i ->
+                    val b = list.getOrNull(i) as? List<*>
+                    if (b == null || b.isEmpty()) null else num(b[0], "bearings").also { v ->
+                        if (v < 0 || v > 360) throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'bearings' has an invalid value.")
+                    }
+                }
+            }?.takeIf { b -> b.any { it != null } }
             if (maximumSpeed < MAXIMUM_SPEED_LOWER_BOUND) throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'maximum_speed' must be at least ${MAXIMUM_SPEED_LOWER_BOUND.toInt()} km/h.")
             return DirectionsRequest(
                 profile, coordinates, preference, units, body["language"]?.toString() ?: "en",
@@ -163,6 +179,7 @@ class DirectionsRequest(
                     AlternativeOptions(count, (a["weight_factor"] as? Number)?.toDouble() ?: 1.4, (a["share_factor"] as? Number)?.toDouble() ?: 0.6)
                 },
                 radiuses = radiuses, id = body["id"]?.toString(), attributes = attributes, extraInfo = extraInfo, echo = body,
+                bearings = bearings,
             )
         }
 
@@ -224,6 +241,7 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         vehicleType = request.vehicleType, vehicleParameters = request.vehicleParameters,
         avoidPolygons = request.avoidPolygons, maximumSpeed = request.maximumSpeed,
         continueStraight = request.continueStraight,
+        hasBearings = request.bearings != null,
     )
 
     /** Il raggio di aggancio massimo del servizio (metri). */
@@ -251,7 +269,7 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         val router = graphs.router(routeOptions)
         val snaps = request.coordinates.mapIndexed { i, (lat, lon) ->
             val radius = request.radiuses?.get(i)?.takeIf { it > 0 } ?: limits.maximumSnappingRadius
-            try { router.snap(lat, lon, radius, i, checkNetwork = request.exactPoints?.getOrNull(i) != true) } catch (e: PointNotFoundException) {
+            try { router.snap(lat, lon, radius, i, checkNetwork = request.exactPoints?.getOrNull(i) != true, heading = request.bearings?.getOrNull(i) ?: Double.NaN) } catch (e: PointNotFoundException) {
                 throw ApiException(404, RoutingErrorCodes.POINT_NOT_FOUND, "Could not find routable point within a radius of ${radius.toLong()} meters of specified coordinate ${e.pointIndex}: %.7f %.7f.".format(lon, lat))
             }
         }
@@ -269,7 +287,10 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
             for (i in 1 until snaps.size) {
                 // continue_straight: il tratto prosegue nel verso con cui il precedente è arrivato al via-point
                 val arrival = if (request.continueStraight) legs.lastOrNull()?.edges?.lastOrNull() else null
-                try { legs += router.route(snaps[i - 1], snaps[i], arrival) } catch (e: RouteNotFoundException) {
+                // ORS `bearings`: la direzione di partenza dal punto i−1 e d'arrivo al punto i
+                val fromHeading = request.bearings?.getOrNull(i - 1) ?: Double.NaN
+                val toHeading = if (i == snaps.size - 1) request.bearings?.getOrNull(i) ?: Double.NaN else Double.NaN
+                try { legs += router.route(snaps[i - 1], snaps[i], arrival, fromHeading, toHeading) } catch (e: RouteNotFoundException) {
                     throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points ${i - 1} (%.7f %.7f) and $i (%.7f %.7f).".format(
                         request.coordinates[i - 1].second, request.coordinates[i - 1].first, request.coordinates[i].second, request.coordinates[i].first))
                 }
