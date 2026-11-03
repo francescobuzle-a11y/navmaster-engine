@@ -56,6 +56,8 @@ class Router(
     /** Landmark del core: la fase 2 diventa un A* bidirezionale (core-ALT). */
     private val landmarks: it.navmaster.engine.ch.CoreLandmarks? = null,
     private val maxVisitedNodes: Int = Int.MAX_VALUE,
+    /** The times of the path (normally the weighting's; with maximumSpeedTimeOnly the limited speed). */
+    private val timeWeighting: Weighting = weighting,
 ) {
     /** Quale algoritmo verrà usato: utile per diagnostica e test. */
     val algorithm: String get() = when {
@@ -332,7 +334,7 @@ class Router(
         val fracA = if (total > 0) dA / total else 0.5; val fracB = if (total > 0) dB / total else 0.5
         it.setEdge(s.edge, a)
         val wFwd = weighting.edgeWeight(it, false); val wBwd = weighting.edgeWeight(it, true)
-        val msFwd = weighting.edgeMillis(it, false); val msBwd = weighting.edgeMillis(it, true)
+        val msFwd = timeWeighting.edgeMillis(it, false); val msBwd = timeWeighting.edgeMillis(it, true)
         val parts = ArrayList<EdgePart>(2)
         // partenza: verso B percorrendo A→B (peso diretto); arrivo: da B verso lo snap percorrendo B→A (peso inverso)
         val wToB = if (asTarget) wBwd else wFwd; val msToB = if (asTarget) msBwd else msFwd
@@ -371,7 +373,7 @@ class Router(
         geom.add(to.snappedLat, to.snappedLon)
         val d = length(geom)
         val frac = if (total > 0) d / total else 1.0
-        val ms = (weighting.edgeMillis(it, !forward) * frac).toLong()
+        val ms = (timeWeighting.edgeMillis(it, !forward) * frac).toLong()
         val base = if (forward) graph.nodeA(from.edge) else graph.nodeB(from.edge)
         val adj = if (forward) graph.nodeB(from.edge) else graph.nodeA(from.edge)
         return RoutePath(listOf(PathEdge(from.edge, !forward, base, adj, geom, d, ms, w * frac, graph.name(from.edge))), d, ms, w * frac)
@@ -397,7 +399,7 @@ class Router(
         for (i in sp.edges.indices) {
             val e = sp.edges[i]; val base = sp.nodes[i]
             it.setEdge(e, base)
-            val w = weighting.edgeWeight(it, false); val ms = weighting.edgeMillis(it, false)
+            val w = weighting.edgeWeight(it, false); val ms = timeWeighting.edgeMillis(it, false)
             edges += PathEdge(e, it.reverse, base, it.adjNode, it.fetchWayGeometry(FetchMode.ALL), it.distance, ms, w, it.name)
             distance += it.distance; millis += ms; weight += w
         }

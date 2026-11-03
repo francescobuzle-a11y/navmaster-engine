@@ -149,7 +149,11 @@ class CrossBorderDirections(
         var queries = 0
 
         // the choice of the crossings without the bearings (they only touch the ends): the quick search
-        fun router(g: CountryGraph): Router = routers.getOrPut(g.id) { g.graph.router(g.service.routeOptions(request).copy(hasBearings = false)) }
+        fun router(g: CountryGraph): Router = routers.getOrPut(g.id) {
+            val o = g.service.routeOptions(request).copy(hasBearings = false)
+            // a trip across a border is a long one: a limited speed on the times only (the quick search)
+            g.graph.router(if (o.maximumSpeed.isFinite() && o.maximumSpeed >= DirectionsRequest.MAXIMUM_SPEED_LOWER_BOUND) o.copy(maximumSpeedTimeOnly = true) else o)
+        }
 
         /** L'aggancio di un punto ([exact]: un passaggio di confine, senza il controllo delle reti isolate). */
         fun snap(g: CountryGraph, p: LL, radius: Double, exact: Boolean = radius == TRANSFER_RADIUS): Snap? = snaps.getOrPut("${g.id}:${p.lat}:${p.lon}:$radius") {

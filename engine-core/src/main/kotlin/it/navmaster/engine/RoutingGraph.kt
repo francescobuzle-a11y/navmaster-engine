@@ -55,16 +55,23 @@ data class RouteOptions(
     val continueStraight: Boolean = false,
     /** ORS `bearings`: come in ORS (`requiresNonDecreasingWeights`) niente CH node-based. */
     val hasBearings: Boolean = false,
+    /**
+     * [maximumSpeed] (≥ 80 km/h, `maximum_speed_lower_bound`) sui tempi soltanto: il percorso con
+     * le preparazioni, le durate con la velocità limitata. ORS la applica dentro il suo core, che
+     * contiene gli archi più veloci di 80 km/h; il nostro core ridotto no, e la ricerca piena su un
+     * viaggio lungo non sta nella memoria del tablet. Usato oltre i 60 km in linea d'aria.
+     */
+    val maximumSpeedTimeOnly: Boolean = false,
 ) {
     /** Richiesta "statica" nel senso di ORS: nessun filtro dipendente dalla richiesta. */
     val isStatic: Boolean get() = avoidFeatures == 0 && (vehicleParameters == null || !vehicleParameters.hasAttributes) &&
-        vehicleType == HeavyVehicleAttributes.HGV && avoidPolygons.isEmpty() && maximumSpeed.isInfinite() && !continueStraight && !hasBearings
+        vehicleType == HeavyVehicleAttributes.HGV && avoidPolygons.isEmpty() && (maximumSpeed.isInfinite() || maximumSpeedTimeOnly) && !continueStraight && !hasBearings
 
     /**
      * Niente CH né Core: i poligoni possono toccare qualunque arco (ORS "non decreasing weights");
      * `avoid_features` e `maximum_speed` toccano archi fuori dal nostro core (vedi [CoreEdgeSelector]).
      */
-    val needsFullSearch: Boolean get() = avoidPolygons.isNotEmpty() || avoidFeatures != 0 || maximumSpeed.isFinite()
+    val needsFullSearch: Boolean get() = avoidPolygons.isNotEmpty() || avoidFeatures != 0 || (maximumSpeed.isFinite() && !maximumSpeedTimeOnly)
 }
 
 /**
@@ -144,7 +151,9 @@ class RoutingGraph private constructor(
     fun router(options: RouteOptions): Router {
         val name = encoderName(options.profile)
         val pe = encoding.profile(name)
-        val weighting = WeightingFactory.create(encoding, pe, options.weighting, options.maximumSpeed)
+        val weighting = WeightingFactory.create(encoding, pe, options.weighting, if (options.maximumSpeedTimeOnly) Double.POSITIVE_INFINITY else options.maximumSpeed)
+        // the times with the limited speed, also when the search does not use it (see maximumSpeedTimeOnly)
+        val timeWeighting = if (options.maximumSpeedTimeOnly) WeightingFactory.create(encoding, pe, options.weighting, options.maximumSpeed) else weighting
         val filter: EdgeFilter = EdgeFilterFactory.create(encoding, name, options.avoidFeatures, options.vehicleType, options.vehicleParameters, options.avoidPolygons)
         val tcp = if (options.turnCosts) TurnCostProvider(turnCosts, name) else null
         val key = chKey(name, weighting)
@@ -152,7 +161,7 @@ class RoutingGraph private constructor(
         val ch = if (options.allowCH && options.isStatic) chStorages[key]?.let { CHGraph(graph, it, weighting) } else null
         val core = if (ch == null && options.allowCH && !options.needsFullSearch) chStorages["${key}_core"]?.let { CHGraph(graph, it, weighting) } else null
         val lm = if (core != null) landmarks["${key}_core"] else null
-        return Router(graph, index, weighting, filter, tcp, ch, core, lm)
+        return Router(graph, index, weighting, filter, tcp, ch, core, lm, timeWeighting = timeWeighting)
     }
 
     fun flush() { graph.flush(); turnCosts.flush(); guidance?.flush(graph.edgeCount); points?.flush(); GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); save() } }

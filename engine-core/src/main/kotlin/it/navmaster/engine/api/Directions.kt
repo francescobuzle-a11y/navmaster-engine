@@ -244,6 +244,11 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         hasBearings = request.bearings != null,
     )
 
+    /** maximum_speed ≥ 80 km/h su un viaggio oltre [FAST_MAXIMUM_SPEED_BEELINE] in linea d'aria: solo sui tempi. */
+    fun fastMaximumSpeed(o: RouteOptions, beeline: Double): Boolean =
+        o.maximumSpeed.isFinite() && o.maximumSpeed >= DirectionsRequest.MAXIMUM_SPEED_LOWER_BOUND && beeline > FAST_MAXIMUM_SPEED_BEELINE &&
+            o.avoidPolygons.isEmpty() && o.avoidFeatures == 0
+
     /** Il raggio di aggancio massimo del servizio (metri). */
     val maximumSnappingRadius: Double get() = limits.maximumSnappingRadius
 
@@ -266,7 +271,8 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         if (beeline > maxDist) throw ApiException(400, RoutingErrorCodes.REQUEST_EXCEEDS_SERVER_LIMIT, "The approximated route distance must not be greater than ${maxDist.toLong()} meters.")
         if (request.alternatives != null && beeline > limits.maximumDistanceAlternativeRoutes) throw ApiException(400, RoutingErrorCodes.REQUEST_EXCEEDS_SERVER_LIMIT, "The approximated route distance must not be greater than ${limits.maximumDistanceAlternativeRoutes.toLong()} meters for alternative routes.")
 
-        val router = graphs.router(routeOptions)
+        // a long trip with a limited speed: the speed on the times only (see RouteOptions.maximumSpeedTimeOnly)
+        val router = graphs.router(if (fastMaximumSpeed(routeOptions, beeline)) routeOptions.copy(maximumSpeedTimeOnly = true) else routeOptions)
         val snaps = request.coordinates.mapIndexed { i, (lat, lon) ->
             val radius = request.radiuses?.get(i)?.takeIf { it > 0 } ?: limits.maximumSnappingRadius
             try { router.snap(lat, lon, radius, i, checkNetwork = request.exactPoints?.getOrNull(i) != true, heading = request.bearings?.getOrNull(i) ?: Double.NaN) } catch (e: PointNotFoundException) {
@@ -438,6 +444,8 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
     }
 
     companion object {
+        /** Oltre questa distanza in linea d'aria (m) maximum_speed vale sui tempi soltanto. */
+        const val FAST_MAXIMUM_SPEED_BEELINE = 60_000.0
         val BUILD_DATE: String = Instant.now().toString()
         fun r6(v: Double) = Math.round(v * 1e6) / 1e6
         fun roundForUnits(v: Double, units: DistanceUnit): Double { val f = Math.pow(10.0, units.decimals.toDouble()); return Math.round(v * f) / f }
