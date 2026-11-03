@@ -77,7 +77,17 @@ class DirectionsRequest(
     val extraInfo: List<String>,
     /** Richiesta originale, rispecchiata in `metadata.query`. */
     val echo: Map<String, Any?>,
+    /**
+     * Punti agganciati così come sono, senza il controllo delle piccole reti isolate: i passaggi di
+     * confine di un viaggio tra Paesi (dove l'estratto di un Paese finisce, la strada è un moncone).
+     */
+    val exactPoints: BooleanArray? = null,
 ) {
+    /** La stessa richiesta su altri punti (un tratto di un viaggio tra Paesi), senza alternative. */
+    fun withPoints(points: List<Pair<Double, Double>>, pointRadiuses: DoubleArray?, exact: BooleanArray? = null): DirectionsRequest = DirectionsRequest(
+        profile, points, preference, units, language, instructions, htmlFormat, geometry, maneuvers, avoidFeatures, vehicleType,
+        vehicleParameters, avoidPolygons, maximumSpeed, continueStraight, navmasterRoads, null, pointRadiuses, id, attributes, extraInfo, echo, exact)
+
     companion object {
         private val KNOWN = setOf("coordinates", "preference", "units", "language", "instructions", "instructions_format", "geometry", "maneuvers",
             "options", "radiuses", "id", "attributes", "elevation", "extra_info", "continue_straight", "roundabout_exits", "geometry_simplify",
@@ -208,13 +218,22 @@ data class DirectionsLimits(
 class DirectionsService(private val graphs: RoutingGraph, private val limits: DirectionsLimits = DirectionsLimits(), private val version: String = Engine.VERSION) {
     val attribution = "navmaster-engine | OpenStreetMap contributors"
 
+    /** Le opzioni di calcolo di una richiesta. */
+    fun routeOptions(request: DirectionsRequest) = RouteOptions(
+        profile = request.profile, weighting = request.preference, avoidFeatures = request.avoidFeatures,
+        vehicleType = request.vehicleType, vehicleParameters = request.vehicleParameters,
+        avoidPolygons = request.avoidPolygons, maximumSpeed = request.maximumSpeed,
+        continueStraight = request.continueStraight,
+    )
+
+    /** Il raggio di aggancio massimo del servizio (metri). */
+    val maximumSnappingRadius: Double get() = limits.maximumSnappingRadius
+
+    /** Il grafo del servizio. */
+    val routingGraph: RoutingGraph get() = graphs
+
     fun handle(request: DirectionsRequest, format: ResponseFormat): Map<String, Any?> {
-        val routeOptions = RouteOptions(
-            profile = request.profile, weighting = request.preference, avoidFeatures = request.avoidFeatures,
-            vehicleType = request.vehicleType, vehicleParameters = request.vehicleParameters,
-            avoidPolygons = request.avoidPolygons, maximumSpeed = request.maximumSpeed,
-            continueStraight = request.continueStraight,
-        )
+        val routeOptions = routeOptions(request)
         val encoder = try { graphs.encoderName(request.profile) } catch (e: IllegalArgumentException) {
             throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'profile' has incorrect value of '${request.profile}'.")
         }
@@ -232,7 +251,7 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         val router = graphs.router(routeOptions)
         val snaps = request.coordinates.mapIndexed { i, (lat, lon) ->
             val radius = request.radiuses?.get(i)?.takeIf { it > 0 } ?: limits.maximumSnappingRadius
-            try { router.snap(lat, lon, radius, i) } catch (e: PointNotFoundException) {
+            try { router.snap(lat, lon, radius, i, checkNetwork = request.exactPoints?.getOrNull(i) != true) } catch (e: PointNotFoundException) {
                 throw ApiException(404, RoutingErrorCodes.POINT_NOT_FOUND, "Could not find routable point within a radius of ${radius.toLong()} meters of specified coordinate ${e.pointIndex}: %.7f %.7f.".format(lon, lat))
             }
         }

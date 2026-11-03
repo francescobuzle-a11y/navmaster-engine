@@ -155,7 +155,11 @@ class RoutingGraph private constructor(
 
     fun flush() { graph.flush(); turnCosts.flush(); guidance?.flush(graph.edgeCount); points?.flush(); GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); save() } }
 
-    override fun close() { graph.close(); turnCosts.close(); guidance?.close(); points?.close(); chStorages.values.forEach { it.close() } }
+    override fun close() {
+        graph.close(); turnCosts.close(); guidance?.close(); points?.close(); chStorages.values.forEach { it.close() }
+        landmarks.values.forEach { it.close() }
+        if (this::index.isInitialized) index.close()
+    }
 
     companion object {
         fun profileByName(name: String): VehicleProfile = when (name) {

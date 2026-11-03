@@ -3,6 +3,7 @@ package it.navmaster.engine.ch
 import it.navmaster.engine.GRAPH_FORMAT_VERSION
 import it.navmaster.engine.routing.NodeHeap
 import it.navmaster.engine.storage.GraphDirectory
+import it.navmaster.engine.storage.IntSource
 import it.navmaster.engine.weighting.Weighting
 import java.util.Random
 
@@ -18,33 +19,39 @@ import java.util.Random
  */
 class CoreLandmarks private constructor(
     val landmarkCount: Int,
-    private val coreIndex: IntArray,
-    private val distances: FloatArray,
+    private val coreIndex: IntSource,
+    /** Le distanze come bit dei float (letti dal file mappato senza copiarli nell'heap). */
+    private val distanceBits: IntSource,
     val landmarkNodes: IntArray,
 ) {
+    private constructor(k: Int, coreIndex: IntArray, distances: FloatArray, lms: IntArray) :
+        this(k, IntSource.OfArray(coreIndex), IntSource.OfArray(IntArray(distances.size) { java.lang.Float.floatToRawIntBits(distances[it]) }), lms)
+
     fun isCoreNode(node: Int) = coreIndex[node] >= 0
 
     /** d(L→v); +∞ se v non è nel core o irraggiungibile. */
     fun fromLandmark(l: Int, node: Int): Double {
         val ci = coreIndex[node]; if (ci < 0) return Double.POSITIVE_INFINITY
-        return distances[ci * 2 * landmarkCount + 2 * l].toDouble()
+        return java.lang.Float.intBitsToFloat(distanceBits[ci * 2 * landmarkCount + 2 * l]).toDouble()
     }
 
     /** d(v→L). */
     fun toLandmark(l: Int, node: Int): Double {
         val ci = coreIndex[node]; if (ci < 0) return Double.POSITIVE_INFINITY
-        return distances[ci * 2 * landmarkCount + 2 * l + 1].toDouble()
+        return java.lang.Float.intBitsToFloat(distanceBits[ci * 2 * landmarkCount + 2 * l + 1]).toDouble()
     }
+
+    fun close() { coreIndex.close(); distanceBits.close() }
 
     fun save(dir: GraphDirectory, name: String) {
         val da = dir.create("landmarks_$name", 1 shl 20)
-        val coreCount = if (landmarkCount == 0) 0 else distances.size / (2 * landmarkCount)
+        val coreCount = if (landmarkCount == 0) 0 else distanceBits.size / (2 * landmarkCount)
         da.setHeader(0, GRAPH_FORMAT_VERSION); da.setHeader(1, landmarkCount); da.setHeader(2, coreCount); da.setHeader(3, coreIndex.size)
         val idxBytes = coreIndex.size.toLong() * 4
-        da.ensureCapacity(idxBytes + distances.size.toLong() * 4 + landmarkNodes.size.toLong() * 4 + 4)
-        for (i in coreIndex.indices) da.setInt(i.toLong() * 4, coreIndex[i])
-        for (i in distances.indices) da.setInt(idxBytes + i.toLong() * 4, java.lang.Float.floatToRawIntBits(distances[i]))
-        val lmBytes = idxBytes + distances.size.toLong() * 4
+        da.ensureCapacity(idxBytes + distanceBits.size.toLong() * 4 + landmarkNodes.size.toLong() * 4 + 4)
+        for (i in 0 until coreIndex.size) da.setInt(i.toLong() * 4, coreIndex[i])
+        for (i in 0 until distanceBits.size) da.setInt(idxBytes + i.toLong() * 4, distanceBits[i])
+        val lmBytes = idxBytes + distanceBits.size.toLong() * 4
         for (i in landmarkNodes.indices) da.setInt(lmBytes + i.toLong() * 4, landmarkNodes[i])
         da.flush(); da.close()
     }
@@ -52,16 +59,22 @@ class CoreLandmarks private constructor(
     companion object {
         fun load(dir: GraphDirectory, name: String, nodeCount: Int): CoreLandmarks? {
             val da = dir.open("landmarks_$name", 1 shl 20) ?: return null
+            var keep = false
             try {
                 if (da.getHeader(0) != GRAPH_FORMAT_VERSION || da.getHeader(3) != nodeCount) return null
                 val k = da.getHeader(1); val coreCount = da.getHeader(2)
-                val coreIndex = IntArray(nodeCount) { da.getInt(it.toLong() * 4) }
                 val idxBytes = nodeCount.toLong() * 4
-                val distances = FloatArray(coreCount * 2 * k) { java.lang.Float.intBitsToFloat(da.getInt(idxBytes + it.toLong() * 4)) }
-                val lmBytes = idxBytes + distances.size.toLong() * 4
+                val nDist = coreCount * 2 * k
+                val lmBytes = idxBytes + nDist.toLong() * 4
                 val lms = IntArray(k) { da.getInt(lmBytes + it.toLong() * 4) }
-                return CoreLandmarks(k, coreIndex, distances, lms)
-            } finally { da.close() }
+                // grafo mappato: letti dal file (niente copia nell'heap); in RAM copiati negli array
+                if (dir.mmap) {
+                    keep = true
+                    return CoreLandmarks(k, IntSource.OfData(da, 0, nodeCount), IntSource.OfData(da, idxBytes, nDist), lms)
+                }
+                return CoreLandmarks(k, IntSource.OfArray(IntArray(nodeCount) { da.getInt(it.toLong() * 4) }),
+                    IntSource.OfArray(IntArray(nDist) { da.getInt(idxBytes + it.toLong() * 4) }), lms)
+            } finally { if (!keep) da.close() }
         }
 
         /**

@@ -1,5 +1,7 @@
 package it.navmaster.engine.index
 
+import it.navmaster.engine.storage.IntSource
+
 import com.carrotsearch.hppc.IntArrayList
 import com.carrotsearch.hppc.IntHashSet
 import it.navmaster.engine.storage.BaseGraph
@@ -41,9 +43,12 @@ class LocationIndex private constructor(
     private val minLat: Double, private val minLon: Double,
     private val cellSizeLat: Double, private val cellSizeLon: Double,
     private val rows: Int, private val cols: Int,
-    private val cellStart: IntArray,   // cols*rows + 1
-    private val cellEdges: IntArray,
+    private val cellStart: IntSource,   // cols*rows + 1
+    private val cellEdges: IntSource,
 ) {
+    /** Chiude il file dell'indice quando è letto dal file mappato. */
+    fun close() { cellStart.close(); cellEdges.close() }
+
     val cells get() = rows * cols
     val entries get() = cellEdges.size
 
@@ -122,6 +127,18 @@ class LocationIndex private constructor(
 
     private fun closerTower(pl: PointList, idx: Int, a: Int, b: Int): Int = if (idx < (pl.size - 1) / 2) a else b
 
+    /** Vero se la cella del punto (o una vicina) ha archi: un controllo rapido prima di [findClosest]. */
+    fun hasEdgesNear(lat: Double, lon: Double): Boolean {
+        if (!graph.bounds.contains(lat, lon)) return false
+        val r0 = row(lat); val c0 = col(lon)
+        for (r in r0 - 1..r0 + 1) for (c in c0 - 1..c0 + 1) {
+            if (r < 0 || r >= rows || c < 0 || c >= cols) continue
+            val cell = r * cols + c
+            if (cellStart[cell + 1] > cellStart[cell]) return true
+        }
+        return false
+    }
+
     /** Archi che toccano le celle della bbox data (può contenere archi che non intersecano la bbox). */
     fun query(minLat: Double, minLon: Double, maxLat: Double, maxLon: Double): IntArray {
         val set = IntHashSet()
@@ -144,8 +161,8 @@ class LocationIndex private constructor(
         da.setHeader(9, java.lang.Double.doubleToLongBits(cellSizeLat).toInt()); da.setHeader(10, (java.lang.Double.doubleToLongBits(cellSizeLat) ushr 32).toInt())
         val startBytes = cellStart.size.toLong() * 4
         da.ensureCapacity(startBytes + cellEdges.size.toLong() * 4)
-        for (i in cellStart.indices) da.setInt(i.toLong() * 4, cellStart[i])
-        for (i in cellEdges.indices) da.setInt(startBytes + i.toLong() * 4, cellEdges[i])
+        for (i in 0 until cellStart.size) da.setInt(i.toLong() * 4, cellStart[i])
+        for (i in 0 until cellEdges.size) da.setInt(startBytes + i.toLong() * 4, cellEdges[i])
         da.flush(); da.close()
     }
 
@@ -156,16 +173,24 @@ class LocationIndex private constructor(
         /** Carica l'indice salvato, se esiste e corrisponde al grafo. */
         fun load(graph: BaseGraph, dir: it.navmaster.engine.storage.GraphDirectory): LocationIndex? {
             val da = dir.open("location_index", 1 shl 20) ?: return null
+            var keep = false
             try {
                 if (da.getHeader(0) != it.navmaster.engine.GRAPH_FORMAT_VERSION || da.getHeader(1) != (graph.nodeCount xor graph.edgeCount)) return null
                 val rows = da.getHeader(2); val cols = da.getHeader(3); val entries = da.getHeader(4)
                 fun dbl(lo: Int, hi: Int) = java.lang.Double.longBitsToDouble((da.getHeader(lo).toLong() and 0xFFFFFFFFL) or (da.getHeader(hi).toLong() shl 32))
                 val minLat = dbl(5, 6); val minLon = dbl(7, 8); val cell = dbl(9, 10)
+                val startBytes = (rows * cols + 1).toLong() * 4
+                // dal file mappato senza copiarlo; in RAM (grafo non mappato) copiato negli array
+                if (dir.mmap) {
+                    val idx = LocationIndex(graph, minLat, minLon, cell, cell, rows, cols,
+                        IntSource.OfData(da, 0, rows * cols + 1), IntSource.OfData(da, startBytes, entries))
+                    keep = true
+                    return idx
+                }
                 val cellStart = IntArray(rows * cols + 1) { da.getInt(it.toLong() * 4) }
-                val startBytes = cellStart.size.toLong() * 4
                 val cellEdges = IntArray(entries) { da.getInt(startBytes + it.toLong() * 4) }
-                return LocationIndex(graph, minLat, minLon, cell, cell, rows, cols, cellStart, cellEdges)
-            } finally { da.close() }
+                return LocationIndex(graph, minLat, minLon, cell, cell, rows, cols, IntSource.OfArray(cellStart), IntSource.OfArray(cellEdges))
+            } finally { if (!keep) da.close() }
         }
 
         fun build(graph: BaseGraph, maxCells: Int = 4_000_000): LocationIndex {
@@ -190,7 +215,7 @@ class LocationIndex private constructor(
             for (i in perCell.indices) start[i + 1] = start[i] + perCell[i].size()
             val edges = IntArray(start[rows * cols])
             for (i in perCell.indices) { var k = start[i]; for (j in 0 until perCell[i].size()) edges[k++] = perCell[i].get(j) }
-            return LocationIndex(graph, minLat, minLon, cell, cell, rows, cols, start, edges)
+            return LocationIndex(graph, minLat, minLon, cell, cell, rows, cols, IntSource.OfArray(start), IntSource.OfArray(edges))
         }
 
         /** Celle attraversate da un segmento: campionamento a passo di mezza cella più gli estremi. */

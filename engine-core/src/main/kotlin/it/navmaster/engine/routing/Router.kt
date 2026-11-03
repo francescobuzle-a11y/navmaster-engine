@@ -66,12 +66,63 @@ class Router(
     }
     private val it = graph.createEdgeIterator()
 
-    fun snap(lat: Double, lon: Double, maxDistance: Double, pointIndex: Int): Snap {
-        val s = index.findClosest(lat, lon, filter)
-        if (!s.isValid || s.distance > maxDistance) {
-            throw PointNotFoundException("Nessuna strada percorribile entro %.0f m dal punto %d (%.6f, %.6f)".format(maxDistance, pointIndex, lon, lat), pointIndex)
+    /**
+     * L'aggancio di una coordinata, come il `DefaultSnapFilter` di ORS: solo archi che il profilo può
+     * percorrere in almeno un verso e che non stanno in una piccola rete isolata (ORS
+     * `min_network_size`: 200), cioè da cui si raggiungono e da cui sono raggiungibili almeno
+     * [MIN_NETWORK_SIZE] nodi. Altrimenti un punto in una zona pedonale o su un tratto staccato
+     * dal resto delle strade non avrebbe nessun percorso.
+     */
+    fun snap(lat: Double, lon: Double, maxDistance: Double, pointIndex: Int, checkNetwork: Boolean = true): Snap {
+        val excluded = HashSet<Int>()
+        val snapFilter = EdgeFilter { e ->
+            e.edge !in excluded && filter.accept(e) && (weighting.edgeWeight(e, false).isFinite() || weighting.edgeWeight(e, true).isFinite())
         }
-        return s
+        for (attempt in 0 until 8) {
+            val s = index.findClosest(lat, lon, snapFilter)
+            if (!s.isValid || s.distance > maxDistance) break
+            if (!checkNetwork) return s
+            val small = smallNetwork(s.edge) ?: return s
+            excluded.addAll(small)
+        }
+        throw PointNotFoundException("Nessuna strada percorribile entro %.0f m dal punto %d (%.6f, %.6f)".format(maxDistance, pointIndex, lon, lat), pointIndex)
+    }
+
+    /** Gli archi della piccola rete isolata di [edge], o null quando l'arco è nella rete principale. */
+    private fun smallNetwork(edge: Int): Set<Int>? {
+        val fwd = explore(edge, forward = true)
+        if (fwd != null) return fwd
+        return explore(edge, forward = false)
+    }
+
+    /** Gli archi raggiunti da [edge] (o che lo raggiungono), o null appena si superano [MIN_NETWORK_SIZE] nodi. */
+    private fun explore(edge: Int, forward: Boolean): Set<Int>? {
+        val e = graph.createEdgeIterator()
+        val visited = HashSet<Int>()
+        val edges = HashSet<Int>().also { it += edge }
+        val queue = ArrayDeque<Int>()
+        for (n in intArrayOf(graph.nodeA(edge), graph.nodeB(edge))) if (visited.add(n)) queue.addLast(n)
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            e.setBaseNode(n)
+            while (e.next()) {
+                if (!filter.accept(e)) continue
+                // avanti: da n verso il nodo adiacente; indietro: dal nodo adiacente verso n
+                if (weighting.edgeWeight(e, !forward).isInfinite()) continue
+                edges += e.edge
+                if (visited.add(e.adjNode)) {
+                    // in un grafo piccolo (prove) la rete principale è quella con almeno metà dei nodi
+                    if (visited.size >= minOf(MIN_NETWORK_SIZE, maxOf(2, graph.nodeCount / 2))) return null
+                    queue.addLast(e.adjNode)
+                }
+            }
+        }
+        return edges
+    }
+
+    companion object {
+        /** ORS `min_network_size`. */
+        const val MIN_NETWORK_SIZE = 200
     }
 
     /**
