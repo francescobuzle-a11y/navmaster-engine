@@ -31,6 +31,12 @@ class CoreEdgeSelector(
     private val turnCosts: TurnCostStorage?,
     /** ORS `maximum_speed_lower_bound`: archi più veloci di così possono ricevere un `maximum_speed`. */
     private val maximumSpeedLowerBound: Double = 80.0,
+    /**
+     * Il core come quello di ORS: anche autostrade, pedaggi, traghetti, guadi e le strade oltre
+     * [maximumSpeedLowerBound], così `avoid_features` e `maximum_speed` sono esatti col core. Più
+     * shortcut e preparazione più lunga (vedi la misura in CI, flusso «Misura del core»).
+     */
+    private val wide: Boolean = false,
 ) {
     private val sh = encoding.shared
     private val pe = encoding.profile(profileName)
@@ -53,6 +59,13 @@ class CoreEdgeSelector(
         // CORE_VERSION 2 anche l'auto (camper e furgoni con le loro misure, DimensionsEdgeFilter)
         if (it.get(sh.maxHeight).isFinite() || it.get(sh.maxWidth).isFinite() || it.get(sh.maxLength).isFinite() ||
             it.get(sh.maxWeight).isFinite() || it.get(sh.maxAxleLoad).isFinite()) return true
+        if (wide) {
+            // ORS AvoidFeaturesCoreEdgeFilter e MaximumSpeedCoreEdgeFilter
+            if (it.get(sh.motorway) || it.get(sh.ford) || it.get(sh.toll).let { t -> t == Toll.ALL || t == Toll.HGV }) return true
+            val wt = it.get(sh.wayType)
+            if (wt == WayType.FERRY || wt == WayType.STEPS) return true
+            if (it.get(pe.speed) > maximumSpeedLowerBound || it.getReverse(pe.speed) > maximumSpeedLowerBound) return true
+        }
         // divieti di svolta a uno dei due estremi
         if (turnCosts != null && (turnCosts.hasEntries(it.baseNode) || turnCosts.hasEntries(it.adjNode))) return true
         return false

@@ -27,10 +27,10 @@ class RoutingGraphTest {
         built.use {
             assertTrue(stats.edges > 10_000)
             it.prepareCH()
-            assertEquals(setOf("car-ors_fastest", "car-ors_fastest_core", "car-ors_shortest", "heavyvehicle_recommended", "heavyvehicle_recommended_core", "heavyvehicle_shortest"), it.chStorages.keys)
+            assertEquals(setOf("car-ors_fastest", "car-ors_fastest_core", "car-ors_shortest", "car-ors_shortest_core", "heavyvehicle_recommended", "heavyvehicle_recommended_core", "heavyvehicle_shortest", "heavyvehicle_shortest_core"), it.chStorages.keys)
         }
         RoutingGraph.load(dir).use { rg ->
-            assertEquals(6, rg.chStorages.size)
+            assertEquals(8, rg.chStorages.size)
             for ((a, b) in pairs) {
                 // Core (con restrizioni e divieti di svolta) vs Dijkstra edge-based filtrato: stesso peso
                 val params = VehicleParameters(height = 4.0, weight = 12.0)
@@ -55,9 +55,10 @@ class RoutingGraphTest {
                 // avoid_features tocca archi fuori dal core: ricerca piena
                 assertEquals("dijkstra_edge_based", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS)).algorithm)
                 assertEquals("dijkstra", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS, turnCosts = false)).algorithm)
-                // anche "shortest" ha le sue preparazioni (CH statica, core con restrizioni)
-                assertEquals("ch", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST)).algorithm)
-                assertEquals("dijkstra_edge_based", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST, vehicleParameters = VehicleParameters(height = 4.0))).algorithm)
+                // anche "shortest" ha le sue preparazioni (CH statica senza costi di svolta, core con e senza restrizioni)
+                assertEquals("ch", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST, turnCosts = false)).algorithm)
+                assertEquals("core_alt_edge_based", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST)).algorithm)
+                assertEquals("core_alt_edge_based", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST, vehicleParameters = VehicleParameters(height = 4.0))).algorithm)
                 assertEquals("ch", rg.router(RouteOptions(profile = "driving-car", weighting = WeightingMethod.FASTEST, turnCosts = false)).algorithm)
             }
         }

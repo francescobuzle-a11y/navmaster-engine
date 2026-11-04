@@ -180,7 +180,7 @@ class CrossBorderDirections(
         fun router(g: CountryGraph): Router = routers.getOrPut(g.id) {
             val o = g.service.routeOptions(request).copy(hasBearings = false)
             // a trip across a border is a long one: a limited speed on the times only (the quick search)
-            g.graph.router(if (o.maximumSpeed.isFinite() && o.maximumSpeed >= DirectionsRequest.MAXIMUM_SPEED_LOWER_BOUND) o.copy(maximumSpeedTimeOnly = true) else o)
+            g.graph.router(if (!g.graph.coreWide && o.maximumSpeed.isFinite() && o.maximumSpeed >= DirectionsRequest.MAXIMUM_SPEED_LOWER_BOUND) o.copy(maximumSpeedTimeOnly = true) else o)
         }
 
         /**

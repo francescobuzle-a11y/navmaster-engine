@@ -36,7 +36,10 @@ jobs:
           serbia-macedonia, bosnia-herzegovina-montenegro, montenegro-albania, montenegro-kosovo, albania-kosovo, albania-macedonia,
           albania-greece, macedonia-kosovo, macedonia-greece, greece-turkey, turkey-georgia, spain-portugal, spain-andorra,
           netherlands-belgium, belgium-luxembourg, denmark-sweden, sweden-norway, sweden-finland, norway-finland,
-          iceland, malta, cyprus, faroe-islands, isle-of-man, guernsey-jersey, great-britain, ireland-and-northern-ireland, monaco
+          iceland, malta, cyprus, faroe-islands, isle-of-man, guernsey-jersey, great-britain, ireland-and-northern-ireland, monaco,
+          germany-france, germany-austria, germany-switzerland, germany-czech-republic, germany-poland, germany-denmark,
+          germany-netherlands, germany-belgium, germany-luxembourg, france-belgium, france-luxembourg, france-switzerland,
+          france-italy, france-spain, france-andorra, france-monaco
         ]
     steps:
       - name: Coppia richiesta?
@@ -74,7 +77,10 @@ jobs:
           for c in $list; do
             d=/mnt/grafi/$c
             sudo mkdir -p "$d" && sudo chown "$USER" "$d"
-            curl -fsSL "https://github.com/francescobuzle-a11y/navmaster/releases/download/dati-$c/nm.tar.gz" | tar -xz -C "$d"
+            # the package whole, or in parts (over 2 GB: Germany, France)
+            u="https://github.com/francescobuzle-a11y/navmaster/releases/download/dati-$c"
+            if curl -fsSIL "$u/nm.tar.gz" >/dev/null 2>&1; then curl -fsSL "$u/nm.tar.gz" | tar -xz -C "$d"
+            else { i=0; while curl -fsSL "$u/nm.tar.gz.part$i"; do i=$((i+1)); done; } | tar -xz -C "$d"; fi
             g=$(dirname "$(find "$d" -name profiles | head -1)")
             echo "$c: $g ($(du -sh "$g" | cut -f1))"
             spec="$spec${spec:+,}$c=$g"

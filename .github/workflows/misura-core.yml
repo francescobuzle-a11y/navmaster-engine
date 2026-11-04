@@ -1,0 +1,84 @@
+# La misura del core "largo" come quello di ORS (autostrade, pedaggi, traghetti, strade oltre 80 km/h
+# dentro) contro quello ridotto, su un Paese vero: nodi nel core, shortcut, tempi di preparazione e
+# dei landmark, dimensione dei file, e i tempi di alcune ricerche (misure del camion, evita pedaggi,
+# evita autostrade, velocità massima 80). Niente viene pubblicato.
+name: Misura del core
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "Paese (nome Geofabrik, es. italy, austria)"
+        default: "italy"
+      core:
+        description: "Core: wide (come ORS) o narrow (ridotto)"
+        default: "wide"
+
+env:
+  GEOFABRIK: https://download.geofabrik.de/europe
+  VEHICLE_ROADS: motorway,motorway_link,trunk,trunk_link,primary,primary_link,secondary,secondary_link,tertiary,tertiary_link,unclassified,residential,living_street,service,road,track,busway
+
+jobs:
+  misura:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Spazio sul disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup /usr/share/swift || true
+          sudo mkdir -p /mnt/w && sudo chown $USER /mnt/w
+          df -h / /mnt; free -g
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: "17"}
+      - name: Compila il motore
+        run: ./gradlew :engine-cli:installDist -q
+      - name: Estratto OSM (solo strade per veicoli, traghetti, divieti di svolta)
+        working-directory: /mnt/w
+        env:
+          REGION: ${{ inputs.region || 'italy' }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool >/dev/null
+          curl -fsSL -o region.osm.pbf "$GEOFABRIK/$REGION-latest.osm.pbf"
+          osmium tags-filter region.osm.pbf w/highway=$VEHICLE_ROADS w/route=ferry,shuttle_train r/type=restriction -o roads.osm.pbf --overwrite
+          rm region.osm.pbf; ls -la
+      - name: Grafo con il core scelto
+        working-directory: /mnt/w
+        env:
+          CORE: ${{ inputs.core || 'wide' }}
+        run: |
+          MEM=$(( $(free -g | awk '/Mem:/{print $2}') - 3 ))
+          date
+          JAVA_OPTS="-Xmx${MEM}g -XX:+UseParallelGC" $GITHUB_WORKSPACE/engine-cli/build/install/engine-cli/bin/engine-cli import roads.osm.pbf nm --mmap --core=$CORE 2>&1 | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' | tee import.log
+          date
+          echo "== riassunto"; grep -E "^.*(CH |Core |Landmark |grafo:)" import.log
+          du -sh nm; ls -la nm | sort -k5 -n -r | head -20
+      - name: Ricerche
+        working-directory: /mnt/w
+        env:
+          REGION: ${{ inputs.region || 'italy' }}
+        run: |
+          CLI=$GITHUB_WORKSPACE/engine-cli/build/install/engine-cli/bin/engine-cli
+          case "$REGION" in
+            italy) TRIPS="45.4103,9.9428 46.9971,11.5029|45.4642,9.1900 41.9028,12.4964|45.4642,9.1900 38.1157,15.6500|45.0703,7.6869 45.4408,12.3155" ;;
+            austria) TRIPS="47.2692,11.4041 48.2082,16.3738|46.6247,14.3053 48.3069,14.2858" ;;
+            *) TRIPS="" ;;
+          esac
+          IFS='|'; for t in $TRIPS; do IFS=' '; set -- $t; IFS='|'
+            for opts in "--profile=driving-hgv --height=4 --width=2.55 --length=16.5 --weight=27 --axleload=11.5" \
+                        "--profile=driving-hgv --height=4 --width=2.55 --length=16.5 --weight=27 --axleload=11.5 --avoid=tollways" \
+                        "--profile=driving-hgv --height=4 --width=2.55 --length=16.5 --weight=27 --axleload=11.5 --avoid=highways" \
+                        "--profile=driving-hgv --height=4 --width=2.55 --length=16.5 --weight=27 --axleload=11.5 --max-speed=80" \
+                        "--profile=driving-hgv --height=4 --width=2.55 --length=16.5 --weight=27 --axleload=11.5 --avoid=ferries --max-speed=80" \
+                        "--profile=driving-car" "--profile=driving-car --avoid=tollways,highways" "--profile=driving-car --height=3.2 --weight=3.5"; do
+              echo "== $1 → $2 $opts"
+              # due volte: la prima paga la lettura dei file
+              for k in 1 2; do $CLI route nm "$1" "$2" $opts --quiet 2>&1 | grep -E "percorso|calcolo|Exception|Nessun" ; done
+            done
+          done
+      - name: Registro
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: misura-${{ inputs.region || 'italy' }}-${{ inputs.core || 'wide' }}
+          path: /mnt/w/import.log

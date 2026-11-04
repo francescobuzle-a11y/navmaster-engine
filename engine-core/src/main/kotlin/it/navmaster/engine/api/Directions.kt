@@ -246,7 +246,7 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
 
     /** maximum_speed ≥ 80 km/h su un viaggio oltre [FAST_MAXIMUM_SPEED_BEELINE] in linea d'aria: solo sui tempi. */
     fun fastMaximumSpeed(o: RouteOptions, beeline: Double): Boolean =
-        o.maximumSpeed.isFinite() && o.maximumSpeed >= DirectionsRequest.MAXIMUM_SPEED_LOWER_BOUND && beeline > FAST_MAXIMUM_SPEED_BEELINE &&
+        !graphs.coreWide && o.maximumSpeed.isFinite() && o.maximumSpeed >= DirectionsRequest.MAXIMUM_SPEED_LOWER_BOUND && beeline > FAST_MAXIMUM_SPEED_BEELINE &&
             o.avoidPolygons.isEmpty()
 
     /** Il raggio di aggancio massimo del servizio (metri). */

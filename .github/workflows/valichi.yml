@@ -40,7 +40,10 @@ jobs:
           for c in ${COUNTRIES//,/ }; do
             d=/mnt/grafi/$c
             sudo mkdir -p "$d" && sudo chown "$USER" "$d"
-            curl -fsSL "https://github.com/francescobuzle-a11y/navmaster/releases/download/dati-$c/nm.tar.gz" | tar -xz -C "$d"
+            # the package whole, or in parts (over 2 GB: Germany, France)
+            u="https://github.com/francescobuzle-a11y/navmaster/releases/download/dati-$c"
+            if curl -fsSIL "$u/nm.tar.gz" >/dev/null 2>&1; then curl -fsSL "$u/nm.tar.gz" | tar -xz -C "$d"
+            else { i=0; while curl -fsSL "$u/nm.tar.gz.part$i"; do i=$((i+1)); done; } | tar -xz -C "$d"; fi
             g=$(dirname "$(find "$d" -name profiles | head -1)")
             echo "$c: $g ($(du -sh "$g" | cut -f1))"
             spec="$spec${spec:+,}$c=$g"

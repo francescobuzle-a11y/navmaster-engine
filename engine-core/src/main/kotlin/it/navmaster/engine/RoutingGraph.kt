@@ -109,7 +109,7 @@ class RoutingGraph private constructor(
      * Prepara per ogni profilo la CH completa (richieste "statiche") e il Core (richieste con restrizioni,
      * avoid_features o divieti di svolta), come le preparazioni `ch` e `core` di ORS, e le salva.
      */
-    fun prepareCH(log: ((String) -> Unit)? = null, withCore: Boolean = true, landmarkCount: Int = 16) {
+    fun prepareCH(log: ((String) -> Unit)? = null, withCore: Boolean = true, landmarkCount: Int = 16, coreWide: Boolean = false) {
         for (pe in encoding.profiles) for (method in listOf(defaultCHWeighting(pe.profile.name), WeightingMethod.SHORTEST)) {
             val name = pe.profile.name
             val w = WeightingFactory.create(encoding, pe, method)
@@ -120,9 +120,9 @@ class RoutingGraph private constructor(
             storage.flush()
             log?.invoke("CH $key: ${storage.shortcutCount} shortcut in ${System.currentTimeMillis() - t0} ms")
             chStorages[key] = storage
-            // il core solo per il peso principale del profilo (come ORS): "shortest" con restrizioni usa la ricerca piena
-            if (withCore && method != WeightingMethod.SHORTEST) {
-                val selector = CoreEdgeSelector(encoding, name, turnCosts)
+            // il core per ogni peso, come ORS (`core.weightings: recommended,shortest`)
+            if (withCore) {
+                val selector = CoreEdgeSelector(encoding, name, turnCosts, wide = coreWide)
                 val coreNodes = selector.coreNodes(graph)
                 val coreKey = "${key}_core"
                 val coreStorage = CHStorage(GraphDirectory(dir, mmap = false), coreKey, graph.edgeCount, graph.nodeCount)
@@ -142,8 +142,18 @@ class RoutingGraph private constructor(
             }
         }
         coreVersion = CoreEdgeSelector.CORE_VERSION
-        GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); set("ch", chStorages.keys.joinToString(",")); set("core_version", coreVersion.toString()); save() }
+        this.coreWide = coreWide && withCore
+        GraphProperties(File(dir, "profiles")).apply {
+            load(); set("profiles", profileNames.joinToString(",")); set("ch", chStorages.keys.joinToString(","))
+            set("core_version", coreVersion.toString()); set("core_kind", if (this@RoutingGraph.coreWide) "wide" else "narrow"); save()
+        }
     }
+
+    /**
+     * Vero se il core contiene anche autostrade, pedaggi, traghetti e strade veloci (come quello di
+     * ORS): allora `avoid_features` e `maximum_speed` usano il core, esatti; altrimenti la ricerca piena.
+     */
+    var coreWide = false; private set
 
     /** L'edizione della regola del core con cui il grafo è stato preparato ([CoreEdgeSelector.CORE_VERSION]); 1 per i grafi senza l'indicazione. */
     var coreVersion = 1; private set
@@ -154,6 +164,14 @@ class RoutingGraph private constructor(
         "driving-hgv", "hgv", "truck", "heavyvehicle" -> "heavyvehicle"
         else -> throw IllegalArgumentException("profilo sconosciuto: $profile")
     }
+
+    /**
+     * Niente CH né Core per questa richiesta: i poligoni possono toccare qualunque arco (ORS "non
+     * decreasing weights"); `avoid_features` e `maximum_speed` toccano archi fuori dal core ridotto,
+     * dentro quello largo ([coreWide]).
+     */
+    fun needsFullSearch(options: RouteOptions): Boolean =
+        options.avoidPolygons.isNotEmpty() || (!coreWide && (options.avoidFeatures != 0 || (options.maximumSpeed.isFinite() && !options.maximumSpeedTimeOnly)))
 
     fun router(options: RouteOptions): Router {
         val name = encoderName(options.profile)
@@ -171,11 +189,11 @@ class RoutingGraph private constructor(
         val ch = if (options.allowCH && options.isStatic && (tcp == null || coreStorage == null)) chStorages[key]?.let { CHGraph(graph, it, weighting) } else null
         // le misure dell'auto (camper, furgoni): nel core solo dall'edizione 2 della regola; prima, ricerca piena
         val coreFits = name == "heavyvehicle" || options.vehicleParameters?.hasDimensions != true || coreVersion >= 2
-        val core = if (ch == null && options.allowCH && !options.needsFullSearch && coreFits) coreStorage?.let { CHGraph(graph, it, weighting) } else null
+        val core = if (ch == null && options.allowCH && !needsFullSearch(options) && coreFits) coreStorage?.let { CHGraph(graph, it, weighting) } else null
         val lm = if (core != null) landmarks["${key}_core"] else null
         // avoid_features alone: first the quick search without them; its path is the best one with
         // them too when it uses none of the roads to avoid (the filter only takes roads away), else
-        // the full search (ORS keeps those roads in its core; our reduced core does not)
+        // the full search (ORS keeps those roads in its core; our reduced core does not, the wide one does)
         val quick = if (ch == null && core == null && options.avoidFeatures != 0 && options.avoidPolygons.isEmpty() && options.allowCH &&
             (options.maximumSpeed.isInfinite() || options.maximumSpeedTimeOnly)) router(options.copy(avoidFeatures = 0)) else null
         val avoid = if (quick != null) AvoidFeaturesEdgeFilter(encoding.shared, options.avoidFeatures, pe.profile.category, name == "heavyvehicle") else null
@@ -227,6 +245,7 @@ class RoutingGraph private constructor(
             check(tc.loadExisting()) { "costi di svolta non caricabili da $dir" }
             val rg = RoutingGraph(dir, encoding, graph, tc, GuidanceStore.load(gdir, graph.names), PointStore.load(gdir))
             rg.coreVersion = props.get("core_version")?.toIntOrNull() ?: 1
+            rg.coreWide = props.get("core_kind") == "wide"
             for (key in (props.get("ch") ?: "").split(',').filter { it.isNotBlank() }) {
                 val st = CHStorage(gdir, key, graph.edgeCount, graph.nodeCount)
                 if (st.loadExisting()) rg.chStorages[key] = st else st.close()
