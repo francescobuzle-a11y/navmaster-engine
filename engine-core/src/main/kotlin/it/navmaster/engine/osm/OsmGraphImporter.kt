@@ -201,10 +201,23 @@ class OsmGraphImporter(
         private val lats = DoubleArrayList(); private val lons = DoubleArrayList()
         private val segIds = LongArrayList() // id OSM dei punti del segmento corrente, in parallelo a lats/lons
         private var segmentStart = -1 // nodo del grafo in cui inizia il segmento corrente
+        /**
+         * ORS `estimated_way_distance`: la distanza in linea d'aria fra il primo e l'ultimo nodo della
+         * way intera (non la lunghezza dell'arco), usata dal modello di accelerazione e dalla penalità
+         * delle strade residenziali; NaN quando un capo manca dall'estratto (ORS non mette il tag).
+         */
+        private var wayBeeline = Double.NaN
+
+        private fun nodeLat(id: Long): Double { val t = towers.getOrDefault(id, -1); if (t >= 0) return graph.lat(t); val p = pillars.getOrDefault(id, -1); return if (p >= 0) pillarLat[p] else Double.NaN }
+        private fun nodeLon(id: Long): Double { val t = towers.getOrDefault(id, -1); if (t >= 0) return graph.lon(t); val p = pillars.getOrDefault(id, -1); return if (p >= 0) pillarLon[p] else Double.NaN }
 
         override fun way(way: OsmWay) {
             if (!acceptWay(way)) return
             val ids = way.nodeIds
+            wayBeeline = if (ids.isEmpty()) Double.NaN else {
+                val la1 = nodeLat(ids[0]); val lo1 = nodeLon(ids[0]); val la2 = nodeLat(ids[ids.size - 1]); val lo2 = nodeLon(ids[ids.size - 1])
+                if (la1.isNaN() || lo1.isNaN() || la2.isNaN() || lo2.isNaN()) Double.NaN else DistanceCalc.haversine(la1, lo1, la2, lo2)
+            }
             segmentStart = -1
             lats.clear(); lons.clear(); segIds.clear()
             for (i in ids.indices) {
@@ -298,7 +311,8 @@ class OsmGraphImporter(
             encoding.shared.write(flags, WayAttributeParser.parse(way, isFerry, widthFromCarriageway = options.widthFromCarriageway))
             val ferryDuration = if (isFerry) OsmValues.parseDurationSeconds(way.tag("duration")) else -1L
             for (i in profiles.indices) {
-                profiles[i].write(flags, profiles[i].profile.analyse(way, wayAccess[i], dist, ferryDuration))
+                // i traghetti: la velocità dalla durata e dalla lunghezza del tratto; le strade: la linea d'aria della way (ORS)
+                profiles[i].write(flags, profiles[i].profile.analyse(way, wayAccess[i], if (isFerry) dist else wayBeeline, ferryDuration))
             }
             graph.setFlags(edge, flags)
             val name = wayName(way)
