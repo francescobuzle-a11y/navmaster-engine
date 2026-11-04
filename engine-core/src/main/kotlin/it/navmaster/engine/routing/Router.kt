@@ -2,6 +2,7 @@ package it.navmaster.engine.routing
 
 import it.navmaster.engine.ch.CHGraph
 import it.navmaster.engine.ch.CoreDijkstra
+import it.navmaster.engine.ch.CoreManyToOne
 import it.navmaster.engine.ch.DijkstraBidirectionCH
 import it.navmaster.engine.index.LocationIndex
 import it.navmaster.engine.index.Snap
@@ -220,33 +221,7 @@ class Router(
             if (keepDirection && best != null && best.edges.isNotEmpty() && best.edges[0].reverse != arrival!!.reverse) best = null
         }
 
-        val sp: SearchPath? = if (ch != null) {
-            val algo = DijkstraBidirectionCH(ch, weighting)
-            if (maxWeight.isFinite()) algo.bestWeight = maxWeight
-            for (p in fromParts) algo.addSource(p.node, p.weight)
-            for (p in toParts) algo.addTarget(p.node, p.weight)
-            if (algo.run()) algo.extractPath() else null
-        } else if (core != null) {
-            val algo = CoreDijkstra(core, weighting, filter, turnCosts, landmarks)
-            if (maxWeight.isFinite()) algo.bestWeight = maxWeight
-            for (p in fromParts) algo.addSource(p.node, p.weight)
-            for (p in toParts) algo.addTarget(p.node, p.weight)
-            val found = algo.run()
-            lastStats = algo.stats
-            if (found) algo.extractPath() else null
-        } else if (turnCosts != null) {
-            val algo = EdgeBasedBidirectionalDijkstra(graph, weighting, turnCosts, filter, maxVisitedNodes)
-            if (maxWeight.isFinite()) algo.bestWeight = maxWeight
-            for (p in fromParts) algo.addSource(p.node, p.weight)
-            for (p in toParts) algo.addTarget(p.node, p.weight)
-            if (algo.run()) algo.extractPath() else null
-        } else {
-            val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes)
-            if (maxWeight.isFinite()) algo.bestWeight = maxWeight
-            for (p in fromParts) algo.addSource(p.node, p.weight)
-            for (p in toParts) algo.addTarget(p.node, p.weight)
-            if (algo.run()) algo.extractPath() else null
-        }
+        val sp = search(fromParts.map { it.node to it.weight }, toParts.map { it.node to it.weight }, maxWeight)
         if (sp != null) {
             val startPart = fromParts.first { it.node == sp.startNode }
             val endPart = toParts.first { it.node == sp.endNode }
@@ -254,6 +229,105 @@ class Router(
             if (best == null || candidate.weight < best.weight) best = candidate
         }
         return best ?: throw RouteNotFoundException("Nessun percorso trovato fra i punti richiesti")
+    }
+
+    /**
+     * I pesi fra [root] e ciascuno di [others] trovati insieme (vedi [CoreManyToOne]):
+     * dagli altri alla radice quando [rootIsTarget], altrimenti dalla radice agli altri. Gli stessi
+     * pesi di [route] (con la ricerca rapida quando c'è, come `route(exact = false)`); null quando
+     * questo router non cerca sul core.
+     */
+    fun manyToOne(root: Snap, others: List<Snap>, rootIsTarget: Boolean): CoreManyToOne? {
+        if (quick != null && quickAccepts != null) return quick.manyToOne(root, others, rootIsTarget)
+        val c = core ?: return null
+        val m = CoreManyToOne(c, weighting, filter, turnCosts, landmarks, rootIsTarget, others.size)
+        for (p in splitEdge(root, asTarget = rootIsTarget)) m.addRoot(p.node, p.weight)
+        for ((i, s) in others.withIndex()) {
+            // sullo stesso arco della radice vale anche il tratto diretto (come in route)
+            if (s.edge == root.edge && (s.position != SnapPosition.TOWER || root.position != SnapPosition.TOWER)) {
+                (if (rootIsTarget) sameEdgeRoute(s, root) else sameEdgeRoute(root, s))?.let { m.addDirect(i, it.weight) }
+            }
+            for (p in splitEdge(s, asTarget = !rootIsTarget)) m.addOther(i, p.node, p.weight)
+        }
+        m.prepare()
+        return m
+    }
+
+    /** Il risultato di [best]: il peso e quali punti (indici nelle due liste). */
+    class Best(val weight: Double, val from: Int, val to: Int)
+
+    /**
+     * Il percorso più leggero da uno qualunque di [from] a uno qualunque di [to], ogni punto con un
+     * peso da aggiungere (il resto del viaggio oltre quel punto): una ricerca sola con tutti i punti
+     * come sorgenti e destinazioni. Lo stesso peso del minimo di [route] (`exact = false`) più i pesi
+     * aggiunti; null quando non c'è percorso (più leggero di [maxWeight]).
+     */
+    fun best(from: List<Pair<Snap, Double>>, to: List<Pair<Snap, Double>>, maxWeight: Double = Double.POSITIVE_INFINITY): Best? {
+        if (quick != null && quickAccepts != null) return quick.best(from, to, maxWeight)
+        var best: Best? = null
+        // the full edge-based search drops a path that runs along an edge twice (pathVia: "un anello"),
+        // and route then has none: one search per pair as route, so that the choice is one it can follow
+        if (ch == null && core == null && turnCosts != null) {
+            for ((i, f) in from.withIndex()) for ((j, t) in to.withIndex()) {
+                val limit = (best?.weight ?: maxWeight) - f.second - t.second
+                if (limit <= 0) continue
+                val w = try { route(f.first, t.first, maxWeight = limit, exact = false).weight } catch (e: RouteNotFoundException) { continue }
+                if (f.second + w + t.second < (best?.weight ?: maxWeight)) best = Best(f.second + w + t.second, i, j)
+            }
+            return best
+        }
+        // i punti sullo stesso arco: il tratto diretto (come in route)
+        for ((i, f) in from.withIndex()) for ((j, t) in to.withIndex()) {
+            if (f.first.edge != t.first.edge || (f.first.position == SnapPosition.TOWER && t.first.position == SnapPosition.TOWER)) continue
+            val direct = sameEdgeRoute(f.first, t.first) ?: continue
+            val w = f.second + direct.weight + t.second
+            if (w < (best?.weight ?: maxWeight)) best = Best(w, i, j)
+        }
+        // i capi degli archi, col peso più basso per nodo (una ricerca tiene un peso per nodo)
+        class End(val node: Int, val weight: Double, val index: Int)
+        fun ends(list: List<Pair<Snap, Double>>, asTarget: Boolean): Collection<End> {
+            val byNode = LinkedHashMap<Int, End>()
+            for ((i, p) in list.withIndex()) for (part in splitEdge(p.first, asTarget)) {
+                val w = part.weight + p.second
+                if (w < (byNode[part.node]?.weight ?: Double.POSITIVE_INFINITY)) byNode[part.node] = End(part.node, w, i)
+            }
+            return byNode.values
+        }
+        val sources = ends(from, asTarget = false); val targets = ends(to, asTarget = true)
+        val sp = search(sources.map { it.node to it.weight }, targets.map { it.node to it.weight }, minOf(maxWeight, best?.weight ?: Double.POSITIVE_INFINITY))
+        if (sp != null && sp.weight < (best?.weight ?: maxWeight)) {
+            best = Best(sp.weight, sources.first { it.node == sp.startNode }.index, targets.first { it.node == sp.endNode }.index)
+        }
+        return best
+    }
+
+    /** La ricerca fra i nodi dati (coi pesi iniziali) con l'algoritmo del router. */
+    private fun search(sources: List<Pair<Int, Double>>, targets: List<Pair<Int, Double>>, maxWeight: Double): SearchPath? = if (ch != null) {
+        val algo = DijkstraBidirectionCH(ch, weighting)
+        if (maxWeight.isFinite()) algo.bestWeight = maxWeight
+        for ((n, w) in sources) algo.addSource(n, w)
+        for ((n, w) in targets) algo.addTarget(n, w)
+        if (algo.run()) algo.extractPath() else null
+    } else if (core != null) {
+        val algo = CoreDijkstra(core, weighting, filter, turnCosts, landmarks)
+        if (maxWeight.isFinite()) algo.bestWeight = maxWeight
+        for ((n, w) in sources) algo.addSource(n, w)
+        for ((n, w) in targets) algo.addTarget(n, w)
+        val found = algo.run()
+        lastStats = algo.stats
+        if (found) algo.extractPath() else null
+    } else if (turnCosts != null) {
+        val algo = EdgeBasedBidirectionalDijkstra(graph, weighting, turnCosts, filter, maxVisitedNodes)
+        if (maxWeight.isFinite()) algo.bestWeight = maxWeight
+        for ((n, w) in sources) algo.addSource(n, w)
+        for ((n, w) in targets) algo.addTarget(n, w)
+        if (algo.run()) algo.extractPath() else null
+    } else {
+        val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes)
+        if (maxWeight.isFinite()) algo.bestWeight = maxWeight
+        for ((n, w) in sources) algo.addSource(n, w)
+        for ((n, w) in targets) algo.addTarget(n, w)
+        if (algo.run()) algo.extractPath() else null
     }
 
     /**

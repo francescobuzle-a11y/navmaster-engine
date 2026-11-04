@@ -133,8 +133,14 @@ class CrossBorderDirections(
     /** I passaggi fra due grafi (calcolati una volta e conservati da chi chiama). */
     private val transfers: (CountryGraph, CountryGraph) -> List<Transfer>,
     private val log: ((String) -> Unit)? = null,
+    /** Fra due Paesi il valico con una ricerca per lato ([chooseTogether]); false: uno alla volta (prove). */
+    private val oneSearch: Boolean = true,
 ) {
     private class LL(val lat: Double, val lon: Double)
+
+    /** Il peso del viaggio scelto all'ultimo confine e i suoi valichi (diagnostica, prove). */
+    internal var lastWeight = Double.NaN; private set
+    internal var lastCrossings: List<Transfer> = emptyList(); private set
 
     /** Un pezzo del viaggio dentro un grafo: i suoi punti (le tappe e i passaggi di confine). */
     private class Piece(val graph: CountryGraph, val points: MutableList<Pair<Double, Double>>, val radiuses: MutableList<Double>,
@@ -315,6 +321,14 @@ class CrossBorderDirections(
                     .filter { t -> LL(t.lat, t.lon).let { ctx.snap(from, it, TRANSFER_RADIUS) != null && ctx.snap(to, it, TRANSFER_RADIUS) != null } }
                 log?.invoke("  ${path.joinToString("-") { it.id }} confine ${from.id}/${to.id}: ${cands.size} candidati")
                 if (cands.isEmpty()) { ok = false; break }
+                // due Paesi: il valico con una ricerca per lato (sotto, uno alla volta quando non si può)
+                if (path.size == 2 && oneSearch) {
+                    val c = chooseTogether(ctx, p, rp, from, q, rq, to, cands, best)
+                    if (c != null) {
+                        if (c.weight < best && c.transfer != null) { best = c.weight; bestChain = listOf(c.transfer to to) }
+                        ok = false; break
+                    }
+                }
                 val next = ArrayList<Triple<Transfer, Double, List<Transfer>>>()
                 for (t in cands) {
                     val tl = LL(t.lat, t.lon)
@@ -349,7 +363,64 @@ class CrossBorderDirections(
                 if (total < best) { best = total; bestChain = via.mapIndexed { i, tr -> tr to path[i + 1] } }
             }
         }
+        lastWeight = best; lastCrossings = bestChain?.map { it.first }.orEmpty()
         return bestChain
+    }
+
+    /** Il valico scelto con una ricerca per lato e il peso del viaggio intero che ci passa (+∞ senza). */
+    private class Choice(val weight: Double, val transfer: Transfer?)
+
+    /**
+     * Il valico migliore fra due Paesi con una ricerca per lato invece di due per valico. Dal lato in
+     * cui il capo del viaggio è più vicino al confine, i pesi fra ogni valico e quel capo in una
+     * ricerca sola ([Router.manyToOne]), definitivi in ordine di peso; dall'altro lato una ricerca
+     * dal suo capo a tutti i valichi insieme, ciascuno col peso oltre il valico ([Router.best]): per i
+     * valichi non ancora definitivi un limite inferiore. Se il migliore di questa ricerca passa per un
+     * valico definitivo, è il viaggio migliore (ogni altro valico pesa almeno il suo limite); se no il
+     * lato vicino prosegue finché quel valico è definitivo e la ricerca dell'altro lato si ripete.
+     * Null quando i router non cercano sul core: allora un valico alla volta.
+     */
+    private fun chooseTogether(ctx: Ctx, p: LL, rp: Double, ga: CountryGraph, q: LL, rq: Double, gb: CountryGraph, cands: List<Transfer>, limit: Double): Choice? {
+        val none = Choice(Double.POSITIVE_INFINITY, null)
+        val sp = ctx.snap(ga, p, rp) ?: return none
+        val sq = ctx.snap(gb, q, rq) ?: return none
+        // i candidati sono agganciati in entrambi i grafi (filtrati da chain)
+        val inA = cands.map { ctx.snap(ga, LL(it.lat, it.lon), TRANSFER_RADIUS)!! }
+        val inB = cands.map { ctx.snap(gb, LL(it.lat, it.lon), TRANSFER_RADIUS)!! }
+        // il lato corto: il capo più vicino ai suoi valichi
+        val nearA = cands.minOf { DistanceCalc.haversine(p.lat, p.lon, it.lat, it.lon) }
+        val nearB = cands.minOf { DistanceCalc.haversine(it.lat, it.lon, q.lat, q.lon) }
+        val shortIsB = nearB <= nearA
+        val near = if (shortIsB) gb else ga; val far = if (shortIsB) ga else gb
+        val t0 = System.currentTimeMillis()
+        val m = (if (shortIsB) ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true) else ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false)) ?: return null
+        ctx.queries++
+        // fino al primo valico col peso definitivo, poi un po' oltre (fino al doppio del suo peso, al più
+        // mezz'ora in più): gli altri hanno un limite vicino al loro peso e la ricerca dall'altro lato
+        // raramente va ripetuta (ognuna costa quanto un viaggio intero da quella parte)
+        m.advance { m.anyReached }
+        val first = cands.indices.filter { m.isFinal(it) }.minOfOrNull { m.lowerBound(it) } ?: Double.POSITIVE_INFINITY
+        if (first.isFinite()) { val upTo = first + minOf(first, 1800.0); m.advance { m.bound >= upTo } }
+        var rounds = 0; var farMs = 0L
+        while (true) {
+            rounds++
+            ctx.queries++
+            val usable = cands.indices.filter { m.lowerBound(it).isFinite() }
+            val t1 = System.currentTimeMillis()
+            val r = if (usable.isEmpty()) null
+                else if (shortIsB) ctx.router(ga).best(listOf(sp to 0.0), usable.map { inA[it] to m.lowerBound(it) }, limit)
+                else ctx.router(gb).best(usable.map { inB[it] to m.lowerBound(it) }, listOf(sq to 0.0), limit)
+            farMs += System.currentTimeMillis() - t1
+            val i = r?.let { usable[if (shortIsB) it.to else it.from] }
+            if (i == null || m.isFinal(i)) {
+                log?.invoke("    valico in una ricerca per lato: ${if (i == null) "nessuno" else "%.5f,%.5f peso %.0f".format(cands[i].lat, cands[i].lon, r!!.weight)}; " +
+                    "lato vicino ${near.id} ${m.stats}; lato lontano ${far.id} $rounds ricerche $farMs ms (${ctx.router(far).algorithm} ${ctx.router(far).quickStats()}); " +
+                    "in tutto ${System.currentTimeMillis() - t0} ms")
+                return if (i == null) none else Choice(r!!.weight, cands[i])
+            }
+            // il migliore passa per un valico con un limite soltanto: il suo peso vero, poi di nuovo
+            m.advance { m.isFinal(i) }
+        }
     }
 
     // ------------------------------------------------------------------------------- the answer
