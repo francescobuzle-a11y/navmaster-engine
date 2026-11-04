@@ -33,7 +33,8 @@ class CoreManyToOne(
     private val coreLevel = base.nodeCount
     private fun inCore(node: Int) = storage.level(node) >= coreLevel
     private val edgeBased get() = turnCosts != null
-    private val potentials: CorePotentials? = landmarks?.takeIf { it.landmarkCount > 0 }?.let { CorePotentials(it) }
+    private val lm = landmarks?.takeIf { it.landmarkCount > 0 }
+    private val potentials: CorePotentials? = lm?.let { CorePotentials(it) }
     /** Le ricerche della radice vanno all'indietro quando è l'arrivo; quelle degli altri nel verso opposto. */
     private val rootReverse = rootIsTarget
     private val otherReverse = !rootIsTarget
@@ -61,6 +62,8 @@ class CoreManyToOne(
     private val tentative = DoubleArray(otherCount) { Double.POSITIVE_INFINITY }
     private val final = BooleanArray(otherCount)
     private val entersCore = BooleanArray(otherCount)
+    /** Il limite inferiore dei landmark per ogni altro punto, senza ricerca (0 senza landmark). */
+    private val landmarkBound = DoubleArray(otherCount)
     private val it1 = ch.iterator()
     private val coreIt = ch.iterator()
     private val baseIt = base.createEdgeIterator()
@@ -112,6 +115,22 @@ class CoreManyToOne(
             val key = if (!edgeBased) node else lastBaseEdge(root1, node).let { e -> if (e < 0) virtualKey(node) else edgeKeyArriving(e, node, rootReverse) }
             relaxCore(key, c.value, -1, -1)
         }
+        // senza ricerca, dai landmark: attraverso il core un percorso va da un ingresso della radice a
+        // uno dell'altro punto e pesa almeno il limite fra i due; altrimenti è un incontro di fase 1
+        lm?.let { l ->
+            val rp = CorePotentials(l)
+            var rootEntries = 0
+            for (c in root1.weight) if (inCore(c.key) && root1.settled.contains(c.key)) {
+                rootEntries++
+                if (rootIsTarget) rp.addTarget(c.key, c.value) else rp.addSource(c.key, c.value)
+            }
+            val viaCore = DoubleArray(otherCount) { Double.POSITIVE_INFINITY }
+            if (rootEntries > 0) for (c in seedsAt) {
+                val h = if (rootIsTarget) rp.toTargets(c.key) else rp.fromSources(c.key)
+                for (seed in c.value) if (seed.weight + h < viaCore[seed.other]) viaCore[seed.other] = seed.weight + h
+            }
+            for (i in 0 until otherCount) landmarkBound[i] = minOf(tentative[i], viaCore[i])
+        }
         phase1Ms = (System.nanoTime() - t0) / 1_000_000
     }
 
@@ -121,8 +140,11 @@ class CoreManyToOne(
     /** Vero quando almeno un punto ha il suo peso definitivo ed è raggiungibile. */
     val anyReached: Boolean get() = (0 until otherCount).any { final[it] && tentative[it].isFinite() }
 
-    /** Il peso di [other] (+∞ se irraggiungibile) quando è definitivo, altrimenti un limite inferiore. */
-    fun lowerBound(other: Int): Double = if (final[other]) tentative[other] else minOf(tentative[other], frontier())
+    /**
+     * Il peso di [other] (+∞ se irraggiungibile) quando è definitivo, altrimenti un limite inferiore:
+     * il migliore fra quello dei landmark (subito, senza ricerca) e quello della ricerca fin qui.
+     */
+    fun lowerBound(other: Int): Double = if (final[other]) tentative[other] else maxOf(landmarkBound[other], minOf(tentative[other], frontier()))
 
     /** Un limite inferiore del peso di ogni punto non ancora definitivo (+∞ a ricerca finita). */
     val bound: Double get() = frontier()
