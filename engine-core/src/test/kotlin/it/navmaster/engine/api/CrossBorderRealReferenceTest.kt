@@ -96,6 +96,20 @@ class CrossBorderRealReferenceTest {
             }
         }
 
+        // ---- i landmark di ogni core: ognuno deve raggiungere ed essere raggiunto da quasi tutto il core
+        for (g in graphs) for ((key, lm) in g.graph.landmarks) {
+            val st = g.graph.chStorages[key] ?: continue
+            val n = g.graph.graph.nodeCount
+            val sample = (0 until n step maxOf(1, n / 200_000)).filter { st.level(it) >= n }
+            val cov = (0 until lm.landmarkCount).map { l ->
+                100 * sample.count { lm.fromLandmark(l, it).isFinite() } / maxOf(1, sample.size) to 100 * sample.count { lm.toLandmark(l, it).isFinite() } / maxOf(1, sample.size)
+            }
+            val worst = cov.minOfOrNull { minOf(it.first, it.second) } ?: 100
+            val line = "  ${g.id} landmark $key: ${cov.joinToString(" ") { "${it.first}/${it.second}" }} (raggiunge/raggiunto da, % del core)"
+            println(line)
+            if (worst < 50) problems += "${g.id} landmark $key: un landmark copre solo il $worst % del core (limiti nulli, ricerche lente)"
+        }
+
         // ---- viaggi interni di ogni Paese: core contro ricerca piena, CH contro Dijkstra
         for (g in graphs) {
             val core = g.graph.router(RouteOptions(profile = "driving-hgv", vehicleParameters = params))

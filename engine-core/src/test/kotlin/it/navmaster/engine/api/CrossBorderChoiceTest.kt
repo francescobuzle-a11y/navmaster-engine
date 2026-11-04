@@ -50,6 +50,7 @@ class CrossBorderChoiceTest {
 
             // molti a uno e uno a molti: limiti inferiori mai sopra il peso, pesi definitivi uguali, in ordine
             var finalEarly = 0; var boundSum = 0.0; var weightSum = 0.0
+            val dirBound = DoubleArray(2); val dirWeight = DoubleArray(2)
             repeat(12) { round ->
                 val root = randomSnap(core)
                 val others = List(8) { if (it == 0 && round % 3 == 0) root else randomSnap(core) }
@@ -59,7 +60,11 @@ class CrossBorderChoiceTest {
                     // subito, dai landmark: mai sopra il peso
                     for (i in others.indices) {
                         assertTrue(m.lowerBound(i) <= want[i] + 0.01 + want[i] * 1e-5, "limite dei landmark ${m.lowerBound(i)} sopra il peso ${want[i]}")
-                        if (want[i].isFinite()) { boundSum += minOf(m.lowerBound(i), want[i]); weightSum += want[i] }
+                        if (want[i].isFinite()) {
+                            boundSum += minOf(m.lowerBound(i), want[i]); weightSum += want[i]
+                            val d = if (rootIsTarget) 1 else 0
+                            dirBound[d] += minOf(m.lowerBound(i), want[i]); dirWeight[d] += want[i]
+                        }
                     }
                     m.advance { m.anyReached }
                     for (i in others.indices) {
@@ -73,7 +78,9 @@ class CrossBorderChoiceTest {
                 }
             }
             assertTrue(finalEarly > 12, "pochi pesi definitivi alla prima fermata: $finalEarly")
-            println("limiti dei landmark: %.0f %% dei pesi".format(100 * boundSum / weightSum))
+            println("limiti dei landmark: %.0f %% dei pesi (radice partenza %.0f %%, radice arrivo %.0f %%)".format(100 * boundSum / weightSum,
+                100 * dirBound[0] / dirWeight[0], 100 * dirBound[1] / dirWeight[1]))
+            assertTrue(dirBound[0] > 0.3 * dirWeight[0] && dirBound[1] > 0.3 * dirWeight[1], "limiti deboli in una direzione")
             assertTrue(boundSum > 0.3 * weightSum, "limiti dei landmark troppo deboli: $boundSum su $weightSum")
 
             // il viaggio "tra Paesi": il valico scelto coi limiti e uno alla volta (valichi a più di 5 km: un punto per luogo)

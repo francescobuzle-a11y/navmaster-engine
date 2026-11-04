@@ -158,6 +158,43 @@ class CoreManyToOne(
         phase1Ms = (System.nanoTime() - t0) / 1_000_000
     }
 
+    /** Diagnostica (prove): da dove viene il limite dei landmark di [other]. */
+    internal fun boundDebug(other: Int): String {
+        val l = lm ?: return "senza landmark"
+        val k = l.landmarkCount
+        val entries = ArrayList<Pair<Int, Double>>()
+        for (c in root1.weight) if (inCore(c.key) && root1.settled.contains(c.key)) entries += c.key to c.value
+        val sb = StringBuilder()
+        sb.append("radice: ${entries.size} ingressi, pesi ${entries.map { it.second }.sorted().take(5).joinToString { "%.0f".format(it) }}")
+        sb.append(", landmark finiti agli ingressi ${entries.take(3).joinToString { (n, _) -> (0 until k).count { l.fromLandmark(it, n).isFinite() }.toString() + "/" + (0 until k).count { l.toLandmark(it, n).isFinite() } }}")
+        sb.append("; tentativo fase 1 ${tentative[other]}, limite ${landmarkBound[other]}")
+        val seeds = ArrayList<Seed>()
+        for (c in seedsAt) for (sd in c.value) if (sd.other == other) seeds += sd
+        val nodes = seedsAt.keys().toArray().filter { n -> seedsAt.get(n).any { it.other == other } }
+        sb.append("; semi ${seeds.size} in ${nodes.size} nodi")
+        for (n in nodes.take(4)) {
+            val w = seedsAt.get(n).filter { it.other == other }.minOf { it.weight }
+            var best = 0.0; var bestL = -1; var bestKind = ""
+            for (li in 0 until k) {
+                val dLc = l.fromLandmark(li, n); val dcL = l.toLandmark(li, n)
+                var sC1 = Double.NEGATIVE_INFINITY; var sC2 = Double.POSITIVE_INFINITY
+                var tC1 = Double.NEGATIVE_INFINITY; var tC2 = Double.POSITIVE_INFINITY
+                for ((e, f) in entries) {
+                    val fL = l.fromLandmark(li, e); val tL = l.toLandmark(li, e)
+                    if (fL.isFinite()) { sC1 = maxOf(sC1, fL - f); tC2 = minOf(tC2, fL + f) }
+                    if (tL.isFinite()) { sC2 = minOf(sC2, tL + f); tC1 = maxOf(tC1, tL - f) }
+                }
+                val t1 = if (rootIsTarget) dcL - tC1 else dLc - sC1
+                val t2 = if (rootIsTarget) tC2 - dLc else sC2 - dcL
+                if (t1.isFinite() && t1 > best) { best = t1; bestL = li; bestKind = "a" }
+                if (t2.isFinite() && t2 > best) { best = t2; bestL = li; bestKind = "b" }
+            }
+            sb.append("\n        seme nodo $n peso %.0f: landmark finiti %d/%d, miglior termine %.0f (landmark $bestL $bestKind)".format(w,
+                (0 until k).count { l.fromLandmark(it, n).isFinite() }, (0 until k).count { l.toLandmark(it, n).isFinite() }, best))
+        }
+        return sb.toString()
+    }
+
     /** Vero quando il peso di [other] è definitivo ([weight]). */
     fun isFinal(other: Int): Boolean = final[other]
 

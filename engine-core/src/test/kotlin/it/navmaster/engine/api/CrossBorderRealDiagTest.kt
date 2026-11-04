@@ -64,24 +64,28 @@ class CrossBorderRealDiagTest {
                     val t = usable[i]
                     val ts = System.currentTimeMillis()
                     val w = try { (if (rootIsTarget) router.route(snaps[i], sr, exact = false) else router.route(sr, snaps[i], exact = false)).weight } catch (e: RouteNotFoundException) { Double.POSITIVE_INFINITY }
-                    Triple(t, m.lowerBound(i) to w, System.currentTimeMillis() - ts)
-                }.sortedBy { it.second.second }
-                for ((t, lw, ms) in rows.take(25)) {
+                    Triple(t, m.lowerBound(i) to w, System.currentTimeMillis() - ts) to i
+                }.sortedBy { it.first.second.second }
+                for ((row, idx) in rows.take(25)) {
+                    val (t, lw, ms) = row
                     val (lb, w) = lw
                     println("   %.5f,%.5f r${t.rank} a %.0f km: limite %s, peso %s (%s), ricerca $ms ms".format(t.lat, t.lon,
                         DistanceCalc.haversine(root.first, root.second, t.lat, t.lon) / 1000,
                         if (lb.isFinite()) "%.0f".format(lb) else "∞", if (w.isFinite()) "%.0f".format(w) else "∞",
                         if (lb.isFinite() && w.isFinite() && w > 0) "%.0f %%".format(100 * lb / w) else "-"))
+                    if (System.getenv("NM_DEBUG") != null && rows.indexOfFirst { it.second == idx } < 4) println("      " + m.boundDebug(idx))
                 }
                 // i landmark: dove sono e quanti nodi del core li raggiungono
-                val lm = g.graph.landmarks.values.firstOrNull { it.landmarkCount > 0 }
+                // quelli del core del camion (la mappa ha anche quelli dell'auto)
+                val lm = g.graph.landmarks["heavyvehicle_recommended_core"]
                 if (lm != null) {
                     val bg = g.graph.graph
                     val sample = (0 until bg.nodeCount step maxOf(1, bg.nodeCount / 20000)).filter { lm.isCoreNode(it) }
                     for (l in 0 until lm.landmarkCount) {
                         val n = lm.landmarkNodes[l]
                         val fin = sample.count { lm.fromLandmark(l, it).isFinite() }
-                        println("   landmark $l: %.4f,%.4f, raggiunge ${100 * fin / maxOf(1, sample.size)} %% del core".format(bg.lat(n), bg.lon(n)))
+                        val back = sample.count { lm.toLandmark(l, it).isFinite() }
+                        println("   landmark $l: %.4f,%.4f, raggiunge ${100 * fin / maxOf(1, sample.size)} %% del core, raggiunto da ${100 * back / maxOf(1, sample.size)} %%".format(bg.lat(n), bg.lon(n)))
                     }
                 }
             }
