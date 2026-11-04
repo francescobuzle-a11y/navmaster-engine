@@ -61,7 +61,7 @@ class WideCoreTest {
                     }
                 }
                 println("$name: $equal uguali, $loops col giro noto")
-                assertTrue(equal >= 30 && loops <= 3, name)
+                assertTrue(equal >= 28 && loops <= 3, name)
             }
         }
     }

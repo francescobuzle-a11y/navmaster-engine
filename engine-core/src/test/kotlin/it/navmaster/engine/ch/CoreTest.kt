@@ -58,7 +58,7 @@ class CoreTest {
                     "mezzo da 3 m e 7,5 t" to EdgeFilterFactory.create(encoding, "heavyvehicle", params = VehicleParameters(height = 3.0, weight = 7.5)),
                 )
                 for ((label, filter) in scenarios) {
-                    var pairs = 0; var coreVisited = 0L; var altVisited = 0L; var plainVisited = 0L
+                    var pairs = 0; var coreVisited = 0L; var altVisited = 0L; var plainVisited = 0L; var loops = 0
                     repeat(60) {
                         val s = rnd.nextInt(g.nodeCount); val t = rnd.nextInt(g.nodeCount)
                         // node-based
@@ -81,11 +81,20 @@ class CoreTest {
                         val cde = CoreDijkstra(ch, w, filter, tcp, lm).also { it.addSource(s, 0.0); it.addTarget(t, 0.0) }
                         assertEquals(ebFound, cde.run(), "[$label] raggiungibilità edge-based diversa per $s→$t")
                         if (ebFound) {
-                            assertTrue(abs(eb.bestWeight - cde.bestWeight) <= 0.01 + eb.bestWeight * 1e-5, "[$label] $s→$t edge-based core-ALT: dijkstra ${eb.bestWeight} vs core ${cde.bestWeight}")
+                            if (abs(eb.bestWeight - cde.bestWeight) > 0.01 + eb.bestWeight * 1e-5) {
+                                // la ricerca piena può girare attorno a un isolato fuori dal core per invertire
+                                // (inversioni vietate); il core no (fuori la CH è node-based, come in ORS): limite noto
+                                val pe2 = eb.extractPath()!!
+                                val ns = pe2.nodes.toList()
+                                val loop = eb.bestWeight < cde.bestWeight && ns.groupBy { it }.filter { it.value.size > 1 }.keys.any { r -> ns.subList(ns.indexOf(r), ns.lastIndexOf(r) + 1).any { !core[it] } }
+                                assertTrue(loop, "[$label] $s→$t edge-based core-ALT: dijkstra ${eb.bestWeight} vs core ${cde.bestWeight}")
+                                loops++
+                            }
                             checkPath(g, cde.extractPath()!!, s, t)
                         }
                     }
-                    println("[$label] coppie $pairs, nodi visitati: core-ALT ${altVisited / maxOf(1, pairs)}, core ${coreVisited / maxOf(1, pairs)}, dijkstra ${plainVisited / maxOf(1, pairs)}")
+                    println("[$label] coppie $pairs, nodi visitati: core-ALT ${altVisited / maxOf(1, pairs)}, core ${coreVisited / maxOf(1, pairs)}, dijkstra ${plainVisited / maxOf(1, pairs)}; $loops col giro della ricerca piena")
+                    assertTrue(loops <= 3, "[$label] troppi giri: $loops")
                     assertTrue(coreVisited < plainVisited, "[$label] il core dovrebbe visitare meno nodi")
                     assertTrue(altVisited <= coreVisited, "[$label] i landmark non dovrebbero aumentare i nodi visitati")
                 }

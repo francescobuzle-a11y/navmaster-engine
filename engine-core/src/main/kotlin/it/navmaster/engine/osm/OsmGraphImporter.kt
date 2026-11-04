@@ -235,13 +235,19 @@ class OsmGraphImporter(
                         lats.add(pillarLat[p]); lons.add(pillarLon[p]); segIds.add(id); continue
                     }
                 }
+                // nodo barriera (anche al primo o all'ultimo nodo della way, come l'OSMReader di GraphHopper):
+                // la way si ferma su una copia del nodo, unita al nodo vero da un arco di lunghezza zero
+                // che porta l'accesso della barriera; una barriera vale una volta sola (il primo passaggio)
+                val bt = barrierTags.get(id)
+                if (bt != null) barrierTags.remove(id)
+                val next: Int
                 if (segmentStart >= 0) {
                     lats.add(graph.lat(tower)); lons.add(graph.lon(tower)); segIds.add(id)
-                    addEdge(way, segmentStart, tower)
+                    addEdge(way, segmentStart, if (bt != null) splitBarrier(way, tower, bt) else tower)
+                    next = tower
+                } else {
+                    next = if (bt != null) splitBarrier(way, tower, bt) else tower
                 }
-                // nodo barriera interno: sdoppia e collega con un arco di lunghezza zero
-                val bt = if (i in 1 until ids.size - 1) barrierTags.get(id) else null
-                val next = if (bt != null) splitBarrier(way, tower, bt) else tower
                 segmentStart = next
                 lats.clear(); lons.clear(); segIds.clear()
                 lats.add(graph.lat(next)); lons.add(graph.lon(next)); segIds.add(id)
