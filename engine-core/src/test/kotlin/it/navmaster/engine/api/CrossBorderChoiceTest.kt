@@ -76,7 +76,7 @@ class CrossBorderChoiceTest {
             println("limiti dei landmark: %.0f %% dei pesi".format(100 * boundSum / weightSum))
             assertTrue(boundSum > 0.3 * weightSum, "limiti dei landmark troppo deboli: $boundSum su $weightSum")
 
-            // il viaggio "tra Paesi": il valico scelto in una ricerca per lato e uno alla volta
+            // il viaggio "tra Paesi": il valico scelto coi limiti e uno alla volta (valichi a più di 5 km: un punto per luogo)
             val service = DirectionsService(g)
             val a = CountryGraph("a", service); val b = CountryGraph("b", service)
             val crossings = ArrayList<Transfer>()
@@ -84,11 +84,11 @@ class CrossBorderChoiceTest {
                 if (crossings.size >= 10) break
                 val s = randomSnap(core)
                 val n = s.closestNode
-                if (crossings.any { c -> DistanceCalc.haversine(c.lat, c.lon, bg.lat(n), bg.lon(n)) < 3_500.0 }) continue
+                if (crossings.any { c -> DistanceCalc.haversine(c.lat, c.lon, bg.lat(n), bg.lon(n)) < 5_500.0 }) continue
                 // su un nodo della strada, come i passaggi veri; strade principali e minori
                 crossings += Transfer(bg.lat(n), bg.lon(n), if (crossings.size % 3 == 2) 5 else 1 + crossings.size % 3)
             }
-            assertTrue(crossings.size >= 8, "valichi finti: ${crossings.size}")
+            assertTrue(crossings.size >= 4, "valichi finti: ${crossings.size}")
             val logs = ArrayList<String>()
             val together = CrossBorderDirections(listOf(a, b), { _, _ -> crossings }, { logs += it })
             val oneByOne = CrossBorderDirections(listOf(a, b), { _, _ -> crossings }, null, oneSearch = false)
@@ -118,22 +118,24 @@ class CrossBorderChoiceTest {
     }
 
     @Test
-    fun `one crossing per place keeps both carriageways of a motorway`() {
-        // il Brennero: i capi delle due carreggiate (sensi unici) ai due margini degli estratti, la statale; Resia
+    fun `crossings grouped by place, the most important road first`() {
+        // il Brennero: i capi delle due carreggiate (sensi unici) ai due margini degli estratti, la statale; Resia: i due capi della strada
         val north1 = Transfer(47.01760, 11.50650, 1); val south1 = Transfer(47.01790, 11.50700, 1)
         val north2 = Transfer(47.00210, 11.50480, 1); val south2 = Transfer(47.00230, 11.50530, 1)
         val road = Transfer(47.01500, 11.50300, 3)
         val resia = Transfer(46.83405, 10.51050, 3); val nauders = Transfer(46.86843, 10.50890, 3)
-        val canneto = 45.150 to 10.380; val innsbruck = 47.269 to 11.404
-        fun detour(t: Transfer) = DistanceCalc.haversine(canneto.first, canneto.second, t.lat, t.lon) + DistanceCalc.haversine(t.lat, t.lon, innsbruck.first, innsbruck.second)
+        val start = 45.4103 to 9.9428; val innsbruck = 47.269 to 11.404
+        fun detour(t: Transfer) = DistanceCalc.haversine(start.first, start.second, t.lat, t.lon) + DistanceCalc.haversine(t.lat, t.lon, innsbruck.first, innsbruck.second)
         val all = listOf(road, north1, resia, south1, north2, nauders, south2)
-        val kept = Transfers.onePerPlace(all, ::detour, 6)
-        val brenner = kept.filter { it.lon > 11.0 }
-        assertEquals(2, brenner.size, "al Brennero: $brenner")
-        assertTrue(brenner.all { it.rank == 1 } && DistanceCalc.haversine(brenner[0].lat, brenner[0].lon, brenner[1].lat, brenner[1].lon) < 500.0)
-        assertTrue(road !in kept && resia in kept && nauders in kept)
-        // il numero di luoghi, non di punti
-        assertEquals(brenner, Transfers.onePerPlace(all, ::detour, 1))
+        val places = Transfers.places(all, ::detour, 6)
+        assertEquals(2, places.size, "luoghi: $places")
+        val brenner = places.first { pl -> pl.any { it.lon > 11.0 } }
+        assertEquals(5, brenner.size)
+        assertEquals(road, brenner.last(), "la statale dopo l'autostrada")
+        assertTrue(brenner.dropLast(1).all { it.rank == 1 })
+        assertEquals(setOf(resia, nauders), places.first { pl -> pl.any { it.lon < 11.0 } }.toSet())
+        // il numero di luoghi
+        assertEquals(1, Transfers.places(all, ::detour, 1).size)
     }
 
     @Suppress("UNCHECKED_CAST")

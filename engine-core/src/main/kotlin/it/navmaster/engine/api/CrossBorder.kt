@@ -92,23 +92,23 @@ object Transfers {
     }
 
     /**
-     * Un valico per luogo (entro [PLACE] m), i luoghi in ordine di [detour], al più [places]: della
-     * strada più importante del luogo i punti allo stesso capo ([SAME_END] m), cioè le due carreggiate
-     * di un'autostrada (sensi unici: dall'Italia si entra in Austria solo da una delle due), non l'altro
-     * capo della stessa strada né le strade minori (al Brennero l'autostrada e la statale).
+     * I valichi raggruppati per luogo (entro [PLACE] m dal punto della strada più importante), i
+     * luoghi in ordine di [detour], al più [places]; in ogni luogo i punti in ordine d'importanza
+     * della strada. Un luogo è un valico solo: al Brennero i capi delle due carreggiate
+     * dell'autostrada e la statale, a Resia i due capi della stessa strada. Quale punto del luogo
+     * serve lo decide il viaggio: un senso unico o un'autostrada vietata al mezzo da un lato non si
+     * raggiungono, allora vale il punto successivo.
      */
-    fun onePerPlace(list: List<Transfer>, detour: (Transfer) -> Double, places: Int): List<Transfer> {
+    fun places(list: List<Transfer>, detour: (Transfer) -> Double, places: Int): List<List<Transfer>> {
         val out = ArrayList<MutableList<Transfer>>()
         for (t in list.sortedWith(compareBy<Transfer>({ it.rank }, { detour(it) }))) {
             val place = out.firstOrNull { DistanceCalc.haversine(it[0].lat, it[0].lon, t.lat, t.lon) < PLACE }
-            if (place == null) out += mutableListOf(t)
-            else if (t.rank == place[0].rank && DistanceCalc.haversine(place[0].lat, place[0].lon, t.lat, t.lon) < SAME_END) place += t
+            if (place == null) out += mutableListOf(t) else place += t
         }
-        return out.sortedBy { detour(it[0]) }.take(places).flatten()
+        return out.sortedBy { detour(it[0]) }.take(places)
     }
 
-    private const val PLACE = 3_000.0
-    private const val SAME_END = 500.0
+    private const val PLACE = 5_000.0
 
     fun rank(c: RoadClass): Int = when (c) {
         RoadClass.MOTORWAY -> 1
@@ -299,14 +299,14 @@ class CrossBorderDirections(
     }
 
     /** I passaggi da provare su un confine: i migliori per deviazione dalla linea p → q, prima le strade principali. */
-    private fun candidates(list: List<Transfer>, p: LL, q: LL, transit: Boolean): List<Transfer> {
+    private fun candidates(list: List<Transfer>, p: LL, q: LL, transit: Boolean): List<List<Transfer>> {
         fun detour(t: Transfer) = DistanceCalc.haversine(p.lat, p.lon, t.lat, t.lon) + DistanceCalc.haversine(t.lat, t.lon, q.lat, q.lon)
-        val major = Transfers.onePerPlace(list.filter { it.rank <= 3 }, ::detour, if (transit) 5 else 6)
+        val major = Transfers.places(list.filter { it.rank <= 3 }, ::detour, if (transit) 5 else 6)
         // le strade minori solo vicino alla partenza o all'arrivo (un viaggio corto oltre il confine)
         val minor = list.filter { it.rank > 3 }.filter { t ->
             minOf(DistanceCalc.haversine(p.lat, p.lon, t.lat, t.lon), DistanceCalc.haversine(t.lat, t.lon, q.lat, q.lon)) < 40_000.0
-        }.let { Transfers.onePerPlace(it, ::detour, if (transit) 2 else 4) }
-        return (major + minor).distinct()
+        }.let { Transfers.places(it, ::detour, if (transit) 2 else 4) }
+        return major + minor
     }
 
     /**
@@ -331,14 +331,16 @@ class CrossBorderDirections(
             var ok = true
             for (k in 1 until path.size) {
                 val from = path[k - 1]; val to = path[k]
-                val cands = candidates(transfers(from, to), p, q, path.size > 2)
+                val places = candidates(transfers(from, to), p, q, path.size > 2)
                     // il passaggio deve essere percorribile dal mezzo in entrambi i grafi
-                    .filter { t -> LL(t.lat, t.lon).let { ctx.snap(from, it, TRANSFER_RADIUS) != null && ctx.snap(to, it, TRANSFER_RADIUS) != null } }
-                log?.invoke("  ${path.joinToString("-") { it.id }} confine ${from.id}/${to.id}: ${cands.size} candidati")
+                    .map { pl -> pl.filter { t -> LL(t.lat, t.lon).let { ctx.snap(from, it, TRANSFER_RADIUS) != null && ctx.snap(to, it, TRANSFER_RADIUS) != null } } }
+                    .filter { it.isNotEmpty() }
+                val cands = places.flatten()
+                log?.invoke("  ${path.joinToString("-") { it.id }} confine ${from.id}/${to.id}: ${cands.size} candidati in ${places.size} luoghi")
                 if (cands.isEmpty()) { ok = false; break }
                 // due Paesi: il valico con una ricerca per lato (sotto, uno alla volta quando non si può)
                 if (path.size == 2 && together) {
-                    val c = chooseTogether(ctx, p, rp, from, q, rq, to, cands, best)
+                    val c = chooseTogether(ctx, p, rp, from, q, rq, to, places, best)
                     if (c != null) {
                         if (c.weight < best && c.transfer != null) { best = c.weight; bestChain = listOf(c.transfer to to) }
                         ok = false; break
@@ -394,8 +396,12 @@ class CrossBorderDirections(
      * viaggio migliore trovato; quando il limite del valico successivo supera il viaggio migliore,
      * nessun altro valico può batterlo. Null quando i router non cercano sul core: un valico alla volta.
      */
-    private fun chooseTogether(ctx: Ctx, p: LL, rp: Double, ga: CountryGraph, q: LL, rq: Double, gb: CountryGraph, cands: List<Transfer>, limit: Double): Choice? {
+    private fun chooseTogether(ctx: Ctx, p: LL, rp: Double, ga: CountryGraph, q: LL, rq: Double, gb: CountryGraph, places: List<List<Transfer>>, limit: Double): Choice? {
         val none = Choice(Double.POSITIVE_INFINITY, null)
+        val cands = places.flatten()
+        // il luogo di ogni punto e quelli prima di lui nel suo luogo (più importanti)
+        val before = ArrayList<IntRange>(cands.size)
+        run { var start = 0; for (pl in places) { for (k in pl.indices) before += start until start + k; start += pl.size } }
         val sp = ctx.snap(ga, p, rp) ?: return none
         val sq = ctx.snap(gb, q, rq) ?: return none
         // i candidati sono agganciati in entrambi i grafi (filtrati da chain)
@@ -412,11 +418,15 @@ class CrossBorderDirections(
         ctx.queries += 2
         val farBounds = DoubleArray(cands.size) { mFar.lowerBound(it) }
         val farWeight = DoubleArray(cands.size) { Double.NaN }
+        // un punto che non si raggiunge da un lato (o non batte il viaggio migliore): vale il successivo del suo luogo
+        val failed = BooleanArray(cands.size)
         var best = limit; var bestI = -1; var farMs = 0L; var searches = 0
         while (true) {
-            // il valico col limite più basso del viaggio intero, non ancora cercato dal lato lontano
+            for (j in cands.indices) if (!failed[j] && farWeight[j].isNaN() && (farBounds[j].isInfinite() || mNear.lowerBound(j).isInfinite())) failed[j] = true
+            // il valico col limite più basso del viaggio intero, non ancora cercato dal lato lontano: in ogni
+            // luogo il punto più importante fra quelli non falliti
             var i = -1; var key = Double.POSITIVE_INFINITY
-            for (j in cands.indices) if (farWeight[j].isNaN()) {
+            for (j in cands.indices) if (farWeight[j].isNaN() && !failed[j] && before[j].all { failed[it] }) {
                 val k = farBounds[j] + mNear.lowerBound(j)
                 if (k < key) { key = k; i = j }
             }
@@ -432,12 +442,13 @@ class CrossBorderDirections(
             val f = if (shortIsB) ctx.weight(ga, p, rp, tl, TRANSFER_RADIUS, best - b) else ctx.weight(gb, tl, TRANSFER_RADIUS, q, rq, best - b)
             farMs += System.currentTimeMillis() - t1; searches++
             farWeight[i] = f
+            if (f.isInfinite()) failed[i] = true
             if (f + b < best) { best = f + b; bestI = i }
         }
         log?.invoke("    valico scelto: ${if (bestI < 0) "nessuno" else "%.5f,%.5f peso %.0f".format(cands[bestI].lat, cands[bestI].lon, best)}; " +
             "lato vicino ${near.id} ${mNear.stats}; lato lontano ${far.id} $searches ricerche $farMs ms; in tutto ${System.currentTimeMillis() - t0} ms")
         fun w(x: Double) = if (x.isFinite()) "%.0f".format(x) else "∞"
-        for ((j, t) in cands.withIndex()) log?.invoke("      %.5f,%.5f r${t.rank}: ${near.id} ${if (mNear.isFinal(j)) w(mNear.weight(j)) else "≥" + w(mNear.lowerBound(j))}, ${far.id} ${if (farWeight[j].isNaN()) "≥" + w(farBounds[j]) else w(farWeight[j])}".format(t.lat, t.lon))
+        for ((j, t) in cands.withIndex()) log?.invoke("      ${if (before[j].isEmpty()) "luogo" else "  …  "} %.5f,%.5f r${t.rank}: ${near.id} ${if (mNear.isFinal(j)) w(mNear.weight(j)) else "≥" + w(mNear.lowerBound(j))}, ${far.id} ${if (farWeight[j].isNaN()) "≥" + w(farBounds[j]) else w(farWeight[j])}".format(t.lat, t.lon))
         return if (bestI < 0) none else Choice(best, cands[bestI])
     }
 
