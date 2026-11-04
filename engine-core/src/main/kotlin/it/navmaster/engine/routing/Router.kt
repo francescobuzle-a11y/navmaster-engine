@@ -63,6 +63,12 @@ class Router(
     private val quickAccepts: EdgeFilter? = null,
 ) {
     /** Quale algoritmo verrà usato: utile per diagnostica e test. */
+    /** The phases of the last core search (diagnostics). */
+    var lastStats = ""; private set
+
+    /** The same, of the quick search when there is one. */
+    fun quickStats(): String = quick?.let { "rapida ${it.algorithm}: ${it.lastStats}" } ?: lastStats
+
     val algorithm: String get() = when {
         ch != null -> "ch"
         core != null -> (if (landmarks != null) "core_alt" else "core") + (if (turnCosts != null) "_edge_based" else "")
@@ -225,7 +231,9 @@ class Router(
             if (maxWeight.isFinite()) algo.bestWeight = maxWeight
             for (p in fromParts) algo.addSource(p.node, p.weight)
             for (p in toParts) algo.addTarget(p.node, p.weight)
-            if (algo.run()) algo.extractPath() else null
+            val found = algo.run()
+            lastStats = algo.stats
+            if (found) algo.extractPath() else null
         } else if (turnCosts != null) {
             val algo = EdgeBasedBidirectionalDijkstra(graph, weighting, turnCosts, filter, maxVisitedNodes)
             if (maxWeight.isFinite()) algo.bestWeight = maxWeight

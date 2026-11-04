@@ -113,12 +113,17 @@ class CoreDijkstra(
     fun addSource(node: Int, w: Double) { if (fwd.relax(node, w, -1, -1)) checkMeeting(node) }
     fun addTarget(node: Int, w: Double) { if (bwd.relax(node, w, -1, -1)) checkMeeting(node) }
 
+    /** Tempi e nodi delle due fasi dell'ultima ricerca (diagnostica). */
+    var stats = ""; private set
+
     fun run(): Boolean {
+        val t0 = System.nanoTime()
         // fase 1: entrambe le direzioni fino a esaurimento (le ricerche CH verso l'alto sono piccole)
         while (!fwd.heap.isEmpty || !bwd.heap.isEmpty) {
             if (!fwd.heap.isEmpty) settlePhase1(fwd, fwdIt, false)
             if (!bwd.heap.isEmpty) settlePhase1(bwd, bwdIt, true)
         }
+        val v1 = visitedNodes; val t1 = System.nanoTime()
         // fase 2: semina gli ingressi al core e cerca dentro con i filtri (A* bilanciato se ci sono i landmark)
         potentials?.let { p ->
             for (c in fwd.weight) if (inCore(c.key) && fwd.settled.contains(c.key)) p.addSource(c.key, c.value)
@@ -133,6 +138,7 @@ class CoreDijkstra(
             if (fk + bk >= bestWeight) break
             if (fk <= bk) settleCore(cFwd, false) else settleCore(cBwd, true)
         }
+        stats = "fase1 $v1 nodi ${(t1 - t0) / 1_000_000} ms, core ${visitedNodes - v1} nodi ${(System.nanoTime() - t1) / 1_000_000} ms" + (if (potentials != null) " ALT" else "")
         return meetingNode >= 0 || coreMet
     }
 

@@ -172,7 +172,7 @@ class CrossBorderDirections(
             // for choosing: the quick search's path also when it uses a road to avoid (the pieces are then exact)
             val w = try { router(g).route(sa, sb, maxWeight = limit, exact = false).weight } catch (e: RouteNotFoundException) { Double.POSITIVE_INFINITY }
             val ms = System.currentTimeMillis() - t0
-            if (ms > 300) log?.invoke("    ricerca ${g.id} ${if (w.isFinite()) "%.0f".format(w) else "∞"} (limite ${if (limit.isFinite()) "%.0f".format(limit) else "∞"}) in $ms ms")
+            if (ms > 300) log?.invoke("    ricerca ${g.id} ${if (w.isFinite()) "%.0f".format(w) else "∞"} (limite ${if (limit.isFinite()) "%.0f".format(limit) else "∞"}) in $ms ms: ${router(g).algorithm} ${router(g).quickStats()}")
             weights[key] = w to limit
             return w
         }
