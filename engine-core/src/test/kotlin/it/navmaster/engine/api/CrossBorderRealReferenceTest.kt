@@ -133,10 +133,12 @@ class CrossBorderRealReferenceTest {
                 if (same(w1, w2)) equal++ else {
                     // la ricerca piena edge-based può girare attorno a un isolato e ripassare da un nodo (inversioni
                     // vietate); fuori dal core la CH è node-based e non lo fa, come in ORS: limite noto, non un errore
-                    // (solo se ripassa da un nodo fuori dal core: dentro, il core lo farebbe anche lui)
+                    // (solo se il giro passa da nodi fuori dal core: le scorciatoie fra nodi del core seguono il
+                    // percorso più breve e non fanno giri; un giro tutto sugli archi del core il core lo farebbe)
                     val st = g.graph.chStorages["heavyvehicle_recommended_core"]; val nn = g.graph.graph.nodeCount
-                    val loop = p2 != null && p1 != null && w2 < w1 && full.isLegal(p2) && st != null &&
-                        p2.edges.map { it.baseNode }.groupBy { it }.filter { it.value.size > 1 }.keys.any { st.level(it) < nn }
+                    val loop = p2 != null && p1 != null && w2 < w1 && full.isLegal(p2) && st != null && p2.edges.map { it.baseNode }.let { ns ->
+                        ns.groupBy { it }.filter { it.value.size > 1 }.keys.any { r -> ns.subList(ns.indexOf(r), ns.lastIndexOf(r) + 1).any { st.level(it) < nn } }
+                    }
                     val line = "  ${g.id} interno ${r1.algorithm}/${r2.algorithm} %.4f,%.4f → %.4f,%.4f: %s contro %s%s".format(p.queryLat, p.queryLon, q.queryLat, q.queryLon, fmt(w1), fmt(w2),
                         if (loop) " (la ricerca piena ripassa da un nodo: limite noto del core)" else "")
                     println(line)

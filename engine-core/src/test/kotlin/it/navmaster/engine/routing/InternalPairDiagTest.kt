@@ -33,6 +33,12 @@ class InternalPairDiagTest {
                     val st = g.chStorages.getValue("heavyvehicle_recommended_core"); val n = g.graph.nodeCount
                     println("  $name: peso %.1f, %.2f km, %d archi, legale ${full.isLegal(p)}, nodi ripetuti ${repeated.size} %s".format(p.weight, p.distance / 1000, p.edges.size,
                         repeated.take(6).map { "$it${if (st.level(it) >= n) " (core)" else ""}" }))
+                    // per ogni nodo ripetuto: il giro fra la prima e l'ultima volta, e quanti nodi fuori dal core
+                    for (r in repeated.take(3)) {
+                        val i = nodes.indexOf(r); val j = nodes.lastIndexOf(r)
+                        val loop = nodes.subList(i, j + 1)
+                        println("    giro da $r: ${loop.size} nodi, ${loop.count { st.level(it) < n }} fuori dal core, %.0f m".format(p.edges.subList(i, j).sumOf { it.distance }))
+                    }
                 }
                 if (pc != null && pf != null) {
                     val ec = pc.edges.map { it.edge }; val ef = pf.edges.map { it.edge }
