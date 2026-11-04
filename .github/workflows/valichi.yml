@@ -1,0 +1,63 @@
+# Prove del motore sui grafi veri dei Paesi (quelli dei pacchetti dati-<paese> dell'app, file
+# nm.tar.gz): i viaggi tra Paesi e la diagnostica della scelta dei valichi. I grafi non stanno sul
+# computer di sviluppo: si scaricano qui.
+name: Valichi su grafi veri
+
+on:
+  workflow_dispatch:
+    inputs:
+      countries:
+        description: "Paesi separati da virgola (es. italy,austria)"
+        default: "italy,austria"
+      test:
+        description: "Prova da eseguire"
+        default: "it.navmaster.engine.api.CrossBorderRealDiagTest"
+      trips:
+        description: "Viaggi (lat,lon;lat,lon|…), vuoto per quelli della prova"
+        default: ""
+
+jobs:
+  prova:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: "17"}
+      - name: Spazio sul disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h / /mnt
+      - name: Grafi dei Paesi
+        env:
+          COUNTRIES: ${{ inputs.countries }}
+        run: |
+          set -euo pipefail
+          spec=""
+          for c in ${COUNTRIES//,/ }; do
+            d=/mnt/grafi/$c
+            sudo mkdir -p "$d" && sudo chown "$USER" "$d"
+            curl -fsSL "https://github.com/francescobuzle-a11y/navmaster/releases/download/dati-$c/nm.tar.gz" | tar -xz -C "$d"
+            g=$(dirname "$(find "$d" -name profiles | head -1)")
+            echo "$c: $g ($(du -sh "$g" | cut -f1))"
+            spec="$spec${spec:+,}$c=$g"
+          done
+          echo "NM_CB=$spec" >> "$GITHUB_ENV"
+          df -h /mnt
+      - name: Prova
+        env:
+          TEST: ${{ inputs.test }}
+          NM_TRIPS: ${{ inputs.trips }}
+        run: |
+          chmod +x gradlew
+          [ -n "$NM_TRIPS" ] || unset NM_TRIPS
+          ./gradlew --no-daemon :engine-core:test --tests "$TEST" -i 2>&1 | tee prova.log | grep -vE "^(> Task|Skipping|Caching|Resolving|Downloading|Download|Starting process|Successfully started|Finished generating)" | grep -E "^\s{4}|PASSED|FAILED|BUILD" || true
+          grep -q "BUILD SUCCESSFUL" prova.log
+      - name: Registro
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prova-${{ github.run_id }}
+          path: |
+            prova.log
+            engine-core/build/test-results/test/*.xml
