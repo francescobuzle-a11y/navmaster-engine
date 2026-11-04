@@ -221,7 +221,7 @@ class Router(
             if (keepDirection && best != null && best.edges.isNotEmpty() && best.edges[0].reverse != arrival!!.reverse) best = null
         }
 
-        val sp = search(fromParts.map { it.node to it.weight }, toParts.map { it.node to it.weight }, maxWeight)
+        val sp = search(fromParts, toParts, maxWeight)
         if (sp != null) {
             val startPart = fromParts.first { it.node == sp.startNode }
             val endPart = toParts.first { it.node == sp.endNode }
@@ -241,44 +241,49 @@ class Router(
         if (quick != null && quickAccepts != null) return quick.manyToOne(root, others, rootIsTarget)
         val c = core ?: return null
         val m = CoreManyToOne(c, weighting, filter, turnCosts, landmarks, rootIsTarget, others.size)
-        for (p in splitEdge(root, asTarget = rootIsTarget)) m.addRoot(p.node, p.weight)
+        for (p in splitEdge(root, asTarget = rootIsTarget)) m.addRoot(p.node, p.weight, p.snapEdge)
         for ((i, s) in others.withIndex()) {
             // sullo stesso arco della radice vale anche il tratto diretto (come in route)
             if (s.edge == root.edge && (s.position != SnapPosition.TOWER || root.position != SnapPosition.TOWER)) {
                 (if (rootIsTarget) sameEdgeRoute(s, root) else sameEdgeRoute(root, s))?.let { m.addDirect(i, it.weight) }
             }
-            for (p in splitEdge(s, asTarget = !rootIsTarget)) m.addOther(i, p.node, p.weight)
+            for (p in splitEdge(s, asTarget = !rootIsTarget)) m.addOther(i, p.node, p.weight, p.snapEdge)
         }
         m.prepare()
         return m
     }
 
-    /** La ricerca fra i nodi dati (coi pesi iniziali) con l'algoritmo del router. */
-    private fun search(sources: List<Pair<Int, Double>>, targets: List<Pair<Int, Double>>, maxWeight: Double): SearchPath? = if (ch != null) {
+    /**
+     * La ricerca fra i capi dati (coi pesi dei tratti parziali) con l'algoritmo del router. Le
+     * ricerche edge-based ricevono anche l'arco agganciato: la prima svolta (dal tratto agganciato
+     * al primo arco) e l'ultima (dall'ultimo arco al tratto agganciato) rispettano divieti e
+     * inversioni, come il tratto virtuale di GraphHopper (`QueryGraphWeighting.calcTurnWeight`).
+     */
+    private fun search(sources: List<EdgePart>, targets: List<EdgePart>, maxWeight: Double): SearchPath? = if (ch != null) {
         val algo = DijkstraBidirectionCH(ch, weighting)
         if (maxWeight.isFinite()) algo.bestWeight = maxWeight
-        for ((n, w) in sources) algo.addSource(n, w)
-        for ((n, w) in targets) algo.addTarget(n, w)
+        for (p in sources) algo.addSource(p.node, p.weight)
+        for (p in targets) algo.addTarget(p.node, p.weight)
         if (algo.run()) algo.extractPath() else null
     } else if (core != null) {
         val algo = CoreDijkstra(core, weighting, filter, turnCosts, landmarks)
         if (maxWeight.isFinite()) algo.bestWeight = maxWeight
-        for ((n, w) in sources) algo.addSource(n, w)
-        for ((n, w) in targets) algo.addTarget(n, w)
+        for (p in sources) algo.addSource(p.node, p.weight, p.snapEdge)
+        for (p in targets) algo.addTarget(p.node, p.weight, p.snapEdge)
         val found = algo.run()
         lastStats = algo.stats
         if (found) algo.extractPath() else null
     } else if (turnCosts != null) {
         val algo = EdgeBasedBidirectionalDijkstra(graph, weighting, turnCosts, filter, maxVisitedNodes)
         if (maxWeight.isFinite()) algo.bestWeight = maxWeight
-        for ((n, w) in sources) algo.addSource(n, w)
-        for ((n, w) in targets) algo.addTarget(n, w)
+        for (p in sources) algo.addSource(p.node, p.weight, p.snapEdge)
+        for (p in targets) algo.addTarget(p.node, p.weight, p.snapEdge)
         if (algo.run()) algo.extractPath() else null
     } else {
         val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes)
         if (maxWeight.isFinite()) algo.bestWeight = maxWeight
-        for ((n, w) in sources) algo.addSource(n, w)
-        for ((n, w) in targets) algo.addTarget(n, w)
+        for (p in sources) algo.addSource(p.node, p.weight)
+        for (p in targets) algo.addTarget(p.node, p.weight)
         if (algo.run()) algo.extractPath() else null
     }
 
@@ -298,8 +303,8 @@ class Router(
         // valgono solo se non ricalcano il percorso migliore
         val candidates = if (turnCosts != null) {
             val algo = EdgeBasedBidirectionalDijkstra(graph, weighting, turnCosts, filter, maxVisitedNodes, explorationFactor = weightFactor)
-            for (p in fromParts) algo.addSource(p.node, p.weight)
-            for (p in toParts) algo.addTarget(p.node, p.weight)
+            for (p in fromParts) algo.addSource(p.node, p.weight, p.snapEdge)
+            for (p in toParts) algo.addTarget(p.node, p.weight, p.snapEdge)
             EdgeBasedAlternatives(algo, targetCount + 2, weightFactor, shareFactor).run()
         } else {
             val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes, explorationFactor = weightFactor)
@@ -324,12 +329,15 @@ class Router(
         return out
     }
 
-    /** Vero se ogni svolta del percorso è consentita (con i costi di svolta del profilo; sempre vero senza). */
+    /**
+     * Vero se ogni svolta del percorso è consentita (con i costi di svolta del profilo; sempre vero
+     * senza), anche fra i tratti agganciati e la loro torre. Due archi uguali di seguito sono
+     * un'inversione a U sulla torre: vietata, salvo il profilo non la permetta.
+     */
     fun isLegal(path: RoutePath): Boolean {
         val tc = turnCosts ?: return true
         for (i in 1 until path.edges.size) {
             val prev = path.edges[i - 1]; val cur = path.edges[i]
-            if (prev.edge == cur.edge) continue
             if (tc.turnWeight(prev.edge, prev.adjNode, cur.edge).isInfinite()) return false
         }
         return true
@@ -347,7 +355,7 @@ class Router(
         // arrivo percorre il tratto dalla torre verso il punto (il verso opposto)
         val towardB = (p.node == graph.nodeB(s.edge)) != asTarget
         val dir = travelBearing(s, towardB)
-        return if (angle(dir, heading) > HEADING_TOLERANCE) EdgePart(p.node, p.weight + HEADING_PENALTY, p.distance, p.millis, p.geometry, p.edge, p.reverse) else p
+        return if (angle(dir, heading) > HEADING_TOLERANCE) EdgePart(p.node, p.weight + HEADING_PENALTY, p.distance, p.millis, p.geometry, p.edge, p.reverse, p.snapEdge) else p
     }
 
     /** La direzione (gradi) del segmento dell'arco su cui sta [s], nel verso A→B ([towardB]) o B→A. */
@@ -361,8 +369,12 @@ class Router(
 
     private fun angle(a: Double, b: Double): Double = Math.abs(((a - b + 540.0) % 360.0) - 180.0)
 
-    /** Tratto parziale di un arco agganciato: dal punto agganciato alla torre [node] (o viceversa). */
-    private class EdgePart(val node: Int, val weight: Double, val distance: Double, val millis: Long, val geometry: PointList, val edge: Int, val reverse: Boolean)
+    /**
+     * Tratto parziale di un arco agganciato: dal punto agganciato alla torre [node] (o viceversa).
+     * [snapEdge]: l'arco con cui il viaggio arriva alla torre (partenza) o ne riparte (arrivo), per
+     * la svolta col primo o l'ultimo arco del percorso; -1 per un aggancio esatto su una torre.
+     */
+    private class EdgePart(val node: Int, val weight: Double, val distance: Double, val millis: Long, val geometry: PointList, val edge: Int, val reverse: Boolean, val snapEdge: Int)
 
     /**
      * Le due estremità raggiungibili da un punto agganciato. Per uno snap su torre c'è un solo
@@ -373,7 +385,8 @@ class Router(
      * i sensi unici. `reverse` resta "la torre della parte è A".
      */
     private fun splitEdge(s: Snap, asTarget: Boolean = false): List<EdgePart> {
-        if (s.position == SnapPosition.TOWER) return listOf(EdgePart(s.closestNode, 0.0, 0.0, 0L, PointList().also { it.add(graph.lat(s.closestNode), graph.lon(s.closestNode)) }, s.edge, false))
+        // su una torre la ricerca parte (o arriva) senza arco: nessuna svolta da controllare
+        if (s.position == SnapPosition.TOWER) return listOf(EdgePart(s.closestNode, 0.0, 0.0, 0L, PointList().also { it.add(graph.lat(s.closestNode), graph.lon(s.closestNode)) }, s.edge, false, -1))
         val a = graph.nodeA(s.edge); val b = graph.nodeB(s.edge)
         val all = graph.fetchWayGeometry(s.edge, reverse = false, FetchMode.ALL)
         val total = graph.distance(s.edge)
@@ -391,14 +404,15 @@ class Router(
         val parts = ArrayList<EdgePart>(2)
         // partenza: verso B percorrendo A→B (peso diretto); arrivo: da B verso lo snap percorrendo B→A (peso inverso)
         val wToB = if (asTarget) wBwd else wFwd; val msToB = if (asTarget) msBwd else msFwd
-        if (!wToB.isInfinite()) parts += EdgePart(b, wToB * fracB, dB, (msToB * fracB).toLong(), fromSnap, s.edge, false)
+        if (!wToB.isInfinite()) parts += EdgePart(b, wToB * fracB, dB, (msToB * fracB).toLong(), fromSnap, s.edge, false, s.edge)
         // partenza: verso A percorrendo B→A (peso inverso); arrivo: da A verso lo snap percorrendo A→B (peso diretto)
         val wToA = if (asTarget) wFwd else wBwd; val msToA = if (asTarget) msFwd else msBwd
-        if (!wToA.isInfinite()) parts += EdgePart(a, wToA * fracA, dA, (msToA * fracA).toLong(), toSnap, s.edge, true)
+        if (!wToA.isInfinite()) parts += EdgePart(a, wToA * fracA, dA, (msToA * fracA).toLong(), toSnap, s.edge, true, s.edge)
         if (parts.isEmpty()) {
-            // arco non percorribile in nessuna direzione per questo peso: la ricerca parte comunque dalle torri a costo zero
-            parts += EdgePart(a, 0.0, dA, 0L, toSnap, s.edge, true)
-            parts += EdgePart(b, 0.0, dB, 0L, fromSnap, s.edge, false)
+            // arco non percorribile in nessuna direzione per questo peso: la ricerca parte comunque dalle
+            // torri a costo zero, come da una torre (senza svolta dall'arco, che il mezzo non percorre)
+            parts += EdgePart(a, 0.0, dA, 0L, toSnap, s.edge, true, -1)
+            parts += EdgePart(b, 0.0, dB, 0L, fromSnap, s.edge, false, -1)
         }
         return parts
     }

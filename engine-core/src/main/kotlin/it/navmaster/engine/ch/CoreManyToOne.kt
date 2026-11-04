@@ -52,11 +52,17 @@ class CoreManyToOne(
         }
     }
 
-    /** Un ingresso al core di un altro punto: la chiave (nodo o arco d'arrivo/partenza) e il peso fin lì. */
-    private class Seed(val other: Int, val key: Int, val weight: Double)
+    /**
+     * Un ingresso al core di un altro punto: la chiave (nodo o arco d'arrivo/partenza), il peso fin lì
+     * e l'arco base con cui il viaggio lo tocca (per la svolta con la ricerca della radice; -1 senza).
+     */
+    private class Seed(val other: Int, val key: Int, val weight: Double, val edge: Int)
 
     private val root1 = State(1024)
     private val others1 = Array(otherCount) { State(64) }
+    /** I capi degli archi agganciati della radice e degli altri punti, col loro arco (vedi [SnapEnds]). */
+    private val rootEnds = SnapEnds()
+    private val otherEnds = Array(otherCount) { SnapEnds() }
     private val core = State(4096)
     private val seedsAt = IntObjectHashMap<ArrayList<Seed>>()
     private val tentative = DoubleArray(otherCount) { Double.POSITIVE_INFINITY }
@@ -75,11 +81,14 @@ class CoreManyToOne(
     private var phase1Ms = 0L
     private var coreNanos = 0L
 
-    /** Un capo dell'arco della radice, col peso del tratto fino al punto. */
-    fun addRoot(node: Int, w: Double) { root1.relax(node, w, -1, -1) }
+    /**
+     * Un capo dell'arco della radice, col peso del tratto fino al punto. [edge]: l'arco agganciato
+     * (per la svolta col primo o l'ultimo arco del percorso); -1 per un aggancio su una torre.
+     */
+    fun addRoot(node: Int, w: Double, edge: Int = -1) { if (rootEnds.add(node, w, edge)) root1.relax(node, w, -1, -1) }
 
-    /** Un capo dell'arco dell'altro punto [other]. */
-    fun addOther(other: Int, node: Int, w: Double) { others1[other].relax(node, w, -1, -1) }
+    /** Un capo dell'arco dell'altro punto [other] (con [edge] come in [addRoot]). */
+    fun addOther(other: Int, node: Int, w: Double, edge: Int = -1) { if (otherEnds[other].add(node, w, edge)) others1[other].relax(node, w, -1, -1) }
 
     /** Un percorso diretto già noto fra la radice e [other] (lo stesso arco). */
     fun addDirect(other: Int, w: Double) { if (w < tentative[other]) tentative[other] = w }
@@ -89,32 +98,47 @@ class CoreManyToOne(
         check(!prepared) { "già preparata" }
         prepared = true
         val t0 = System.nanoTime()
-        phase1(root1, rootReverse)
-        for (s in others1) phase1(s, otherReverse)
+        phase1(root1, rootReverse, rootEnds)
+        for ((i, s) in others1.withIndex()) phase1(s, otherReverse, otherEnds[i])
         phase1Nodes = visitedNodes
-        // incontri in fase 1 (come CoreDijkstra: un nodo raggiunto da entrambi, anche del core)
+        // incontri in fase 1 (come CoreDijkstra: un nodo raggiunto da entrambi, anche del core; edge-based
+        // con la svolta fra l'arco d'arrivo e quello di partenza)
         for ((i, s) in others1.withIndex()) for (c in s.weight) {
-            val r = root1.weightOf(c.key)
-            if (r.isFinite() && c.value + r < tentative[i]) tentative[i] = c.value + r
+            val node = c.key
+            if (!root1.weight.containsKey(node)) continue
+            phase1States(s, otherEnds[i], node) { wo, eo ->
+                phase1States(root1, rootEnds, node) { wr, er ->
+                    val turn = if (!edgeBased) 0.0 else if (rootIsTarget) turnCosts!!.turnOrZero(eo, node, er) else turnCosts!!.turnOrZero(er, node, eo)
+                    if (turn.isFinite() && wo + wr + turn < tentative[i]) tentative[i] = wo + wr + turn
+                }
+            }
         }
         // gli ingressi al core degli altri: dove la ricerca della radice li incontra; e i potenziali verso di loro
         for ((i, s) in others1.withIndex()) for (c in s.weight) {
             val node = c.key
             if (!inCore(node) || !s.settled.contains(node)) continue
-            val key = if (!edgeBased) node else lastBaseEdge(s, node).let { e -> if (e < 0) virtualKey(node) else edgeKeyArriving(e, node, otherReverse) }
-            (seedsAt.get(node) ?: ArrayList<Seed>(2).also { seedsAt.put(node, it) }).add(Seed(i, key, c.value))
             potentials?.let { p -> if (rootIsTarget) p.addSource(node, c.value) else p.addTarget(node, c.value) }
             entersCore[i] = true
+            if (!edgeBased) { addSeed(node, Seed(i, node, c.value, -1)); continue }
+            // edge-based: la chiave è l'ultimo arco base fra il nodo e la fase 1; il capo diretto a parte (sotto)
+            if (s.parentEdge.getOrDefault(node, -1) < 0) continue
+            val e = lastBaseEdge(s, node)
+            addSeed(node, Seed(i, edgeKeyArriving(e, node, otherReverse), c.value, e))
+        }
+        // edge-based: i capi degli archi agganciati nel core entrano col tratto diretto e il loro arco
+        if (edgeBased) for ((i, ends) in otherEnds.withIndex()) for (c in ends.weight) {
+            if (inCore(c.key)) addSeed(c.key, Seed(i, virtualKey(c.key), c.value, ends.edgeAt(c.key)))
         }
         // senza ingressi al core un punto ha solo gli incontri di fase 1: già definitivo
         for (i in 0 until otherCount) if (!entersCore[i]) final[i] = true
-        // gli ingressi al core della radice: i semi della ricerca
+        // gli ingressi al core della radice: i semi della ricerca (i capi diretti con una chiave fittizia)
         for (c in root1.weight) {
             val node = c.key
             if (!inCore(node) || !root1.settled.contains(node)) continue
-            val key = if (!edgeBased) node else lastBaseEdge(root1, node).let { e -> if (e < 0) virtualKey(node) else edgeKeyArriving(e, node, rootReverse) }
-            relaxCore(key, c.value, -1, -1)
+            if (!edgeBased) { relaxCore(node, c.value, -1, -1); continue }
+            if (root1.parentEdge.getOrDefault(node, -1) >= 0) relaxCore(edgeKeyArriving(lastBaseEdge(root1, node), node, rootReverse), c.value, -1, -1)
         }
+        if (edgeBased) for (c in rootEnds.weight) if (inCore(c.key)) relaxCore(virtualKey(c.key), c.value, -1, -1)
         // senza ricerca, dai landmark: attraverso il core un percorso va da un ingresso della radice a
         // uno dell'altro punto e pesa almeno il limite fra i due; altrimenti è un incontro di fase 1
         lm?.let { l ->
@@ -184,21 +208,47 @@ class CoreManyToOne(
         return if (h.isEmpty) Double.POSITIVE_INFINITY else h.peekKey()
     }
 
-    private fun phase1(s: State, reverse: Boolean) {
+    /** Un ingresso al core di un altro punto nel nodo [node]. */
+    private fun addSeed(node: Int, seed: Seed) {
+        (seedsAt.get(node) ?: ArrayList<Seed>(2).also { seedsAt.put(node, it) }).add(seed)
+    }
+
+    /** Come la fase 1 di [CoreDijkstra]: dal capo di un arco agganciato la prima mossa svolta dal tratto agganciato. */
+    private fun phase1(s: State, reverse: Boolean, ends: SnapEnds) {
         while (!s.heap.isEmpty) {
             val node = s.heap.pop()
             if (!s.settled.add(node)) continue
             visitedNodes++
             if (inCore(node)) continue // punto d'ingresso: non si espande in fase 1
             val w = s.weightOf(node)
+            val snapEdge = if (edgeBased && s.parentEdge.getOrDefault(node, -1) < 0) ends.edgeAt(node) else -1
             it1.setBaseNode(node, reverse)
             while (it1.next()) {
                 val adj = it1.adjNode
                 if (s.settled.contains(adj)) continue
-                s.relax(adj, w + it1.weight, node, it1.chEdge)
+                var turn = 0.0
+                if (snapEdge >= 0) {
+                    val b = storage.baseEdgeAt(it1.chEdge, node)
+                    turn = if (!reverse) turnCosts!!.turnWeight(snapEdge, node, b) else turnCosts!!.turnWeight(b, node, snapEdge)
+                    if (turn.isInfinite()) continue
+                }
+                s.relax(adj, w + it1.weight + turn, node, it1.chEdge)
             }
         }
     }
+
+    /**
+     * Gli stati di fase 1 di [s] in [node] come in [CoreDijkstra]: (peso, arco base con cui il viaggio
+     * tocca il nodo); edge-based anche il capo diretto quando la fase 1 lo ha superato da un altro capo.
+     */
+    private inline fun phase1States(s: State, ends: SnapEnds, node: Int, f: (Double, Int) -> Unit) {
+        if (s.parentEdge.getOrDefault(node, -1) < 0) { f(s.weightOf(node), if (edgeBased) ends.edgeAt(node) else -1); return }
+        f(s.weightOf(node), if (edgeBased) lastBaseEdge(s, node) else -1)
+        if (edgeBased && ends.has(node)) f(ends.weightAt(node), ends.edgeAt(node))
+    }
+
+    /** L'arco della chiave della ricerca della radice in [node]: per una chiave fittizia l'arco agganciato della radice (o -1). */
+    private fun keyEdge(key: Int, node: Int): Int = if (key >= 0) key ushr 1 else rootEnds.edgeAt(node)
 
     /** La chiave dell'heap: il peso più il limite inferiore del resto verso gli ingressi degli altri. */
     private fun heapKey(w: Double, node: Int): Double {
@@ -211,16 +261,13 @@ class CoreManyToOne(
         if (!core.relax(key, w, from, edge, heapKey(w, node))) return
         val seeds = seedsAt.get(node) ?: return
         // un incontro con l'ingresso di un altro punto nello stesso nodo (col costo della svolta fra i due archi)
+        val rootEdge = if (edgeBased) keyEdge(key, node) else -1
         for (s in seeds) {
             var total = w + s.weight
             if (edgeBased) {
-                val fwdKey = if (rootReverse) s.key else key
-                val bwdKey = if (rootReverse) key else s.key
-                if (fwdKey >= 0 && bwdKey >= 0) {
-                    val turn = turnCosts!!.turnWeight(fwdKey ushr 1, node, bwdKey ushr 1)
-                    if (turn.isInfinite()) continue
-                    total += turn
-                }
+                val turn = if (rootReverse) turnCosts!!.turnOrZero(s.edge, node, rootEdge) else turnCosts!!.turnOrZero(rootEdge, node, s.edge)
+                if (turn.isInfinite()) continue
+                total += turn
             }
             // la stessa chiave d'arco nelle due ricerche non capita: l'arco d'ingresso di un altro punto
             // ha l'altro capo fuori dal core, la ricerca della radice percorre solo archi fra nodi del core
@@ -235,7 +282,7 @@ class CoreManyToOne(
         visitedNodes++
         val w = core.weightOf(key)
         val node = if (edgeBased) keyNode(key, rootReverse) else key
-        val inEdge = if (edgeBased && key >= 0) key ushr 1 else -1
+        val inEdge = if (edgeBased) keyEdge(key, node) else -1
         coreIt.setBaseNode(node, rootReverse)
         while (coreIt.next()) {
             val adj = coreIt.adjNode

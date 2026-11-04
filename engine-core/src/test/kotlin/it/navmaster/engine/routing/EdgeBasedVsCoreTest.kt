@@ -46,9 +46,10 @@ class EdgeBasedVsCoreTest {
             val to = eb.snap(49.4049966, 8.6696132, 400.0, 1)
             assertNotEquals(SnapPosition.TOWER, from.position)
             val p = eb.route(from, to)
-            checkPath(p, tc, from, to)
+            checkPath(p, tc, eb)
             assertTrue(p.edges.any { e -> p.edges.any { it.edge == e.edge && it.reverse != e.reverse } }, "il percorso dovrebbe ripercorrere una strada nel verso opposto")
             val c = core.route(from, to)
+            checkPath(c, tc, core)
             assertTrue(p.weight <= c.weight + 0.05 + c.weight * 1e-4, "ricerca piena ${p.weight} vs core ${c.weight}")
 
             // coppie a caso, con punti su torri e a metà arco
@@ -64,9 +65,10 @@ class EdgeBasedVsCoreTest {
                 val cp = try { core.route(a, b) } catch (e: RouteNotFoundException) { null }
                 val ep = try { eb.route(a, b) } catch (e: RouteNotFoundException) { null }
                 if (cp != null) assertNotNull(ep, "$label: nessun percorso con la ricerca piena, il core ne trova uno di peso ${cp.weight}")
+                cp?.let { checkPath(it, tc, core, label) }
                 if (ep == null) return@repeat
                 found++
-                checkPath(ep, tc, a, b)
+                checkPath(ep, tc, eb, label)
                 val rep = repeatsEdge(ep)
                 if (rep) repeated++
                 if (cp == null) { onlyFull++; return@repeat }
@@ -87,18 +89,17 @@ class EdgeBasedVsCoreTest {
     }
 
     /**
-     * Il percorso è continuo e ogni svolta fra due archi interi è consentita (inversioni a U
-     * comprese). Le svolte fra il tratto agganciato e la sua torre non vengono controllate: la
-     * ricerca parte dalla torre senza l'arco d'arrivo (lo stesso fa il core).
+     * Il percorso è continuo e ogni svolta è consentita (inversioni a U comprese), anche fra il
+     * tratto agganciato e la sua torre: la ricerca riceve l'arco agganciato, come il tratto
+     * virtuale di GraphHopper. Lo stesso controllo di [Router.isLegal] (usato dalle alternative).
      */
-    private fun checkPath(p: RoutePath, tc: TurnCostProvider, from: Snap, to: Snap) {
-        for (k in 1 until p.edges.size) assertEquals(p.edges[k - 1].adjNode, p.edges[k].baseNode, "percorso spezzato all'arco $k")
-        val first = if (from.position != SnapPosition.TOWER) 1 else 0
-        val last = if (to.position != SnapPosition.TOWER) p.edges.size - 2 else p.edges.size - 1
-        for (k in first + 1..last) {
+    private fun checkPath(p: RoutePath, tc: TurnCostProvider, router: Router, label: String = "") {
+        for (k in 1 until p.edges.size) assertEquals(p.edges[k - 1].adjNode, p.edges[k].baseNode, "$label: percorso spezzato all'arco $k")
+        for (k in 1 until p.edges.size) {
             val prev = p.edges[k - 1]; val cur = p.edges[k]
-            assertTrue(tc.turnWeight(prev.edge, prev.adjNode, cur.edge).isFinite(), "svolta vietata da ${prev.edge} a ${cur.edge} nel nodo ${prev.adjNode}")
+            assertTrue(tc.turnWeight(prev.edge, prev.adjNode, cur.edge).isFinite(), "$label (${router.algorithm}): svolta vietata da ${prev.edge} a ${cur.edge} nel nodo ${prev.adjNode}, arco $k di ${p.edges.size}")
         }
+        assertTrue(router.isLegal(p), "$label (${router.algorithm}): percorso con una svolta vietata")
     }
 
     private fun repeatsEdge(p: RoutePath): Boolean {

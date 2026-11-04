@@ -61,6 +61,38 @@ class CoreEdgeSelector(
 }
 
 /**
+ * I capi degli archi agganciati da cui parte (o a cui arriva) una ricerca sul core, ognuno col peso
+ * del tratto parziale e con l'arco agganciato: l'arco con cui il viaggio arriva al capo (partenza) o
+ * con cui ne riparte verso il punto (arrivo); -1 per un aggancio esatto su una torre. La prima e
+ * l'ultima svolta rispettano così divieti e inversioni, come il tratto virtuale di GraphHopper.
+ */
+internal class SnapEnds {
+    val weight = IntDoubleHashMap(4)
+    private val edge = IntIntHashMap(4)
+
+    /** Vero se il capo è nuovo o più leggero di quello già noto nello stesso nodo. */
+    fun add(node: Int, w: Double, snapEdge: Int): Boolean {
+        if (weight.containsKey(node) && weight.get(node) <= w) return false
+        weight.put(node, w); edge.put(node, snapEdge); return true
+    }
+
+    fun has(node: Int) = weight.containsKey(node)
+    fun weightAt(node: Int) = weight.get(node)
+    fun edgeAt(node: Int) = edge.getOrDefault(node, -1)
+}
+
+/** L'arco base di [chEdge] che tocca [node] (per uno shortcut il primo o l'ultimo, dal lato di [node]). */
+internal fun CHStorage.baseEdgeAt(chEdge: Int, node: Int): Int {
+    if (!isShortcut(chEdge)) return chEdge
+    val sc = shortcutIndex(chEdge)
+    return if (nodeA(sc) == node) origFirst(sc) else origLast(sc)
+}
+
+/** La svolta in [node] da [inEdge] a [outEdge]: 0 quando uno dei due manca (una torre esatta, un ingresso senza arco). */
+internal fun TurnCostProvider.turnOrZero(inEdge: Int, node: Int, outEdge: Int): Double =
+    if (inEdge < 0 || outEdge < 0) 0.0 else turnWeight(inEdge, node, outEdge)
+
+/**
  * Ricerca "core-ALT" semplificata (ORS `CoreDijkstra`): fase 1, ricerca CH verso l'alto da entrambi
  * i lati senza espandere i nodi del core (che diventano punti d'ingresso); fase 2, Dijkstra
  * bidirezionale sui soli archi del core con il filtro della richiesta, node-based o edge-based.
@@ -95,6 +127,8 @@ class CoreDijkstra(
     }
 
     private val fwd = State(); private val bwd = State()
+    /** I capi degli archi agganciati: sorgenti e destinazioni dirette, col loro arco. */
+    private val fwdEnds = SnapEnds(); private val bwdEnds = SnapEnds()
     /** Fase 2: chiavi = nodi (node-based) oppure chiavi d'arco (edge-based). */
     private val cFwd = State(); private val cBwd = State()
     /** Edge-based: chiavi di fase 2 presenti in ogni nodo (in avanti: arrivate lì; all'indietro: in partenza da lì). */
@@ -104,14 +138,21 @@ class CoreDijkstra(
     private val baseIt = base.createEdgeIterator()
     var bestWeight = Double.POSITIVE_INFINITY; internal set
     private var meetingNode = -1          // incontro in fase 1
+    /** L'incontro di fase 1 usa il tratto agganciato diretto (il capo, non lo stato di fase 1 che lo ha superato). */
+    private var meetFwdDirect = false; private var meetBwdDirect = false
     private var coreMeetFwd = Int.MIN_VALUE   // chiave in avanti dell'incontro in fase 2
     private var coreMeetBwd = Int.MIN_VALUE   // chiave all'indietro dell'incontro in fase 2 (uguale a coreMeetFwd se sullo stesso arco)
     private val coreMet get() = coreMeetFwd != Int.MIN_VALUE
     var visitedNodes = 0; private set
     private val edgeBased get() = turnCosts != null
 
-    fun addSource(node: Int, w: Double) { if (fwd.relax(node, w, -1, -1)) checkMeeting(node) }
-    fun addTarget(node: Int, w: Double) { if (bwd.relax(node, w, -1, -1)) checkMeeting(node) }
+    /**
+     * Una sorgente col peso del tratto fin lì. [edge]: l'arco agganciato con cui il viaggio arriva al
+     * nodo (un punto a metà arco), per la prima svolta; -1 su una torre.
+     */
+    fun addSource(node: Int, w: Double, edge: Int = -1) { if (fwdEnds.add(node, w, edge)) fwd.relax(node, w, -1, -1) }
+    /** Una destinazione: [edge] è l'arco agganciato con cui il viaggio riparte dal nodo verso il punto (-1 su una torre). */
+    fun addTarget(node: Int, w: Double, edge: Int = -1) { if (bwdEnds.add(node, w, edge)) bwd.relax(node, w, -1, -1) }
 
     /** Tempi e nodi delle due fasi dell'ultima ricerca (diagnostica). */
     var stats = ""; private set
@@ -120,17 +161,18 @@ class CoreDijkstra(
         val t0 = System.nanoTime()
         // fase 1: entrambe le direzioni fino a esaurimento (le ricerche CH verso l'alto sono piccole)
         while (!fwd.heap.isEmpty || !bwd.heap.isEmpty) {
-            if (!fwd.heap.isEmpty) settlePhase1(fwd, fwdIt, false)
-            if (!bwd.heap.isEmpty) settlePhase1(bwd, bwdIt, true)
+            if (!fwd.heap.isEmpty) settlePhase1(fwd, fwdIt, false, fwdEnds)
+            if (!bwd.heap.isEmpty) settlePhase1(bwd, bwdIt, true, bwdEnds)
         }
+        phase1Meetings()
         val v1 = visitedNodes; val t1 = System.nanoTime()
         // fase 2: semina gli ingressi al core e cerca dentro con i filtri (A* bilanciato se ci sono i landmark)
         potentials?.let { p ->
             for (c in fwd.weight) if (inCore(c.key) && fwd.settled.contains(c.key)) p.addSource(c.key, c.value)
             for (c in bwd.weight) if (inCore(c.key) && bwd.settled.contains(c.key)) p.addTarget(c.key, c.value)
         }
-        seedCore(fwd, cFwd, reverse = false)
-        seedCore(bwd, cBwd, reverse = true)
+        seedCore(fwd, cFwd, fwdEnds, reverse = false)
+        seedCore(bwd, cBwd, bwdEnds, reverse = true)
         while (!cFwd.heap.isEmpty || !cBwd.heap.isEmpty) {
             val fk = if (cFwd.heap.isEmpty) Double.POSITIVE_INFINITY else cFwd.heap.peekKey()
             val bk = if (cBwd.heap.isEmpty) Double.POSITIVE_INFINITY else cBwd.heap.peekKey()
@@ -161,41 +203,80 @@ class CoreDijkstra(
         checkCoreMeeting(key, reverse)
     }
 
-    private fun settlePhase1(s: State, it: CHGraph.Iterator, reverse: Boolean) {
+    private fun settlePhase1(s: State, it: CHGraph.Iterator, reverse: Boolean, ends: SnapEnds) {
         val node = s.heap.pop()
         if (!s.settled.add(node)) return
         visitedNodes++
         if (inCore(node)) return // punto d'ingresso: non si espande in fase 1
         val w = s.weightOf(node)
+        // il capo di un arco agganciato: la prima mossa svolta dal tratto agganciato (all'indietro:
+        // l'ultima svolta verso di esso). Fuori dal core non ci sono divieti, solo l'inversione sull'arco
+        val snapEdge = if (edgeBased && s.parentEdge.getOrDefault(node, -1) < 0) ends.edgeAt(node) else -1
         it.setBaseNode(node, reverse)
         while (it.next()) {
             val adj = it.adjNode
             if (s.settled.contains(adj)) continue
-            if (s.relax(adj, w + it.weight, node, it.chEdge)) checkMeeting(adj)
+            var turn = 0.0
+            if (snapEdge >= 0) {
+                val b = storage.baseEdgeAt(it.chEdge, node)
+                turn = if (!reverse) turnCosts!!.turnWeight(snapEdge, node, b) else turnCosts!!.turnWeight(b, node, snapEdge)
+                if (turn.isInfinite()) continue
+            }
+            s.relax(adj, w + it.weight + turn, node, it.chEdge)
         }
     }
 
-    private fun checkMeeting(node: Int) {
-        val f = fwd.weightOf(node); val b = bwd.weightOf(node)
-        if (f.isInfinite() || b.isInfinite()) return
-        if (f + b < bestWeight) { bestWeight = f + b; meetingNode = node; coreMeetFwd = Int.MIN_VALUE; coreMeetBwd = Int.MIN_VALUE }
+    /**
+     * Gli stati di fase 1 di [s] in [node]: (peso, arco con cui il viaggio arriva al nodo in avanti o
+     * ne riparte all'indietro, è il capo diretto). Edge-based, quando la fase 1 ha raggiunto un capo
+     * da un altro capo più leggera, vale anche il tratto agganciato diretto: le svolte sono diverse.
+     */
+    private inline fun phase1States(s: State, ends: SnapEnds, node: Int, f: (Double, Int, Boolean) -> Unit) {
+        if (s.parentEdge.getOrDefault(node, -1) < 0) { f(s.weightOf(node), if (edgeBased) ends.edgeAt(node) else -1, true); return }
+        f(s.weightOf(node), if (edgeBased) lastBaseEdge(s, node) else -1, false)
+        if (edgeBased && ends.has(node)) f(ends.weightAt(node), ends.edgeAt(node), true)
     }
 
-    /** Ogni nodo del core raggiunto in fase 1 diventa una sorgente della fase 2. */
-    private fun seedCore(from: State, to: State, reverse: Boolean) {
+    /**
+     * Gli incontri di fase 1 (la fase 1 va fino in fondo): un nodo raggiunto da entrambe le
+     * direzioni, edge-based con la svolta fra l'arco d'arrivo e quello di partenza (inversione = +∞).
+     */
+    private fun phase1Meetings() {
+        for (c in fwd.weight) {
+            val node = c.key
+            if (!bwd.weight.containsKey(node)) continue
+            phase1States(fwd, fwdEnds, node) { wf, ef, df ->
+                phase1States(bwd, bwdEnds, node) { wb, eb, db ->
+                    val turn = if (edgeBased) turnCosts!!.turnOrZero(ef, node, eb) else 0.0
+                    if (turn.isFinite() && wf + wb + turn < bestWeight) {
+                        bestWeight = wf + wb + turn; meetingNode = node; meetFwdDirect = df; meetBwdDirect = db
+                        coreMeetFwd = Int.MIN_VALUE; coreMeetBwd = Int.MIN_VALUE
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Ogni nodo del core raggiunto in fase 1 diventa una sorgente della fase 2. Edge-based la chiave
+     * è l'ultimo arco base con cui si arriva al nodo (per la svolta successiva); i capi degli archi
+     * agganciati nel core entrano col tratto diretto e una chiave fittizia (l'arco agganciato in [ends]).
+     */
+    private fun seedCore(from: State, to: State, ends: SnapEnds, reverse: Boolean) {
         for (c in from.weight) {
             val node = c.key
             if (!inCore(node) || !from.settled.contains(node)) continue
             if (!edgeBased) { relaxCore(to, node, c.value, -1, -1, reverse); continue }
-            // edge-based: la chiave è l'ultimo arco base con cui si arriva al nodo (per il costo di svolta successivo)
-            val lastBase = lastBaseEdge(from, node)
-            val key = if (lastBase < 0) virtualKey(node) else edgeKeyArriving(lastBase, node, reverse)
-            relaxCore(to, key, c.value, -1, -1, reverse)
+            if (from.parentEdge.getOrDefault(node, -1) >= 0) relaxCore(to, edgeKeyArriving(lastBaseEdge(from, node), node, reverse), c.value, -1, -1, reverse)
         }
+        if (edgeBased) for (c in ends.weight) if (inCore(c.key)) relaxCore(to, virtualKey(c.key), c.value, -1, -1, reverse)
     }
 
-    /** Chiave fittizia per un nodo del core che è sorgente diretta (nessun arco di arrivo): negativa, mai confusa con una chiave d'arco. */
+    /** Chiave fittizia per un capo dell'arco agganciato nel core (sorgente o destinazione diretta): negativa, mai confusa con una chiave d'arco. */
     private fun virtualKey(node: Int) = -(node + 2)
+
+    /** L'arco della chiave di fase 2 [key] in [node]: per una chiave fittizia l'arco agganciato del capo (o -1). */
+    private fun keyEdge(key: Int, node: Int, reverse: Boolean): Int = if (key >= 0) key ushr 1 else (if (reverse) bwdEnds else fwdEnds).edgeAt(node)
 
     /** Arco base con cui la ricerca di fase 1 è arrivata a [node], o -1. */
     private fun lastBaseEdge(s: State, node: Int): Int {
@@ -235,7 +316,7 @@ class CoreDijkstra(
         visitedNodes++
         val w = s.weightOf(key)
         val node = if (edgeBased) keyNode(key, reverse) else key
-        val inEdge = if (edgeBased && key >= 0) key ushr 1 else -1
+        val inEdge = if (edgeBased) keyEdge(key, node, reverse) else -1
         coreIt.setBaseNode(node, reverse)
         while (coreIt.next()) {
             val adj = coreIt.adjNode
@@ -301,12 +382,9 @@ class CoreDijkstra(
             val otherW = (if (reverse) cFwd else cBwd).weightOf(other)
             val fwdKey = if (reverse) other else key
             val bwdKey = if (reverse) key else other
-            var total = myW + otherW
-            if (fwdKey >= 0 && bwdKey >= 0) {
-                val turn = turnCosts!!.turnWeight(fwdKey ushr 1, node, bwdKey ushr 1)
-                if (turn.isInfinite()) continue
-                total += turn
-            }
+            val turn = turnCosts!!.turnOrZero(keyEdge(fwdKey, node, false), node, keyEdge(bwdKey, node, true))
+            if (turn.isInfinite()) continue
+            val total = myW + otherW + turn
             if (total < bestWeight) { bestWeight = total; coreMeetFwd = fwdKey; coreMeetBwd = bwdKey; meetingNode = -1 }
         }
     }
@@ -316,8 +394,9 @@ class CoreDijkstra(
         val edges = ArrayList<Int>()
         val startNode: Int
         if (meetingNode >= 0) {
-            startNode = unpackPhase1(fwd, meetingNode, edges, forward = true)
-            unpackPhase1(bwd, meetingNode, edges, forward = false)
+            // il capo diretto parte (o arriva) lì, senza la catena di fase 1
+            startNode = if (meetFwdDirect) meetingNode else unpackPhase1(fwd, meetingNode, edges, forward = true)
+            if (!meetBwdDirect) unpackPhase1(bwd, meetingNode, edges, forward = false)
         } else {
             // catena di fase 2 in avanti: (arco CH, nodo di partenza) fino al seme, poi fase 1 dal nodo d'ingresso
             val chain = ArrayList<Long>(); var k = coreMeetFwd
@@ -330,7 +409,8 @@ class CoreDijkstra(
                 chain.add((pe.toLong() shl 32) or (fromNode.toLong() and 0xFFFFFFFFL)); k = pk
             }
             chain.reverse()
-            startNode = unpackPhase1(fwd, entryFwd, edges, forward = true)
+            // una chiave fittizia è il capo diretto dell'arco agganciato: nessuna catena di fase 1
+            startNode = if (k < 0) entryFwd else unpackPhase1(fwd, entryFwd, edges, forward = true)
             for (c in chain) ch.unpack((c ushr 32).toInt(), c.toInt(), edges)
             // catena di fase 2 all'indietro: dal punto d'incontro verso la destinazione
             val bwdEdges = ArrayList<Int>()
@@ -342,7 +422,7 @@ class CoreDijkstra(
                 val fromNode = if (edgeBased) keyNode(k, true) else k
                 ch.unpack(pe, fromNode, bwdEdges); k = cBwd.parentNode.get(k)
             }
-            unpackPhase1(bwd, entryBwd, bwdEdges, forward = false)
+            if (k >= 0) unpackPhase1(bwd, entryBwd, bwdEdges, forward = false)
             // edge-based con incontro sullo stesso arco: l'arco è incluso in entrambe le catene, la parte all'indietro inizia con esso
             if (edgeBased && coreMeetFwd == coreMeetBwd && coreMeetFwd >= 0 && bwdEdges.isNotEmpty()) {
                 check(bwdEdges.first() == coreMeetFwd ushr 1) { "la catena all'indietro non inizia con l'arco d'incontro" }

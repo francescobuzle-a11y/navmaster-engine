@@ -119,10 +119,15 @@ class DirectionsServiceTest {
                 val flipped = it.navmaster.engine.routing.PathEdge(arrival.edge, !arrival.reverse, arrival.adjNode, arrival.baseNode, arrival.geometry, arrival.distance, arrival.millis, arrival.weight, arrival.name)
                 val opposite = straight.route(sV, sA, flipped)
                 assertTrue(opposite.edges.first().edge == arrival.edge)
+                // la prima svolta, dal tratto del via alla sua torre, rispetta divieti e inversioni
+                assertTrue(straight.isLegal(onward) && straight.isLegal(opposite), "svolta vietata alla torre del via-point")
                 if (opposite.edges.first().reverse == flipped.reverse) {
                     twoWay++
                     assertTrue(onward.distance != opposite.distance)
-                    assertTrue(free.route(sV, sA).distance <= minOf(onward.distance, opposite.distance) + 1e-6)
+                    // senza verso imposto la ricerca sceglie il più leggero dei due (per peso, non per distanza)
+                    val any = free.route(sV, sA)
+                    assertTrue(free.isLegal(any))
+                    assertTrue(any.weight <= minOf(onward.weight, opposite.weight) + 1e-6, "senza verso ${any.weight}, nei due versi ${onward.weight} e ${opposite.weight}")
                 }
             }
             assertTrue(twoWay > 0, "nessun via-point su strada a doppio senso")

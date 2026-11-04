@@ -29,6 +29,9 @@ class EdgeBasedBidirectionalDijkstra(
     private val fwdSources = IntHashSet(); private val bwdTargets = IntHashSet()
     private val sourceWeights = com.carrotsearch.hppc.IntDoubleHashMap()
     private val targetWeights = com.carrotsearch.hppc.IntDoubleHashMap()
+    /** L'arco agganciato di ogni sorgente (con cui il viaggio arriva lì) e di ogni destinazione (con cui ne riparte). */
+    private val sourceEdges = com.carrotsearch.hppc.IntIntHashMap()
+    private val targetEdges = com.carrotsearch.hppc.IntIntHashMap()
 
     var bestWeight = Double.POSITIVE_INFINITY; internal set
     private var meetingKey = -1
@@ -36,33 +39,58 @@ class EdgeBasedBidirectionalDijkstra(
     private var meetingNode = -1
     var visitedNodes = 0; private set
 
-    fun addSource(node: Int, initialWeight: Double) { fwdSources.add(node); sourceWeights.put(node, initialWeight) }
-    fun addTarget(node: Int, initialWeight: Double) { bwdTargets.add(node); targetWeights.put(node, initialWeight) }
+    /**
+     * Una sorgente col peso del tratto fin lì. [edge]: l'arco agganciato con cui il viaggio arriva al
+     * nodo (un punto a metà arco), così la prima svolta rispetta divieti e inversioni; -1 su una torre.
+     */
+    fun addSource(node: Int, initialWeight: Double, edge: Int = -1) {
+        if (sourceWeights.containsKey(node) && sourceWeights.get(node) <= initialWeight) return
+        fwdSources.add(node); sourceWeights.put(node, initialWeight); sourceEdges.put(node, edge)
+    }
+
+    /** Una destinazione: [edge] è l'arco agganciato con cui il viaggio riparte dal nodo verso il punto (-1 su una torre). */
+    fun addTarget(node: Int, initialWeight: Double, edge: Int = -1) {
+        if (targetWeights.containsKey(node) && targetWeights.get(node) <= initialWeight) return
+        bwdTargets.add(node); targetWeights.put(node, initialWeight); targetEdges.put(node, edge)
+    }
+
+    /** La svolta in [node] da [inEdge] a [outEdge]; 0 quando uno dei due manca (una torre esatta). */
+    private fun turn(inEdge: Int, node: Int, outEdge: Int): Double = if (inEdge < 0 || outEdge < 0) 0.0 else turnCosts.turnWeight(inEdge, node, outEdge)
 
     fun run(): Boolean {
+        // un nodo che è sorgente e destinazione: dal tratto agganciato della partenza a quello dell'arrivo
         for (c in sourceWeights) if (targetWeights.containsKey(c.key)) {
-            val w = c.value + targetWeights.get(c.key)
+            val t = turn(sourceEdges.getOrDefault(c.key, -1), c.key, targetEdges.getOrDefault(c.key, -1))
+            if (t.isInfinite()) continue
+            val w = c.value + targetWeights.get(c.key) + t
             if (w < bestWeight) { bestWeight = w; meetingNode = c.key }
         }
-        // prime mosse: dagli archi uscenti delle sorgenti e dagli archi entranti delle destinazioni, senza costo di svolta
+        // prime mosse: dagli archi uscenti delle sorgenti e dagli archi entranti delle destinazioni, con
+        // la svolta dall'arco agganciato (o verso di esso); da una torre esatta senza costo di svolta
         for (c in sourceWeights) {
+            val inEdge = sourceEdges.getOrDefault(c.key, -1)
             fwdIt.setBaseNode(c.key)
             while (fwdIt.next()) {
                 if (!filter.accept(fwdIt)) continue
                 val w = weighting.edgeWeight(fwdIt, false)
                 if (w.isInfinite()) continue
-                if (fwd.relax(fwdIt.edgeKey, c.value + w, c.key, -1)) checkMeeting(fwdIt.edgeKey, fwdIt)
+                val t = turn(inEdge, c.key, fwdIt.edge)
+                if (t.isInfinite()) continue
+                if (fwd.relax(fwdIt.edgeKey, c.value + w + t, c.key, -1)) checkMeeting(fwdIt.edgeKey, fwdIt)
             }
         }
         for (c in targetWeights) {
+            val outEdge = targetEdges.getOrDefault(c.key, -1)
             bwdIt.setBaseNode(c.key)
             while (bwdIt.next()) {
                 if (!filter.accept(bwdIt)) continue
                 // arrivare al nodo destinazione percorrendo l'arco verso di esso = verso opposto all'iteratore
                 val w = weighting.edgeWeight(bwdIt, true)
                 if (w.isInfinite()) continue
+                val t = turn(bwdIt.edge, c.key, outEdge)
+                if (t.isInfinite()) continue
                 val key = travelKey(bwdIt)
-                if (bwd.relax(key, c.value + w, c.key, -1)) checkMeeting(key, bwdIt)
+                if (bwd.relax(key, c.value + w + t, c.key, -1)) checkMeeting(key, bwdIt)
             }
         }
         while (!fwd.heap.isEmpty || !bwd.heap.isEmpty) {
