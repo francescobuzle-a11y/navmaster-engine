@@ -29,16 +29,66 @@ class CoreLandmarks private constructor(
 
     fun isCoreNode(node: Int) = coreIndex[node] >= 0
 
+    /**
+     * The distances kept in memory as 16-bit steps of [step] (as ORS and GraphHopper keep their
+     * landmarks): read from the mapped file one at a time they cost a native call each on Android,
+     * 32 per node of the search (3 s for a long lorry trip on the tablet). Made at the first search.
+     */
+    @Volatile private var quantized: ShortArray? = null
+    /** The size of a step: each distance is within half a step (the potentials allow for it). */
+    @Volatile var step = 0.0; private set
+
+    /** The distances in memory (once; the file mapped stays for the rest). */
+    fun warm() {
+        if (quantized != null || distanceBits !is IntSource.OfData) return
+        synchronized(this) {
+            if (quantized != null) return
+            val n = distanceBits.size
+            val buf = IntArray(minOf(n, 1 shl 20))
+            var max = 0f
+            var i = 0
+            while (i < n) {
+                val c = minOf(buf.size, n - i)
+                distanceBits.read(i, buf, c)
+                for (j in 0 until c) { val f = java.lang.Float.intBitsToFloat(buf[j]); if (f.isFinite() && f > max) max = f }
+                i += c
+            }
+            val s = if (max > 0f) max.toDouble() / (INF_STEP - 1) else 1.0
+            val q = ShortArray(n)
+            i = 0
+            while (i < n) {
+                val c = minOf(buf.size, n - i)
+                distanceBits.read(i, buf, c)
+                for (j in 0 until c) {
+                    val f = java.lang.Float.intBitsToFloat(buf[j])
+                    q[i + j] = (if (f.isFinite()) Math.round(f / s).toInt().coerceIn(0, INF_STEP - 1) else INF_STEP).toShort()
+                }
+                i += c
+            }
+            step = s
+            quantized = q
+        }
+    }
+
+    private fun distance(index: Int): Double {
+        val q = quantized
+        if (q != null) {
+            val v = q[index].toInt() and 0xFFFF
+            return if (v == INF_STEP) Double.POSITIVE_INFINITY else v * step
+        }
+        return java.lang.Float.intBitsToFloat(distanceBits[index]).toDouble()
+    }
+
     /** d(L→v); +∞ se v non è nel core o irraggiungibile. */
     fun fromLandmark(l: Int, node: Int): Double {
         val ci = coreIndex[node]; if (ci < 0) return Double.POSITIVE_INFINITY
-        return java.lang.Float.intBitsToFloat(distanceBits[ci * 2 * landmarkCount + 2 * l]).toDouble()
+        return distance(ci * 2 * landmarkCount + 2 * l)
     }
 
     /** d(v→L). */
     fun toLandmark(l: Int, node: Int): Double {
         val ci = coreIndex[node]; if (ci < 0) return Double.POSITIVE_INFINITY
-        return java.lang.Float.intBitsToFloat(distanceBits[ci * 2 * landmarkCount + 2 * l + 1]).toDouble()
+        return distance(ci * 2 * landmarkCount + 2 * l + 1)
     }
 
     fun close() { coreIndex.close(); distanceBits.close() }
@@ -57,6 +107,9 @@ class CoreLandmarks private constructor(
     }
 
     companion object {
+        /** The 16-bit value of an unreachable landmark. */
+        private const val INF_STEP = 0xFFFF
+
         fun load(dir: GraphDirectory, name: String, nodeCount: Int): CoreLandmarks? {
             val da = dir.open("landmarks_$name", 1 shl 20) ?: return null
             var keep = false
@@ -149,6 +202,9 @@ class CoreLandmarks private constructor(
  */
 class CorePotentials(private val lm: CoreLandmarks) {
     private val k = lm.landmarkCount
+    init { lm.warm() }
+    /** Each bound is a difference of two distances, each within half a step: a step off at most. */
+    private val margin = EPS + 2 * lm.step
     private val tC1 = DoubleArray(k) { Double.NEGATIVE_INFINITY }  // max_e (d(e→L) − b(e))
     private val tC2 = DoubleArray(k) { Double.POSITIVE_INFINITY }  // min_e (d(L→e) + b(e))
     private val sC1 = DoubleArray(k) { Double.NEGATIVE_INFINITY }  // max_e (d(L→e) − f(e))
@@ -184,7 +240,7 @@ class CorePotentials(private val lm: CoreLandmarks) {
             if (toL.isFinite() && tC1[l].isFinite()) h = maxOf(h, toL - tC1[l])
             if (fromL.isFinite() && tC2[l].isFinite()) h = maxOf(h, tC2[l] - fromL)
         }
-        return maxOf(0.0, h - EPS)
+        return maxOf(0.0, h - margin)
     }
 
     /** Limite inferiore del costo dalle sorgenti a [node]. */
@@ -196,7 +252,7 @@ class CorePotentials(private val lm: CoreLandmarks) {
             if (fromL.isFinite() && sC1[l].isFinite()) h = maxOf(h, fromL - sC1[l])
             if (toL.isFinite() && sC2[l].isFinite()) h = maxOf(h, sC2[l] - toL)
         }
-        return maxOf(0.0, h - EPS)
+        return maxOf(0.0, h - margin)
     }
 
     /** p_f(v); la ricerca all'indietro usa −p_f. */

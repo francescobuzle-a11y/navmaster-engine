@@ -19,5 +19,7 @@ abstract class IntSource {
     class OfData(private val da: DataAccess, private val offset: Long, override val size: Int) : IntSource() {
         override fun get(i: Int) = da.getInt(offset + i.toLong() * 4)
         override fun close() { da.close() }
+        /** [count] interi da [from] in [dst] in un colpo solo. */
+        fun read(from: Int, dst: IntArray, count: Int) = da.getInts(offset + from.toLong() * 4, dst, 0, count)
     }
 }

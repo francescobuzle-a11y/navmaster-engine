@@ -74,6 +74,23 @@ abstract class DataAccess(val name: String, segmentSize: Int) : Closeable {
     fun getByte(pos: Long): Byte = segment((pos ushr segmentSizePower).toInt()).get((pos and segmentMask.toLong()).toInt())
     fun setByte(pos: Long, value: Byte) { segment((pos ushr segmentSizePower).toInt()).put((pos and segmentMask.toLong()).toInt(), value) }
 
+    /**
+     * [count] ints from [pos] into [dst] at once (a block copy: on Android a read of a mapped
+     * buffer one int at a time is a native call each).
+     */
+    fun getInts(pos: Long, dst: IntArray, dstOff: Int, count: Int) {
+        var p = pos; var o = dstOff; var left = count
+        while (left > 0) {
+            val seg = (p ushr segmentSizePower).toInt()
+            val off = (p and segmentMask.toLong()).toInt()
+            val n = minOf(left, (segmentSize - off) / 4)
+            val bb = segment(seg).duplicate().order(ByteOrder.LITTLE_ENDIAN)
+            bb.position(off)
+            bb.asIntBuffer().get(dst, o, n)
+            p += n * 4L; o += n; left -= n
+        }
+    }
+
     fun getLong(pos: Long): Long = (getInt(pos).toLong() and 0xFFFFFFFFL) or (getInt(pos + 4).toLong() shl 32)
     fun setLong(pos: Long, value: Long) { setInt(pos, value.toInt()); setInt(pos + 4, (value ushr 32).toInt()) }
 
