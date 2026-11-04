@@ -11,6 +11,9 @@ on:
         default: "30"
       seed:
         description: "Seme casuale"
+      import_opts:
+        description: "Opzioni di engine-cli import (es. --no-width-from-carriageway, --core=wide)"
+        default: ""
         default: "42"
       cases:
         description: "Casi separati da virgola (vuoto = tutti; vedi CASES in confronta.py)"
@@ -55,7 +58,7 @@ jobs:
           set -euo pipefail
           chmod +x gradlew
           ./gradlew --no-daemon -q :engine-server:installDist :engine-cli:installDist
-          engine-cli/build/install/engine-cli/bin/engine-cli import data/heidelberg.test.pbf graphs/heidelberg --profiles=car,hgv | tee import.log
+          engine-cli/build/install/engine-cli/bin/engine-cli import data/heidelberg.test.pbf graphs/heidelberg --profiles=car,hgv ${{ inputs.import_opts }} | tee import.log
 
       - name: Avvio del motore
         run: |
