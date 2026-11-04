@@ -84,7 +84,7 @@ class BidirectionalDijkstra(
     private val fwdIt = graph.createEdgeIterator()
     private val bwdIt = graph.createEdgeIterator()
 
-    var bestWeight = Double.POSITIVE_INFINITY; private set
+    var bestWeight = Double.POSITIVE_INFINITY; internal set
     var meetingNode = -1; private set
     var visitedNodes = 0; private set
 

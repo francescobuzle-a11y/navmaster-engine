@@ -102,7 +102,7 @@ class CoreDijkstra(
     private val cBwdAtNode = com.carrotsearch.hppc.IntObjectHashMap<com.carrotsearch.hppc.IntArrayList>()
     private val fwdIt = ch.iterator(); private val bwdIt = ch.iterator()
     private val baseIt = base.createEdgeIterator()
-    var bestWeight = Double.POSITIVE_INFINITY; private set
+    var bestWeight = Double.POSITIVE_INFINITY; internal set
     private var meetingNode = -1          // incontro in fase 1
     private var coreMeetFwd = Int.MIN_VALUE   // chiave in avanti dell'incontro in fase 2
     private var coreMeetBwd = Int.MIN_VALUE   // chiave all'indietro dell'incontro in fase 2 (uguale a coreMeetFwd se sullo stesso arco)

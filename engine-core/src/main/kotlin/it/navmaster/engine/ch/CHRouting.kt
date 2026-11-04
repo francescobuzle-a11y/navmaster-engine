@@ -102,7 +102,7 @@ class DijkstraBidirectionCH(private val ch: CHGraph, private val weighting: Weig
     private val fwd = State(); private val bwd = State()
     private val fwdIt = ch.iterator(); private val bwdIt = ch.iterator()
     private val stallIt = ch.iterator()
-    var bestWeight = Double.POSITIVE_INFINITY; private set
+    var bestWeight = Double.POSITIVE_INFINITY; internal set
     private var meetingNode = -1
     var visitedNodes = 0; private set
 

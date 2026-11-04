@@ -145,7 +145,8 @@ class CrossBorderDirections(
     private inner class Ctx(val request: DirectionsRequest) {
         private val routers = HashMap<String, Router>()
         private val snaps = HashMap<String, Snap?>()
-        private val weights = HashMap<String, Double>()
+        /** The weights found, with the limit they were looked for under (an infinite one below a limit may exist above it). */
+        private val weights = HashMap<String, Pair<Double, Double>>()
         var queries = 0
 
         // the choice of the crossings without the bearings (they only touch the ends): the quick search
@@ -160,11 +161,20 @@ class CrossBorderDirections(
             try { router(g).snap(p.lat, p.lon, radius, 0, checkNetwork = !exact) } catch (e: PointNotFoundException) { null }
         }
 
-        fun weight(g: CountryGraph, a: LL, ra: Double, b: LL, rb: Double): Double = weights.getOrPut("${g.id}:${a.lat}:${a.lon}>${b.lat}:${b.lon}") {
-            val sa = snap(g, a, ra) ?: return@getOrPut Double.POSITIVE_INFINITY
-            val sb = snap(g, b, rb) ?: return@getOrPut Double.POSITIVE_INFINITY
+        /** The weight from [a] to [b] in [g], or +∞ when there is no path lighter than [limit]. */
+        fun weight(g: CountryGraph, a: LL, ra: Double, b: LL, rb: Double, limit: Double = Double.POSITIVE_INFINITY): Double {
+            val key = "${g.id}:${a.lat}:${a.lon}>${b.lat}:${b.lon}"
+            weights[key]?.let { (w, l) -> if (w.isFinite() || l >= limit) return if (w < limit) w else Double.POSITIVE_INFINITY }
+            val sa = snap(g, a, ra) ?: return Double.POSITIVE_INFINITY
+            val sb = snap(g, b, rb) ?: return Double.POSITIVE_INFINITY
             queries++
-            try { router(g).route(sa, sb).weight } catch (e: RouteNotFoundException) { Double.POSITIVE_INFINITY }
+            val t0 = System.currentTimeMillis()
+            // for choosing: the quick search's path also when it uses a road to avoid (the pieces are then exact)
+            val w = try { router(g).route(sa, sb, maxWeight = limit, exact = false).weight } catch (e: RouteNotFoundException) { Double.POSITIVE_INFINITY }
+            val ms = System.currentTimeMillis() - t0
+            if (ms > 300) log?.invoke("    ricerca ${g.id} ${if (w.isFinite()) "%.0f".format(w) else "∞"} (limite ${if (limit.isFinite()) "%.0f".format(limit) else "∞"}) in $ms ms")
+            weights[key] = w to limit
+            return w
         }
     }
 
@@ -299,14 +309,23 @@ class CrossBorderDirections(
                     val tl = LL(t.lat, t.lon)
                     var w = Double.POSITIVE_INFINITY; var via: List<Transfer> = emptyList()
                     if (k == 1) {
-                        w = ctx.weight(from, p, rp, tl, TRANSFER_RADIUS); via = listOf(t)
+                        // each search only as far as the best whole trip found so far: it cannot win beyond
+                        w = ctx.weight(from, p, rp, tl, TRANSFER_RADIUS, best); via = listOf(t)
+                        // two countries: the whole trip through this crossing at once, so that the
+                        // next crossings are looked for under its weight
+                        if (path.size == 2 && w.isFinite()) {
+                            val total = w + ctx.weight(path[1], tl, TRANSFER_RADIUS, q, rq, best - w)
+                            if (total < best) { best = total; bestChain = listOf(t to path[1]) }
+                            continue
+                        }
                     } else for ((pt, pw, pc) in layer) {
                         if (pw >= best || pw >= w) continue
-                        val x = pw + ctx.weight(from, LL(pt.lat, pt.lon), TRANSFER_RADIUS, tl, TRANSFER_RADIUS)
+                        val x = pw + ctx.weight(from, LL(pt.lat, pt.lon), TRANSFER_RADIUS, tl, TRANSFER_RADIUS, minOf(best, w) - pw)
                         if (x < w) { w = x; via = pc + t }
                     }
                     if (w.isFinite() && w < best) next += Triple(t, w, via)
                 }
+                if (path.size == 2) { ok = false; break }
                 layer = next.sortedBy { it.second }.take(if (k == path.size - 1) next.size else 8)
                 log?.invoke("    pesi ${from.id}/${to.id}: ${layer.joinToString { "%.0f".format(it.second) }}")
                 if (layer.isEmpty()) { ok = false; break }
@@ -315,7 +334,7 @@ class CrossBorderDirections(
             val last = path.last()
             for ((t, w, via) in layer) {
                 if (w >= best) continue
-                val total = w + ctx.weight(last, LL(t.lat, t.lon), TRANSFER_RADIUS, q, rq)
+                val total = w + ctx.weight(last, LL(t.lat, t.lon), TRANSFER_RADIUS, q, rq, best - w)
                 if (total < best) { best = total; bestChain = via.mapIndexed { i, tr -> tr to path[i + 1] } }
             }
         }

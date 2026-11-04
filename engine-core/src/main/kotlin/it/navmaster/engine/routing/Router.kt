@@ -179,10 +179,18 @@ class Router(
      * invertire sull'arco. Per un aggancio esatto su una torre l'arco d'arrivo è già alle spalle e
      * nessuna parte viene esclusa.
      */
-    fun route(from: Snap, to: Snap, arrival: PathEdge? = null, fromHeading: Double = Double.NaN, toHeading: Double = Double.NaN): RoutePath {
+    /**
+     * [maxWeight]: only a path lighter than this (none found otherwise): a search that cannot beat
+     * a known path stops there instead of exploring all it can reach. [exact] false: the quick
+     * search's path is taken even when it uses a road to avoid (an estimate, for choosing).
+     */
+    fun route(from: Snap, to: Snap, arrival: PathEdge? = null, fromHeading: Double = Double.NaN, toHeading: Double = Double.NaN,
+              maxWeight: Double = Double.POSITIVE_INFINITY, exact: Boolean = true): RoutePath {
         if (quick != null && quickAccepts != null) {
-            val p = try { quick.route(from, to, arrival, fromHeading, toHeading) } catch (e: RouteNotFoundException) { null }
-            if (p != null && p.edges.all { e -> it.setEdge(e.edge, e.baseNode); quickAccepts.accept(it) }) return p
+            val p = try { quick.route(from, to, arrival, fromHeading, toHeading, maxWeight) } catch (e: RouteNotFoundException) { null }
+            if (p != null && (!exact || p.edges.all { e -> it.setEdge(e.edge, e.baseNode); quickAccepts.accept(it) })) return p
+            // no path even without the filter (or none under the limit): none with it either
+            if (p == null) throw RouteNotFoundException("Nessun percorso trovato fra i punti richiesti")
         }
         var fromParts = splitEdge(from, asTarget = false).map { penalised(it, from, fromHeading, asTarget = false) }
         val toParts = splitEdge(to, asTarget = true).map { penalised(it, to, toHeading, asTarget = true) }
@@ -208,21 +216,25 @@ class Router(
 
         val sp: SearchPath? = if (ch != null) {
             val algo = DijkstraBidirectionCH(ch, weighting)
+            if (maxWeight.isFinite()) algo.bestWeight = maxWeight
             for (p in fromParts) algo.addSource(p.node, p.weight)
             for (p in toParts) algo.addTarget(p.node, p.weight)
             if (algo.run()) algo.extractPath() else null
         } else if (core != null) {
             val algo = CoreDijkstra(core, weighting, filter, turnCosts, landmarks)
+            if (maxWeight.isFinite()) algo.bestWeight = maxWeight
             for (p in fromParts) algo.addSource(p.node, p.weight)
             for (p in toParts) algo.addTarget(p.node, p.weight)
             if (algo.run()) algo.extractPath() else null
         } else if (turnCosts != null) {
             val algo = EdgeBasedBidirectionalDijkstra(graph, weighting, turnCosts, filter, maxVisitedNodes)
+            if (maxWeight.isFinite()) algo.bestWeight = maxWeight
             for (p in fromParts) algo.addSource(p.node, p.weight)
             for (p in toParts) algo.addTarget(p.node, p.weight)
             if (algo.run()) algo.extractPath() else null
         } else {
             val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes)
+            if (maxWeight.isFinite()) algo.bestWeight = maxWeight
             for (p in fromParts) algo.addSource(p.node, p.weight)
             for (p in toParts) algo.addTarget(p.node, p.weight)
             if (algo.run()) algo.extractPath() else null

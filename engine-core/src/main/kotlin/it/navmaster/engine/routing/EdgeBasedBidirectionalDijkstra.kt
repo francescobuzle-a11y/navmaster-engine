@@ -30,7 +30,7 @@ class EdgeBasedBidirectionalDijkstra(
     private val sourceWeights = com.carrotsearch.hppc.IntDoubleHashMap()
     private val targetWeights = com.carrotsearch.hppc.IntDoubleHashMap()
 
-    var bestWeight = Double.POSITIVE_INFINITY; private set
+    var bestWeight = Double.POSITIVE_INFINITY; internal set
     private var meetingKey = -1
     /** Incontro diretto su un nodo comune a sorgenti e destinazioni (percorso senza archi). */
     private var meetingNode = -1
