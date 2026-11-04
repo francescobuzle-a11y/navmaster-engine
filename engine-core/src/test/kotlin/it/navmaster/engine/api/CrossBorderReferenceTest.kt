@@ -123,7 +123,7 @@ class CrossBorderReferenceTest {
                         same(w, r.weight) -> if (w.isInfinite()) noRoute++ else equal++
                         // più confini: ogni valico è scelto da solo (l'approssimazione nota E): un viaggio in cui
                         // la scelta congiunta dei valichi pesa meno si segnala, non è un errore
-                        r.crossings.size >= 2 && w.isFinite() && w > r.weight -> {
+                        r.crossings.size >= 3 && w.isFinite() && w > r.weight -> {
                             multiBorder++
                             println("  (più confini) viaggio $k: peso ${"%.1f".format(w)} invece di ${"%.1f".format(r.weight)} (+%.1f %%): valichi scelti uno alla volta".format(100 * (w - r.weight) / r.weight))
                         }
@@ -138,7 +138,7 @@ class CrossBorderReferenceTest {
                         }
                     }
                 }
-                println("${case.name}: $equal uguali, $noRoute senza percorso in entrambi, $multiBorder con più confini scelti uno alla volta, ${diffs.size} diversi${if (diffs.isEmpty()) "" else "\n    " + diffs.joinToString("\n    ")}")
+                println("${case.name}: $equal uguali, $noRoute senza percorso in entrambi, $multiBorder con più confini scelti uno alla volta, ${cbd.twoChoices} scelte di due valichi insieme, ${diffs.size} diversi${if (diffs.isEmpty()) "" else "\n    " + diffs.joinToString("\n    ")}")
                 problems += diffs.map { "${case.name}: $it" }
             }
             assertTrue(problems.isEmpty(), "differenze dal riferimento:\n" + problems.joinToString("\n"))

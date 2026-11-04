@@ -19,7 +19,10 @@ class ReachDiagTest {
             val ei = bg.createEdgeIterator()
             fun describe(e: Int, base: Int): String { ei.setEdge(e, base); return "arco $e way ${ei.get(sh.osmWayId)} '${ei.name}' classe ${ei.get(sh.roadClass)} accesso ${ei.get(pe.access)} velocità ${ei.get(pe.speed)}/${ei.getReverse(pe.speed)} dist %.0f".format(ei.distance) }
             val snaps = pts.map { (la, lo) -> r.snap(la, lo, 400.0, 0) }
-            for ((i, s) in snaps.withIndex()) println("punto $i: ${describe(s.edge, bg.nodeA(s.edge))} posizione ${s.position} a %.0f m".format(s.distance))
+            for ((i, s) in snaps.withIndex()) println("punto $i: ${describe(s.edge, bg.nodeA(s.edge))} posizione ${s.position} a %.0f m, nodo vicino ${s.closestNode}, capi ${bg.nodeA(s.edge)}/${bg.nodeB(s.edge)}".format(s.distance))
+            runCatching { r.route(snaps[0], snaps[1]) }.onSuccess { p ->
+                println("percorso A→B: %.0f m, ${p.edges.size} archi; primi: ${p.edges.take(6).joinToString { e -> ei.setEdge(e.edge, e.baseNode); "${e.edge}(way ${ei.get(sh.osmWayId)} ${e.baseNode}→${e.adjNode})" }}".format(p.distance))
+            }.onFailure { println("percorso A→B: ${it.message}") }
             // all'indietro da B: i nodi da cui si arriva a B; le way sulla frontiera (arrivano al nodo ma non si percorrono verso B)
             val w = WeightingFactory.create(g.encoding, pe, WeightingMethod.FASTEST)
             val b = snaps.last()
