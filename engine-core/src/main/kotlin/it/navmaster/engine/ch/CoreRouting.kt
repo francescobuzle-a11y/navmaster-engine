@@ -36,13 +36,23 @@ class CoreEdgeSelector(
     private val pe = encoding.profile(profileName)
     private val isHgv = profileName == "heavyvehicle"
 
+    companion object {
+        /**
+         * L'edizione della regola del core, salvata nel grafo (`core_version`): un grafo preparato con
+         * un'edizione precedente non ha nel core gli archi che una richiesta può escludere, e per quella
+         * richiesta non si può usare (vedi RoutingGraph.router). 1: limiti fisici solo nel core del
+         * camion; 2: anche nel core dell'auto.
+         */
+        const val CORE_VERSION = 2
+    }
+
     fun isCoreEdge(it: BaseGraph.EdgeIterator): Boolean {
-        // restrizioni per mezzi pesanti
-        if (isHgv) {
-            if (it.get(sh.hgvBlocked) != 0 || it.get(sh.hazmatForbidden)) return true
-            if (it.get(sh.maxHeight).isFinite() || it.get(sh.maxWidth).isFinite() || it.get(sh.maxLength).isFinite() ||
-                it.get(sh.maxWeight).isFinite() || it.get(sh.maxAxleLoad).isFinite()) return true
-        }
+        // divieti per mezzi pesanti e merci pericolose: solo il camion
+        if (isHgv && (it.get(sh.hgvBlocked) != 0 || it.get(sh.hazmatForbidden))) return true
+        // limiti fisici (altezza, larghezza, lunghezza, peso, carico per asse): camion, e dall'edizione
+        // CORE_VERSION 2 anche l'auto (camper e furgoni con le loro misure, DimensionsEdgeFilter)
+        if (it.get(sh.maxHeight).isFinite() || it.get(sh.maxWidth).isFinite() || it.get(sh.maxLength).isFinite() ||
+            it.get(sh.maxWeight).isFinite() || it.get(sh.maxAxleLoad).isFinite()) return true
         // divieti di svolta a uno dei due estremi
         if (turnCosts != null && (turnCosts.hasEntries(it.baseNode) || turnCosts.hasEntries(it.adjNode))) return true
         return false

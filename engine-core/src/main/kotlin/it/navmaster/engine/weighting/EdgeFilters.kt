@@ -35,6 +35,26 @@ data class VehicleParameters(
     val hazmat: Boolean = false,
 ) {
     val hasAttributes get() = length > 0 || height > 0 || width > 0 || weight > 0 || axleLoad > 0 || hazmat
+    /** Le misure fisiche (senza le merci pericolose): valgono per ogni veicolo, anche l'auto (camper, furgoni). */
+    val hasDimensions get() = length > 0 || height > 0 || width > 0 || weight > 0 || axleLoad > 0
+
+    /** Vero se un arco coi limiti dati (0 = nessuno) non è percorribile con queste misure. */
+    fun blockedBy(maxHeight: Double, maxWidth: Double, maxLength: Double, maxWeight: Double, maxAxleLoad: Double): Boolean =
+        (height > 0 && blocks(maxHeight, height)) || (width > 0 && blocks(maxWidth, width)) || (length > 0 && blocks(maxLength, length)) ||
+            (weight > 0 && blocks(maxWeight, weight)) || (axleLoad > 0 && blocks(maxAxleLoad, axleLoad))
+
+    private fun blocks(limit: Double, vehicleValue: Double) = limit > 0.0 && limit < vehicleValue
+}
+
+/**
+ * Estensione NavMaster, non in ORS: le misure fisiche del veicolo applicate ai limiti delle strade
+ * (altezza, larghezza, lunghezza, peso, carico per asse) per il profilo auto, cioè camper e furgoni,
+ * senza i divieti riservati ai mezzi pesanti (`hgv=no`, che valgono sopra 3,5 t di merci) e senza
+ * le merci pericolose.
+ */
+class DimensionsEdgeFilter(private val shared: SharedEncoding, private val params: VehicleParameters) : EdgeFilter {
+    override fun accept(edge: BaseGraph.EdgeIterator): Boolean =
+        !params.blockedBy(edge.get(shared.maxHeight), edge.get(shared.maxWidth), edge.get(shared.maxLength), edge.get(shared.maxWeight), edge.get(shared.maxAxleLoad))
 }
 
 /**
@@ -53,15 +73,8 @@ class HeavyVehicleEdgeFilter(
         if (edge.get(shared.hgvBlocked) and vehicleType != 0) return false
         if (params == null || !params.hasAttributes) return true
         if (params.hazmat && edge.get(shared.hazmatForbidden)) return false
-        if (params.height > 0 && blocks(edge.get(shared.maxHeight), params.height)) return false
-        if (params.width > 0 && blocks(edge.get(shared.maxWidth), params.width)) return false
-        if (params.length > 0 && blocks(edge.get(shared.maxLength), params.length)) return false
-        if (params.weight > 0 && blocks(edge.get(shared.maxWeight), params.weight)) return false
-        if (params.axleLoad > 0 && blocks(edge.get(shared.maxAxleLoad), params.axleLoad)) return false
-        return true
+        return !params.blockedBy(edge.get(shared.maxHeight), edge.get(shared.maxWidth), edge.get(shared.maxLength), edge.get(shared.maxWeight), edge.get(shared.maxAxleLoad))
     }
-
-    private fun blocks(limit: Double, vehicleValue: Double) = limit > 0.0 && limit < vehicleValue
 }
 
 /**
@@ -126,6 +139,7 @@ object EdgeFilterFactory {
         val filters = ArrayList<EdgeFilter>(4)
         if (avoidFeatures != 0) filters += AvoidFeaturesEdgeFilter(encoding.shared, avoidFeatures, pe.profile.category, isHgv)
         if (isHgv) filters += HeavyVehicleEdgeFilter(encoding.shared, vehicleType, params)
+        else if (params != null && params.hasDimensions) filters += DimensionsEdgeFilter(encoding.shared, params)
         if (avoidPolygons.isNotEmpty()) filters += AvoidPolygonsEdgeFilter(avoidPolygons)
         return when (filters.size) {
             0 -> EdgeFilter.ALL

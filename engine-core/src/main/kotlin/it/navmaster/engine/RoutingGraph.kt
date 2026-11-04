@@ -141,8 +141,12 @@ class RoutingGraph private constructor(
                 log?.invoke("Landmark $coreKey: ${lm.landmarkCount} in ${System.currentTimeMillis() - t0} ms")
             }
         }
-        GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); set("ch", chStorages.keys.joinToString(",")); save() }
+        coreVersion = CoreEdgeSelector.CORE_VERSION
+        GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); set("ch", chStorages.keys.joinToString(",")); set("core_version", coreVersion.toString()); save() }
     }
+
+    /** L'edizione della regola del core con cui il grafo è stato preparato ([CoreEdgeSelector.CORE_VERSION]); 1 per i grafi senza l'indicazione. */
+    var coreVersion = 1; private set
 
     /** Nome del profilo ORS (`driving-hgv`) → nome interno dell'encoder (`heavyvehicle`). */
     fun encoderName(profile: String): String = when (profile) {
@@ -160,9 +164,14 @@ class RoutingGraph private constructor(
         val filter: EdgeFilter = EdgeFilterFactory.create(encoding, name, options.avoidFeatures, options.vehicleType, options.vehicleParameters, options.avoidPolygons)
         val tcp = if (options.turnCosts) TurnCostProvider(turnCosts, name) else null
         val key = chKey(name, weighting)
-        // come `RoutingRequest.setSpeedups` di ORS: CH per le richieste statiche, altrimenti Core se preparato, altrimenti Dijkstra
-        val ch = if (options.allowCH && options.isStatic) chStorages[key]?.let { CHGraph(graph, it, weighting) } else null
-        val core = if (ch == null && options.allowCH && !options.needsFullSearch) chStorages["${key}_core"]?.let { CHGraph(graph, it, weighting) } else null
+        // come `RoutingRequest.setSpeedups` di ORS: CH per le richieste statiche, altrimenti Core se preparato, altrimenti Dijkstra.
+        // La nostra CH è node-based e ignora i divieti di svolta (ORS per i profili con costi di svolta prepara una CH
+        // edge-based): con i costi di svolta una richiesta statica usa il core, che li rispetta, quando c'è
+        val coreStorage = chStorages["${key}_core"]
+        val ch = if (options.allowCH && options.isStatic && (tcp == null || coreStorage == null)) chStorages[key]?.let { CHGraph(graph, it, weighting) } else null
+        // le misure dell'auto (camper, furgoni): nel core solo dall'edizione 2 della regola; prima, ricerca piena
+        val coreFits = name == "heavyvehicle" || options.vehicleParameters?.hasDimensions != true || coreVersion >= 2
+        val core = if (ch == null && options.allowCH && !options.needsFullSearch && coreFits) coreStorage?.let { CHGraph(graph, it, weighting) } else null
         val lm = if (core != null) landmarks["${key}_core"] else null
         // avoid_features alone: first the quick search without them; its path is the best one with
         // them too when it uses none of the roads to avoid (the filter only takes roads away), else
@@ -217,6 +226,7 @@ class RoutingGraph private constructor(
             val tc = TurnCostStorage(gdir, TurnCostEncoding(profiles.map { it.name }))
             check(tc.loadExisting()) { "costi di svolta non caricabili da $dir" }
             val rg = RoutingGraph(dir, encoding, graph, tc, GuidanceStore.load(gdir, graph.names), PointStore.load(gdir))
+            rg.coreVersion = props.get("core_version")?.toIntOrNull() ?: 1
             for (key in (props.get("ch") ?: "").split(',').filter { it.isNotBlank() }) {
                 val st = CHStorage(gdir, key, graph.edgeCount, graph.nodeCount)
                 if (st.loadExisting()) rg.chStorages[key] = st else st.close()
