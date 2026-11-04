@@ -295,7 +295,10 @@ class CoreManyToOne(
 
     private fun relaxCore(key: Int, w: Double, from: Int, edge: Int) {
         val node = if (edgeBased) keyNode(key, rootReverse) else key
-        if (!core.relax(key, w, from, edge, heapKey(w, node))) return
+        // i landmark dicono che di qui non si incontra nessun altro punto
+        val hk = heapKey(w, node)
+        if (hk.isInfinite()) return
+        if (!core.relax(key, w, from, edge, hk)) return
         val seeds = seedsAt.get(node) ?: return
         // un incontro con l'ingresso di un altro punto nello stesso nodo (col costo della svolta fra i due archi)
         val rootEdge = if (edgeBased) keyEdge(key, node) else -1

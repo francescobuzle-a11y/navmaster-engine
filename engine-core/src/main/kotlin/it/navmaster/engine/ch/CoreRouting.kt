@@ -191,10 +191,17 @@ class CoreDijkstra(
         return if (reverse) w - pf else w + pf
     }
 
+    /** Un nodo da cui i landmark dicono che non si raggiungono le destinazioni (o che le sorgenti non raggiungono): fuori da ogni percorso. */
+    private fun unreachable(node: Int): Boolean {
+        val p = potentials ?: return false
+        return p.toTargets(node).isInfinite() || p.fromSources(node).isInfinite()
+    }
+
     /** Registra una chiave di fase 2 nel suo nodo (una sola volta) e verifica gli incontri. */
     private fun relaxCore(s: State, key: Int, w: Double, from: Int, edge: Int, reverse: Boolean) {
         val isNew = !s.weight.containsKey(key)
         val node = if (edgeBased) keyNode(key, reverse) else key
+        if (unreachable(node)) return
         if (!s.relax(key, w, from, edge, heapKey(w, node, reverse))) return
         if (edgeBased && isNew) {
             val map = if (reverse) cBwdAtNode else cFwdAtNode

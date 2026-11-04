@@ -150,7 +150,7 @@ class CoreLandmarks private constructor(
             for (v in 0 until n) if (storage.level(v) >= coreLevel) coreIndex[v] = coreCount++
             if (coreCount == 0) return CoreLandmarks(0, coreIndex, FloatArray(0), IntArray(0))
             val k = minOf(count, coreCount)
-            val lms = IntArray(k)
+            val lms = IntArray(k) { -1 }
             val minDist = DoubleArray(n) { Double.POSITIVE_INFINITY }
             val dist = DoubleArray(n)
             val it = ch.iterator()
@@ -197,11 +197,51 @@ class CoreLandmarks private constructor(
             var farthest = start; var best = -1.0
             for (v in coreNodes) if (main.get(v) && dist[v].isFinite() && dist[v] > best) { best = dist[v]; farthest = v }
             lms[0] = farthest
+            return compute(ch, coreIndex, coreCount, lms, minDist, dist, main, coreNodes, log)
+        }
+
+        /** Landmark nei nodi dati (prove: per esempio in una zona chiusa del core). */
+        internal fun prepareAt(ch: CHGraph, nodes: IntArray): CoreLandmarks {
+            val n = ch.base.nodeCount
+            val coreIndex = IntArray(n) { -1 }
+            var coreCount = 0
+            for (v in 0 until n) if (ch.storage.level(v) >= n) coreIndex[v] = coreCount++
+            val coreNodes = IntArray(coreCount).also { a -> var c = 0; for (v in 0 until n) if (coreIndex[v] >= 0) a[c++] = v }
+            return compute(ch, coreIndex, coreCount, nodes.copyOf(), DoubleArray(n) { Double.POSITIVE_INFINITY }, DoubleArray(n), null, coreNodes, null)
+        }
+
+        /**
+         * Le distanze dai e verso i landmark [lms] (scelti man mano, il più lontano dai precedenti fra i
+         * nodi di [main], quando un elemento è -1).
+         */
+        private fun compute(ch: CHGraph, coreIndex: IntArray, coreCount: Int, lms: IntArray, minDist: DoubleArray, dist: DoubleArray,
+                            main: java.util.BitSet?, coreNodes: IntArray, log: ((String) -> Unit)?): CoreLandmarks {
+            val n = ch.base.nodeCount; val storage = ch.storage; val coreLevel = n
+            val k = lms.size
+            val it = ch.iterator()
+            fun explore(from: Int, reverse: Boolean, out: DoubleArray) {
+                java.util.Arrays.fill(out, Double.POSITIVE_INFINITY)
+                val heap = NodeHeap(1024); val settled = java.util.BitSet(n)
+                out[from] = 0.0; heap.push(from, 0.0)
+                while (!heap.isEmpty) {
+                    val v = heap.pop()
+                    if (settled.get(v)) continue
+                    settled.set(v)
+                    val w = out[v]
+                    it.setBaseNode(v, reverse)
+                    while (it.next()) {
+                        val adj = it.adjNode
+                        if (storage.level(adj) < coreLevel) continue
+                        val nw = w + it.weight
+                        if (nw < out[adj]) { out[adj] = nw; heap.push(adj, nw) }
+                    }
+                }
+            }
             val distances = FloatArray(coreCount * 2 * k)
             for (l in 0 until k) {
-                if (l > 0) {
+                if (lms[l] < 0) {
                     var cand = -1; var cbest = -1.0
-                    for (v in coreNodes) if (main.get(v) && minDist[v].isFinite() && minDist[v] > cbest) { cbest = minDist[v]; cand = v }
+                    for (v in coreNodes) if ((main == null || main.get(v)) && minDist[v].isFinite() && minDist[v] > cbest) { cbest = minDist[v]; cand = v }
                     lms[l] = if (cand < 0) lms[0] else cand
                 }
                 val lmNode = lms[l]
@@ -233,6 +273,15 @@ class CorePotentials(private val lm: CoreLandmarks) {
     private val tC2 = DoubleArray(k) { Double.POSITIVE_INFINITY }  // min_e (d(L→e) + b(e))
     private val sC1 = DoubleArray(k) { Double.NEGATIVE_INFINITY }  // max_e (d(L→e) − f(e))
     private val sC2 = DoubleArray(k) { Double.POSITIVE_INFINITY }  // min_e (d(e→L) + f(e))
+    /**
+     * Il primo termine di un landmark vale solo se tutte le destinazioni (sorgenti) lo raggiungono
+     * (ne sono raggiunte): con una destinazione e da cui L è irraggiungibile, d(v→L) − d(e→L) non è un
+     * limite per e, e saltare il termine nodo per nodo rompe la coerenza dei potenziali (la ricerca A*
+     * può fermarsi prima del percorso migliore: visto coi landmark in una zona chiusa). Quando vale, un
+     * nodo che non raggiunge L non raggiunge nessuna destinazione: potenziale infinito.
+     */
+    private val tAll = BooleanArray(k) { true }
+    private val sAll = BooleanArray(k) { true }
     private var hasTargets = false; private var hasSources = false
 
     fun addTarget(node: Int, b: Double) {
@@ -240,7 +289,7 @@ class CorePotentials(private val lm: CoreLandmarks) {
         hasTargets = true
         for (l in 0 until k) {
             val toL = lm.toLandmark(l, node); val fromL = lm.fromLandmark(l, node)
-            if (toL.isFinite()) tC1[l] = maxOf(tC1[l], toL - b)
+            if (toL.isFinite()) tC1[l] = maxOf(tC1[l], toL - b) else tAll[l] = false
             if (fromL.isFinite()) tC2[l] = minOf(tC2[l], fromL + b)
         }
     }
@@ -250,30 +299,42 @@ class CorePotentials(private val lm: CoreLandmarks) {
         hasSources = true
         for (l in 0 until k) {
             val fromL = lm.fromLandmark(l, node); val toL = lm.toLandmark(l, node)
-            if (fromL.isFinite()) sC1[l] = maxOf(sC1[l], fromL - f)
+            if (fromL.isFinite()) sC1[l] = maxOf(sC1[l], fromL - f) else sAll[l] = false
             if (toL.isFinite()) sC2[l] = minOf(sC2[l], toL + f)
         }
     }
 
-    /** Limite inferiore del costo residuo da [node] alle destinazioni. */
+    /**
+     * Limite inferiore del costo residuo da [node] alle destinazioni; +∞ quando i landmark dicono che
+     * da [node] non se ne raggiunge nessuna. Il secondo termine vale anche con destinazioni che L non
+     * raggiunge: L raggiunge [node], quindi [node] non raggiunge quelle.
+     */
     fun toTargets(node: Int): Double {
         if (!hasTargets || !lm.isCoreNode(node)) return 0.0
         var h = 0.0
         for (l in 0 until k) {
-            val toL = lm.toLandmark(l, node); val fromL = lm.fromLandmark(l, node)
-            if (toL.isFinite() && tC1[l].isFinite()) h = maxOf(h, toL - tC1[l])
+            if (tAll[l] && tC1[l].isFinite()) {
+                val toL = lm.toLandmark(l, node)
+                if (toL.isInfinite()) return Double.POSITIVE_INFINITY
+                h = maxOf(h, toL - tC1[l])
+            }
+            val fromL = lm.fromLandmark(l, node)
             if (fromL.isFinite() && tC2[l].isFinite()) h = maxOf(h, tC2[l] - fromL)
         }
         return maxOf(0.0, h - margin)
     }
 
-    /** Limite inferiore del costo dalle sorgenti a [node]. */
+    /** Limite inferiore del costo dalle sorgenti a [node]; +∞ quando nessuna sorgente lo raggiunge (come sopra). */
     fun fromSources(node: Int): Double {
         if (!hasSources || !lm.isCoreNode(node)) return 0.0
         var h = 0.0
         for (l in 0 until k) {
-            val fromL = lm.fromLandmark(l, node); val toL = lm.toLandmark(l, node)
-            if (fromL.isFinite() && sC1[l].isFinite()) h = maxOf(h, fromL - sC1[l])
+            if (sAll[l] && sC1[l].isFinite()) {
+                val fromL = lm.fromLandmark(l, node)
+                if (fromL.isInfinite()) return Double.POSITIVE_INFINITY
+                h = maxOf(h, fromL - sC1[l])
+            }
+            val toL = lm.toLandmark(l, node)
             if (toL.isFinite() && sC2[l].isFinite()) h = maxOf(h, sC2[l] - toL)
         }
         return maxOf(0.0, h - margin)
