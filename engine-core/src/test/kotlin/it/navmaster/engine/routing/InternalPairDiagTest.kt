@@ -30,7 +30,9 @@ class InternalPairDiagTest {
                     if (p == null) { println("  $name: nessun percorso"); continue }
                     val nodes = p.edges.map { it.baseNode }
                     val repeated = nodes.groupBy { it }.filter { it.value.size > 1 }.keys
-                    println("  $name: peso %.1f, %.2f km, %d archi, legale ${full.isLegal(p)}, nodi ripetuti ${repeated.size} %s".format(p.weight, p.distance / 1000, p.edges.size, repeated.take(5)))
+                    val st = g.chStorages.getValue("heavyvehicle_recommended_core"); val n = g.graph.nodeCount
+                    println("  $name: peso %.1f, %.2f km, %d archi, legale ${full.isLegal(p)}, nodi ripetuti ${repeated.size} %s".format(p.weight, p.distance / 1000, p.edges.size,
+                        repeated.take(6).map { "$it${if (st.level(it) >= n) " (core)" else ""}" }))
                 }
                 if (pc != null && pf != null) {
                     val ec = pc.edges.map { it.edge }; val ef = pf.edges.map { it.edge }
