@@ -13,3 +13,4 @@ graphs/
 data/*.pbf
 data/*.osm
 data/*.ghz
+!data/heidelberg.test.pbf
