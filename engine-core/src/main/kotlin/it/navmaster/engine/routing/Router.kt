@@ -143,13 +143,25 @@ class Router(
         return explore(edge, forward = false)
     }
 
-    /** Gli archi raggiunti da [edge] (o che lo raggiungono), o null appena si superano [MIN_NETWORK_SIZE] nodi. */
+    /**
+     * Gli archi raggiunti da [edge] (o che lo raggiungono), o null appena si superano [MIN_NETWORK_SIZE]
+     * nodi. Si parte dai capi nel verso in cui l'arco si percorre: in avanti dal capo d'arrivo, all'indietro
+     * da quello di partenza (come i sottografi per arco di GraphHopper). Un'autostrada che entra
+     * nell'estratto dal bordo si percorre ma non vi si arriva: il suo capo a monte non è raggiunto da
+     * nessuno, e un punto agganciato lì non avrebbe percorso.
+     */
     private fun explore(edge: Int, forward: Boolean): Set<Int>? {
         val e = graph.createEdgeIterator()
         val visited = HashSet<Int>()
         val edges = HashSet<Int>().also { it += edge }
         val queue = ArrayDeque<Int>()
-        for (n in intArrayOf(graph.nodeA(edge), graph.nodeB(edge))) if (visited.add(n)) queue.addLast(n)
+        it.setEdge(edge, graph.nodeA(edge))
+        val ab = weighting.edgeWeight(it, false).isFinite(); val ba = weighting.edgeWeight(it, true).isFinite()
+        val starts = ArrayList<Int>(2)
+        if (ab) starts += if (forward) graph.nodeB(edge) else graph.nodeA(edge)
+        if (ba) starts += if (forward) graph.nodeA(edge) else graph.nodeB(edge)
+        if (starts.isEmpty()) { starts += graph.nodeA(edge); starts += graph.nodeB(edge) }
+        for (n in starts) if (visited.add(n)) queue.addLast(n)
         while (queue.isNotEmpty()) {
             val n = queue.removeFirst()
             e.setBaseNode(n)
