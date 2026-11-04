@@ -276,11 +276,22 @@ class CrossBorderDirections(
     /** I passaggi da provare su un confine: i migliori per deviazione dalla linea p → q, prima le strade principali. */
     private fun candidates(list: List<Transfer>, p: LL, q: LL, transit: Boolean): List<Transfer> {
         fun detour(t: Transfer) = DistanceCalc.haversine(p.lat, p.lon, t.lat, t.lon) + DistanceCalc.haversine(t.lat, t.lon, q.lat, q.lon)
-        val major = list.filter { it.rank <= 3 }.sortedBy { detour(it) }.take(if (transit) 6 else 8)
+        // one crossing per place: the ends of the roads of one pass lie within a few hundred metres
+        // (at the Brenner the motorway and the state road); the most important road of the place,
+        // the places in order of detour
+        fun spread(l: List<Transfer>): List<Transfer> {
+            val out = ArrayList<Transfer>()
+            for (t in l.sortedWith(compareBy<Transfer> { detour(it) })) {
+                val i = out.indexOfFirst { DistanceCalc.haversine(it.lat, it.lon, t.lat, t.lon) < 3_000.0 }
+                if (i < 0) out += t else if (t.rank < out[i].rank) out[i] = t
+            }
+            return out
+        }
+        val major = spread(list.filter { it.rank <= 3 }).take(if (transit) 5 else 6)
         // le strade minori solo vicino alla partenza o all'arrivo (un viaggio corto oltre il confine)
         val minor = list.filter { it.rank > 3 }.filter { t ->
             minOf(DistanceCalc.haversine(p.lat, p.lon, t.lat, t.lon), DistanceCalc.haversine(t.lat, t.lon, q.lat, q.lon)) < 40_000.0
-        }.sortedBy { detour(it) }.take(if (transit) 2 else 5)
+        }.let { spread(it) }.take(if (transit) 2 else 4)
         return (major + minor).distinct()
     }
 

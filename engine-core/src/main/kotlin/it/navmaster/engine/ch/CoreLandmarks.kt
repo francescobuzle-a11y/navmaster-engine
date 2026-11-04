@@ -38,8 +38,13 @@ class CoreLandmarks private constructor(
     /** The size of a step: each distance is within half a step (the potentials allow for it). */
     @Volatile var step = 0.0; private set
 
-    /** The distances in memory (once; the file mapped stays for the rest). */
+    /**
+     * The distances in memory (once; the file mapped stays for the rest). Not used: rounded to
+     * 16 bits the potentials are no longer exactly consistent and the path could be a little off
+     * the best one (seen on Canneto → Innsbruck); the gain was a fifth of the time only.
+     */
     fun warm() {
+        if (!QUANTIZE) return
         if (quantized != null || distanceBits !is IntSource.OfData) return
         synchronized(this) {
             if (quantized != null) return
@@ -109,6 +114,8 @@ class CoreLandmarks private constructor(
     companion object {
         /** The 16-bit value of an unreachable landmark. */
         private const val INF_STEP = 0xFFFF
+        /** Landmarks rounded to 16 bits in memory (see [warm]): off, the search stays exact. */
+        private const val QUANTIZE = false
 
         fun load(dir: GraphDirectory, name: String, nodeCount: Int): CoreLandmarks? {
             val da = dir.open("landmarks_$name", 1 shl 20) ?: return null
