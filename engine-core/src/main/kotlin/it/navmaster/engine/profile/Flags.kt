@@ -60,30 +60,19 @@ object AvoidFeatureFlags {
 enum class ProfileCategory { UNKNOWN, DRIVING, CYCLING, WALKING, WHEELCHAIR }
 
 /**
- * Codici di priorità di GraphHopper: 0 = escludi … 10 = neutro … 15 = ottimo.
- * Il fattore memorizzato è `value / 10`.
+ * Codici di priorità di openrouteservice 10 (`PriorityCode`): 0 = pessimo … 4 = neutro … 7 = ottimo.
+ * Il fattore memorizzato è `value / 7` (`PriorityCode.getFactor`); il peso «recommended» lo usa
+ * come 2^((fattore·7 − 4) / (4 − 7)): ottimo ×0,5, neutro ×1, pessimo ×2,52.
  */
 enum class PriorityCode(val value: Int) {
-    EXCLUDE(0),
-    REACH_DESTINATION(1),
-    VERY_BAD(3),
-    BAD(5),
-    AVOID_MORE(6),
-    AVOID(8),
-    SLIGHT_AVOID(9),
-    UNCHANGED(10),
-    SLIGHT_PREFER(11),
-    PREFER(12),
-    VERY_NICE(13),
-    BEST(15);
+    WORST(0),
+    AVOID_AT_ALL_COSTS(1),
+    REACH_DEST(2),
+    AVOID_IF_POSSIBLE(3),
+    UNCHANGED(4),
+    PREFER(5),
+    VERY_NICE(6),
+    BEST(7);
 
-    val factor: Double get() = value / 10.0
-
-    companion object {
-        /** Nomi storici usati dal codice ORS. */
-        val REACH_DEST = REACH_DESTINATION
-        val AVOID_AT_ALL_COSTS = VERY_BAD
-        val AVOID_IF_POSSIBLE = AVOID
-        val WORST = EXCLUDE
-    }
+    val factor: Double get() = value.toDouble() / BEST.value
 }

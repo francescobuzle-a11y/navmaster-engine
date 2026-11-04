@@ -109,7 +109,7 @@ class RoutingGraph private constructor(
      * Prepara per ogni profilo la CH completa (richieste "statiche") e il Core (richieste con restrizioni,
      * avoid_features o divieti di svolta), come le preparazioni `ch` e `core` di ORS, e le salva.
      */
-    fun prepareCH(log: ((String) -> Unit)? = null, withCore: Boolean = true, landmarkCount: Int = 16, coreWide: Boolean = false) {
+    fun prepareCH(log: ((String) -> Unit)? = null, withCore: Boolean = true, landmarkCount: Int = 16, coreWide: Boolean = true) {
         for (pe in encoding.profiles) for (method in listOf(defaultCHWeighting(pe.profile.name), WeightingMethod.SHORTEST)) {
             val name = pe.profile.name
             val w = WeightingFactory.create(encoding, pe, method)

@@ -15,7 +15,8 @@ class ProfileEncoding(val profile: VehicleProfile) {
     /** 5 bit × 5 km/h come ORS (`speed_bits=5`, `speed_factor=5`): massimo 155 km/h. */
     val speed = DecimalEncodedValue("${profile.name}_speed", 5, 5.0, twoDirections = true)
     /** Fattore di priorità 0.0..1.5 a passi di 0.1 (GraphHopper `PriorityCode`). */
-    val priority = DecimalEncodedValue("${profile.name}_priority", 4, 0.1)
+    /** Il fattore di priorità (ORS: 4 bit a passi di 1/7, i valori di PriorityCode esatti). */
+    val priority = DecimalEncodedValue("${profile.name}_priority", 4, 1.0 / 7)
 
     internal fun register(b: EncodedValueRegistry.Builder) { b.add(access).add(speed).add(priority) }
 

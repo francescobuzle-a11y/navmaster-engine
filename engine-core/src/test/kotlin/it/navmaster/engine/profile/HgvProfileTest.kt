@@ -105,12 +105,12 @@ class HgvProfileTest {
         assertEquals(PriorityCode.VERY_NICE, hgv.priority(way("highway" to "motorway")))
         assertEquals(PriorityCode.PREFER, hgv.priority(way("highway" to "primary")))
         assertEquals(PriorityCode.UNCHANGED, hgv.priority(way("highway" to "tertiary")))
-        assertEquals(PriorityCode.AVOID, hgv.priority(way("highway" to "residential")))
-        assertEquals(PriorityCode.REACH_DESTINATION, hgv.priority(way("highway" to "residential", "maxspeed" to "30")))
-        assertEquals(PriorityCode.VERY_BAD, hgv.priority(way("highway" to "living_street")))
+        assertEquals(PriorityCode.AVOID_IF_POSSIBLE, hgv.priority(way("highway" to "residential")))
+        assertEquals(PriorityCode.REACH_DEST, hgv.priority(way("highway" to "residential", "maxspeed" to "30")))
+        assertEquals(PriorityCode.AVOID_AT_ALL_COSTS, hgv.priority(way("highway" to "living_street")))
         assertEquals(PriorityCode.BEST, hgv.priority(way("highway" to "residential", "hgv" to "designated")))
         // un limite basso su una primaria indica un centro abitato
-        assertEquals(PriorityCode.AVOID, hgv.priority(way("highway" to "primary", "maxspeed" to "40")))
+        assertEquals(PriorityCode.AVOID_IF_POSSIBLE, hgv.priority(way("highway" to "primary", "maxspeed" to "40")))
         assertEquals(PriorityCode.UNCHANGED, hgv.priority(way("highway" to "primary", "maxspeed" to "50")))
     }
 

@@ -67,7 +67,7 @@ class ShortestWeighting(private val p: ProfileEncoding) : Weighting {
 
 /**
  * "recommended" (ORS `ORSPriorityWeighting`): il peso del [base] viene moltiplicato per
- * 2^((priorità·15 − 10) / (10 − 15)), così le strade preferite costano meno.
+ * 2^((priorità·7 − 4) / (4 − 7)), così le strade preferite costano meno (scala di ORS 10).
  * Come in ORS, `minWeight` è 0: l'euristica A* non è informativa con questo peso.
  */
 class PriorityWeighting(private val p: ProfileEncoding, private val base: Weighting) : Weighting {

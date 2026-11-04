@@ -88,18 +88,18 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
                 "primary", "primary_link", "secondary", "secondary_link" -> candidates[100.0] = PriorityCode.PREFER
                 "tertiary", "tertiary_link" -> candidates[100.0] = PriorityCode.UNCHANGED
                 "residential", "service", "road", "unclassified" ->
-                    if (!maxSpeed.isNaN() && maxSpeed <= 30) candidates[120.0] = PriorityCode.REACH_DESTINATION
-                    else candidates[100.0] = PriorityCode.AVOID
-                "living_street" -> candidates[100.0] = PriorityCode.VERY_BAD
-                "track" -> candidates[100.0] = PriorityCode.EXCLUDE
-                else -> candidates[40.0] = PriorityCode.AVOID
+                    if (!maxSpeed.isNaN() && maxSpeed <= 30) candidates[120.0] = PriorityCode.REACH_DEST
+                    else candidates[100.0] = PriorityCode.AVOID_IF_POSSIBLE
+                "living_street" -> candidates[100.0] = PriorityCode.AVOID_AT_ALL_COSTS
+                "track" -> candidates[100.0] = PriorityCode.WORST
+                else -> candidates[40.0] = PriorityCode.AVOID_IF_POSSIBLE
             }
         } else {
             candidates[100.0] = PriorityCode.UNCHANGED
         }
         if (!maxSpeed.isNaN()) {
             // un limite basso indica un centro abitato
-            if (maxSpeed <= 40) candidates[110.0] = PriorityCode.AVOID
+            if (maxSpeed <= 40) candidates[110.0] = PriorityCode.AVOID_IF_POSSIBLE
             else if (maxSpeed <= 50) candidates[110.0] = PriorityCode.UNCHANGED
         }
         return candidates[candidates.lastKey()]!!

@@ -64,7 +64,8 @@ jobs:
             austria) TRIPS="47.2692,11.4041 48.2082,16.3738|46.6247,14.3053 48.3069,14.2858" ;;
             *) TRIPS="" ;;
           esac
-          IFS='|'; for t in $TRIPS; do IFS=' '; set -- $t; IFS='|'
+          IFS='|' read -r -a TRIPLIST <<< "$TRIPS"
+          for t in "${TRIPLIST[@]}"; do set -- $t
             for opts in "--profile=driving-hgv --height=4 --width=2.55 --length=16.5 --weight=27 --axleload=11.5" \
                         "--profile=driving-hgv --height=4 --width=2.55 --length=16.5 --weight=27 --axleload=11.5 --avoid=tollways" \
                         "--profile=driving-hgv --height=4 --width=2.55 --length=16.5 --weight=27 --axleload=11.5 --avoid=highways" \
@@ -73,7 +74,7 @@ jobs:
                         "--profile=driving-car" "--profile=driving-car --avoid=tollways,highways" "--profile=driving-car --height=3.2 --weight=3.5"; do
               echo "== $1 → $2 $opts"
               # due volte: la prima paga la lettura dei file
-              for k in 1 2; do $CLI route nm "$1" "$2" $opts --quiet 2>&1 | grep -E "percorso|calcolo|Exception|Nessun" ; done
+              for k in 1 2; do $CLI route nm "$1" "$2" $opts --quiet 2>&1 | grep -E "percorso|calcolo|Exception|Nessun" | sed 's/^.*Exception[^:]*: //' ; done
             done
           done
       - name: Registro

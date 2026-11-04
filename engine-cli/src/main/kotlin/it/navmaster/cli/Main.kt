@@ -21,7 +21,7 @@ import kotlin.system.exitProcess
 private const val USAGE = """
 navmaster-engine
 
-  import <file.osm.pbf> <cartella-grafo> [--profiles=car,hgv] [--no-ch] [--no-width-from-carriageway] [--mmap] [--core=wide]   costruisce il grafo (--mmap: file su disco invece che in RAM; --core=wide: core come ORS)
+  import <file.osm.pbf> <cartella-grafo> [--profiles=car,hgv] [--no-ch] [--no-width-from-carriageway] [--mmap] [--core=narrow]   costruisce il grafo (--mmap: file su disco invece che in RAM; --core=narrow: core ridotto, senza autostrade e strade veloci)
   info <cartella-grafo>                                          riepilogo del grafo
   route <cartella-grafo> <lat,lon> <lat,lon> [--profile=driving-hgv] [--weighting=fastest|shortest|recommended]
         [--avoid=highways,tollways,ferries,fords] [--height=4.0 --weight=40 --width=2.55 --length=18.75 --hazmat] [--no-turn-costs] [--no-ch]
@@ -138,7 +138,7 @@ private fun importGraph(args: List<String>) {
         println("grafo: %,d nodi, %,d archi (%,d pillar, %,d archi barriera), divieti di svolta %,d applicati su %,d, %.1f s".format(
             stats.towers, stats.edges, stats.pillars, stats.barrierEdges, stats.turnRestrictions, stats.turnRestrictionRelations, stats.millis / 1000.0))
         println("bbox: ${it.graph.bounds}")
-        if (!args.contains("--no-ch")) it.prepareCH(log = { msg -> println(msg) }, coreWide = opt(args, "core") == "wide")
+        if (!args.contains("--no-ch")) it.prepareCH(log = { msg -> println(msg) }, coreWide = opt(args, "core") != "narrow")
     }
 }
 

@@ -64,7 +64,7 @@ class RequestOptionsTest {
             val dPlain = ((plain["routes"] as List<*>)[0] as Map<*, *>)["summary"] as Map<*, *>
             val dSlow = ((slow["routes"] as List<*>)[0] as Map<*, *>)["summary"] as Map<*, *>
             assertTrue((dSlow["duration"] as Double) >= (dPlain["duration"] as Double) - 0.1)
-            assertEquals("dijkstra_edge_based", it.router(RouteOptions(profile = "driving-hgv", maximumSpeed = 80.0)).algorithm)
+            assertEquals("core_alt_edge_based", it.router(RouteOptions(profile = "driving-hgv", maximumSpeed = 80.0)).algorithm)
 
             // avoid_polygons: un poligono sul tracciato del percorso lo devia (o lo rende impossibile)
             val pts = PolylineEncoder.decode(route["geometry"] as String)

@@ -33,10 +33,11 @@ class CoreEdgeSelector(
     private val maximumSpeedLowerBound: Double = 80.0,
     /**
      * Il core come quello di ORS: anche autostrade, pedaggi, traghetti, guadi e le strade oltre
-     * [maximumSpeedLowerBound], così `avoid_features` e `maximum_speed` sono esatti col core. Più
-     * shortcut e preparazione più lunga (vedi la misura in CI, flusso «Misura del core»).
+     * [maximumSpeedLowerBound], così `avoid_features` e `maximum_speed` sono esatti col core.
+     * Misurato sull'Italia (flusso «Misura del core»): +6 % di nodi nel core, stessi shortcut e
+     * tempi di preparazione del core ridotto; è il predefinito.
      */
-    private val wide: Boolean = false,
+    private val wide: Boolean = true,
 ) {
     private val sh = encoding.shared
     private val pe = encoding.profile(profileName)

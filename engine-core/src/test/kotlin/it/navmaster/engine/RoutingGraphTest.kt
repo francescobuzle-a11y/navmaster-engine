@@ -51,10 +51,10 @@ class RoutingGraphTest {
                 val p2 = plainRouter.route(plainRouter.snap(a.first, a.second, 400.0, 0), plainRouter.snap(b.first, b.second, 400.0, 1))
                 assertTrue(abs(p1.weight - p2.weight) <= 0.05 + p2.weight * 1e-4, "CH ${p1.weight} vs Dijkstra ${p2.weight}")
                 assertEquals(p2.distance, p1.distance, p2.distance * 0.01)
-                // con restrizioni del veicolo o avoid_features niente CH: Core
-                // avoid_features tocca archi fuori dal core: ricerca piena
-                assertEquals("dijkstra_edge_based", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS)).algorithm)
-                assertEquals("dijkstra", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS, turnCosts = false)).algorithm)
+                // con restrizioni del veicolo o avoid_features niente CH: il core (largo come ORS: pedaggi e autostrade dentro)
+                assertTrue(rg.coreWide)
+                assertEquals("core_alt_edge_based", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS)).algorithm)
+                assertEquals("core_alt", rg.router(RouteOptions(profile = "driving-hgv", avoidFeatures = AvoidFeatureFlags.TOLLWAYS, turnCosts = false)).algorithm)
                 // anche "shortest" ha le sue preparazioni (CH statica senza costi di svolta, core con e senza restrizioni)
                 assertEquals("ch", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST, turnCosts = false)).algorithm)
                 assertEquals("core_alt_edge_based", rg.router(RouteOptions(profile = "driving-hgv", weighting = WeightingMethod.SHORTEST)).algorithm)
