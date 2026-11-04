@@ -15,6 +15,9 @@ on:
       trips:
         description: "Viaggi (lat,lon;lat,lon|…), vuoto per quelli della prova"
         default: ""
+  push:
+    branches: [main]
+    paths: [".github/workflows/valichi.yml"]
 
 jobs:
   prova:
@@ -30,7 +33,7 @@ jobs:
           df -h / /mnt
       - name: Grafi dei Paesi
         env:
-          COUNTRIES: ${{ inputs.countries }}
+          COUNTRIES: ${{ inputs.countries || 'italy,austria' }}
         run: |
           set -euo pipefail
           spec=""
@@ -46,7 +49,7 @@ jobs:
           df -h /mnt
       - name: Prova
         env:
-          TEST: ${{ inputs.test }}
+          TEST: ${{ inputs.test || 'it.navmaster.engine.api.CrossBorderRealDiagTest' }}
           NM_TRIPS: ${{ inputs.trips }}
         run: |
           chmod +x gradlew
