@@ -12,6 +12,9 @@ on:
       seed:
         description: "Seme casuale"
         default: "42"
+      probes:
+        description: "Sonde: JSON, lista di {name, profile, body}"
+        default: ""
       import_opts:
         description: "Opzioni di engine-cli import (es. --no-width-from-carriageway, --core=wide)"
         default: ""
@@ -89,10 +92,11 @@ jobs:
           N: ${{ inputs.requests || '30' }}
           SEED: ${{ inputs.seed || '42' }}
           CASES: ${{ inputs.cases }}
+          PROBES: ${{ inputs.probes }}
         run: |
           set -euo pipefail
           python3 tools/confronto-ors/confronta.py --ors "$ORS_URL" --engine "$ENGINE_URL" \
-            --n "$N" --seed "$SEED" --cases "$CASES" --out confronto-out | tee confronto.log
+            --n "$N" --seed "$SEED" --cases "$CASES" --probes "$PROBES" --out confronto-out | tee confronto.log
           cat confronto-out/rapporto.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Diagnostica

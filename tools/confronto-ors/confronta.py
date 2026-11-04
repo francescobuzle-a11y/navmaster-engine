@@ -382,6 +382,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="confronto-out")
     ap.add_argument("--cases", default="", help="sottoinsieme di casi separati da virgola (vuoto = tutti)")
+    ap.add_argument("--probes", default="", help='sonde: JSON, lista di {"name","profile","body"}; per ognuna le risposte dei due server con i passi')
     args = ap.parse_args()
 
     for label, base in (("ORS", args.ors), ("motore", args.engine)):
@@ -418,6 +419,27 @@ def main():
         summary_json[name] = {"profile": profile, "rows": [row_public(r) | {"body": r["body"]} for r in rows]}
 
     report += ["## Quadro d'insieme", ""] + overview + ["", "## Dettaglio per caso", ""] + details
+    # le sonde: richieste fisse, le risposte dei due server passo per passo
+    probes = json.loads(args.probes) if args.probes.strip() else []
+    if probes:
+        report += ["", "## Sonde", ""]
+        pdir = os.path.join(args.out, "sonde"); os.makedirs(pdir, exist_ok=True)
+        for k, pr in enumerate(probes):
+            name, profile, body = pr.get("name", "sonda %d" % k), pr["profile"], pr["body"]
+            a, b = post(args.ors, profile, body), post(args.engine, profile, body)
+            report += ["### %s (`%s`)" % (name, profile), "", "`%s`" % json.dumps(body), ""]
+            for label, r in (("ORS", a), ("motore", b)):
+                if r.get("error_code") is not None:
+                    report.append("- **%s**: errore %s %s" % (label, r.get("error_code"), r.get("message", "")))
+                    continue
+                feats = (r["raw"].get("features") or [])
+                steps = [st for f in feats[:1] for seg in (f["properties"].get("segments") or []) for st in (seg.get("steps") or [])]
+                report.append("- **%s**: %.0f m, %.0f s, %d passi: %s" % (label, r["distance"], r["duration"], len(steps),
+                              "; ".join("%s %dm" % (st.get("name") or "-", round(st.get("distance", 0))) for st in steps[:40])))
+            report.append("")
+            with open(os.path.join(pdir, "%02d.json" % k), "w", encoding="utf-8") as f:
+                json.dump({"name": name, "profile": profile, "request": body, "ors": a.get("raw"), "engine": b.get("raw")}, f, ensure_ascii=False)
+            print("sonda %s: ORS %s / motore %s" % (name, a.get("distance", a.get("error_code")), b.get("distance", b.get("error_code"))), flush=True)
     report.append("Durata totale: %.0f s." % (time.time() - t0))
     text = "\n".join(report) + "\n"
     with open(os.path.join(args.out, "rapporto.md"), "w") as fh:
