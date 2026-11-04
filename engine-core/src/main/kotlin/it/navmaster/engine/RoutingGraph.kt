@@ -25,6 +25,7 @@ import it.navmaster.engine.storage.TurnCostStorage
 import it.navmaster.engine.weighting.EdgeFilter
 import it.navmaster.engine.profile.HeavyVehicleAttributes
 import it.navmaster.engine.weighting.EdgeFilterFactory
+import it.navmaster.engine.weighting.AvoidFeaturesEdgeFilter
 import it.navmaster.engine.weighting.TurnCostProvider
 import it.navmaster.engine.weighting.VehicleParameters
 import it.navmaster.engine.weighting.WeightingFactory
@@ -62,6 +63,8 @@ data class RouteOptions(
      * viaggio lungo non sta nella memoria del tablet. Usato oltre i 60 km in linea d'aria.
      */
     val maximumSpeedTimeOnly: Boolean = false,
+    /** ORS `maximum_visited_nodes` (1 000 000): oltre, la ricerca piena si ferma (non esaurisce la memoria). */
+    val maxVisitedNodes: Int = 1_000_000,
 ) {
     /** Richiesta "statica" nel senso di ORS: nessun filtro dipendente dalla richiesta. */
     val isStatic: Boolean get() = avoidFeatures == 0 && (vehicleParameters == null || !vehicleParameters.hasAttributes) &&
@@ -161,7 +164,14 @@ class RoutingGraph private constructor(
         val ch = if (options.allowCH && options.isStatic) chStorages[key]?.let { CHGraph(graph, it, weighting) } else null
         val core = if (ch == null && options.allowCH && !options.needsFullSearch) chStorages["${key}_core"]?.let { CHGraph(graph, it, weighting) } else null
         val lm = if (core != null) landmarks["${key}_core"] else null
-        return Router(graph, index, weighting, filter, tcp, ch, core, lm, timeWeighting = timeWeighting)
+        // avoid_features alone: first the quick search without them; its path is the best one with
+        // them too when it uses none of the roads to avoid (the filter only takes roads away), else
+        // the full search (ORS keeps those roads in its core; our reduced core does not)
+        val quick = if (ch == null && core == null && options.avoidFeatures != 0 && options.avoidPolygons.isEmpty() && options.allowCH &&
+            (options.maximumSpeed.isInfinite() || options.maximumSpeedTimeOnly)) router(options.copy(avoidFeatures = 0)) else null
+        val avoid = if (quick != null) AvoidFeaturesEdgeFilter(encoding.shared, options.avoidFeatures, pe.profile.category, name == "heavyvehicle") else null
+        return Router(graph, index, weighting, filter, tcp, ch, core, lm, maxVisitedNodes = options.maxVisitedNodes, timeWeighting = timeWeighting,
+            quick = quick, quickAccepts = avoid)
     }
 
     fun flush() { graph.flush(); turnCosts.flush(); guidance?.flush(graph.edgeCount); points?.flush(); GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); save() } }

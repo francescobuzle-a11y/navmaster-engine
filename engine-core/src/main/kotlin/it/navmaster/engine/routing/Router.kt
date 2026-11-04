@@ -58,6 +58,9 @@ class Router(
     private val maxVisitedNodes: Int = Int.MAX_VALUE,
     /** The times of the path (normally the weighting's; with maximumSpeedTimeOnly the limited speed). */
     private val timeWeighting: Weighting = weighting,
+    /** The quick search to try first (see RoutingGraph.router: avoid_features), and what its path must pass. */
+    private val quick: Router? = null,
+    private val quickAccepts: EdgeFilter? = null,
 ) {
     /** Quale algoritmo verrà usato: utile per diagnostica e test. */
     val algorithm: String get() = when {
@@ -177,6 +180,10 @@ class Router(
      * nessuna parte viene esclusa.
      */
     fun route(from: Snap, to: Snap, arrival: PathEdge? = null, fromHeading: Double = Double.NaN, toHeading: Double = Double.NaN): RoutePath {
+        if (quick != null && quickAccepts != null) {
+            val p = try { quick.route(from, to, arrival, fromHeading, toHeading) } catch (e: RouteNotFoundException) { null }
+            if (p != null && p.edges.all { e -> it.setEdge(e.edge, e.baseNode); quickAccepts.accept(it) }) return p
+        }
         var fromParts = splitEdge(from, asTarget = false).map { penalised(it, from, fromHeading, asTarget = false) }
         val toParts = splitEdge(to, asTarget = true).map { penalised(it, to, toHeading, asTarget = true) }
         var best: RoutePath? = null

@@ -14,14 +14,15 @@ class MaxSpeedRealTest {
         val service = DirectionsService(g, DirectionsLimits(50, 6_000_000.0, 6_000_000.0, 400.0))
         fun run(name: String, from: Pair<Double, Double>, to: Pair<Double, Double>, fast: Boolean?): Pair<Double, Double> {
             val body = linkedMapOf<String, Any?>("coordinates" to listOf(listOf(from.second, from.first), listOf(to.second, to.first)), "instructions" to false,
-                "maximum_speed" to 80.0, "options" to mapOf("profile_params" to mapOf("restrictions" to mapOf("height" to 4.0, "weight" to 40.0))))
+                "maximum_speed" to 80.0, "options" to mapOf("avoid_features" to listOf("ferries"), "profile_params" to mapOf("restrictions" to mapOf("height" to 4.0, "weight" to 40.0))))
             val req = DirectionsRequest.fromJson("driving-hgv", body)
             val t0 = System.currentTimeMillis()
             val rt = Runtime.getRuntime(); System.gc(); val before = rt.totalMemory() - rt.freeMemory()
             val res = if (fast == false) {
                 // the exact search (as ORS) forced, for the comparison
-                val o = service.routeOptions(req)
-                val router = g.router(o)
+                val o = service.routeOptions(req).copy(maxVisitedNodes = Int.MAX_VALUE)
+                // the full search itself (no quick try): the quick router is not made when CH/core are off
+                val router = g.router(o.copy(allowCH = false))
                 val a = router.snap(from.first, from.second, 400.0, 0); val b = router.snap(to.first, to.second, 400.0, 1)
                 val p = router.route(a, b)
                 p.distance to p.millis / 1000.0
