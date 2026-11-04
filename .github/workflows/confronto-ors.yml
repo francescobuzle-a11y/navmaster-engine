@@ -11,10 +11,10 @@ on:
         default: "30"
       seed:
         description: "Seme casuale"
+        default: "42"
       import_opts:
         description: "Opzioni di engine-cli import (es. --no-width-from-carriageway, --core=wide)"
         default: ""
-        default: "42"
       cases:
         description: "Casi separati da virgola (vuoto = tutti; vedi CASES in confronta.py)"
         default: ""
