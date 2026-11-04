@@ -91,6 +91,25 @@ object Transfers {
         return queries
     }
 
+    /**
+     * Un valico per luogo (entro [PLACE] m), i luoghi in ordine di [detour], al più [places]: della
+     * strada più importante del luogo i punti allo stesso capo ([SAME_END] m), cioè le due carreggiate
+     * di un'autostrada (sensi unici: dall'Italia si entra in Austria solo da una delle due), non l'altro
+     * capo della stessa strada né le strade minori (al Brennero l'autostrada e la statale).
+     */
+    fun onePerPlace(list: List<Transfer>, detour: (Transfer) -> Double, places: Int): List<Transfer> {
+        val out = ArrayList<MutableList<Transfer>>()
+        for (t in list.sortedWith(compareBy<Transfer>({ it.rank }, { detour(it) }))) {
+            val place = out.firstOrNull { DistanceCalc.haversine(it[0].lat, it[0].lon, t.lat, t.lon) < PLACE }
+            if (place == null) out += mutableListOf(t)
+            else if (t.rank == place[0].rank && DistanceCalc.haversine(place[0].lat, place[0].lon, t.lat, t.lon) < SAME_END) place += t
+        }
+        return out.sortedBy { detour(it[0]) }.take(places).flatten()
+    }
+
+    private const val PLACE = 3_000.0
+    private const val SAME_END = 500.0
+
     fun rank(c: RoadClass): Int = when (c) {
         RoadClass.MOTORWAY -> 1
         RoadClass.TRUNK -> 2
@@ -282,22 +301,11 @@ class CrossBorderDirections(
     /** I passaggi da provare su un confine: i migliori per deviazione dalla linea p → q, prima le strade principali. */
     private fun candidates(list: List<Transfer>, p: LL, q: LL, transit: Boolean): List<Transfer> {
         fun detour(t: Transfer) = DistanceCalc.haversine(p.lat, p.lon, t.lat, t.lon) + DistanceCalc.haversine(t.lat, t.lon, q.lat, q.lon)
-        // one crossing per place: the ends of the roads of one pass lie within a few hundred metres
-        // (at the Brenner the motorway and the state road); the most important road of the place,
-        // the places in order of detour
-        fun spread(l: List<Transfer>): List<Transfer> {
-            val out = ArrayList<Transfer>()
-            for (t in l.sortedWith(compareBy<Transfer> { detour(it) })) {
-                val i = out.indexOfFirst { DistanceCalc.haversine(it.lat, it.lon, t.lat, t.lon) < 3_000.0 }
-                if (i < 0) out += t else if (t.rank < out[i].rank) out[i] = t
-            }
-            return out
-        }
-        val major = spread(list.filter { it.rank <= 3 }).take(if (transit) 5 else 6)
+        val major = Transfers.onePerPlace(list.filter { it.rank <= 3 }, ::detour, if (transit) 5 else 6)
         // le strade minori solo vicino alla partenza o all'arrivo (un viaggio corto oltre il confine)
         val minor = list.filter { it.rank > 3 }.filter { t ->
             minOf(DistanceCalc.haversine(p.lat, p.lon, t.lat, t.lon), DistanceCalc.haversine(t.lat, t.lon, q.lat, q.lon)) < 40_000.0
-        }.let { spread(it) }.take(if (transit) 2 else 4)
+        }.let { Transfers.onePerPlace(it, ::detour, if (transit) 2 else 4) }
         return (major + minor).distinct()
     }
 

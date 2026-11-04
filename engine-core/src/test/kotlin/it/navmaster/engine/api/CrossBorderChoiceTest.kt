@@ -117,6 +117,25 @@ class CrossBorderChoiceTest {
         }
     }
 
+    @Test
+    fun `one crossing per place keeps both carriageways of a motorway`() {
+        // il Brennero: i capi delle due carreggiate (sensi unici) ai due margini degli estratti, la statale; Resia
+        val north1 = Transfer(47.01760, 11.50650, 1); val south1 = Transfer(47.01790, 11.50700, 1)
+        val north2 = Transfer(47.00210, 11.50480, 1); val south2 = Transfer(47.00230, 11.50530, 1)
+        val road = Transfer(47.01500, 11.50300, 3)
+        val resia = Transfer(46.83405, 10.51050, 3); val nauders = Transfer(46.86843, 10.50890, 3)
+        val canneto = 45.150 to 10.380; val innsbruck = 47.269 to 11.404
+        fun detour(t: Transfer) = DistanceCalc.haversine(canneto.first, canneto.second, t.lat, t.lon) + DistanceCalc.haversine(t.lat, t.lon, innsbruck.first, innsbruck.second)
+        val all = listOf(road, north1, resia, south1, north2, nauders, south2)
+        val kept = Transfers.onePerPlace(all, ::detour, 6)
+        val brenner = kept.filter { it.lon > 11.0 }
+        assertEquals(2, brenner.size, "al Brennero: $brenner")
+        assertTrue(brenner.all { it.rank == 1 } && DistanceCalc.haversine(brenner[0].lat, brenner[0].lon, brenner[1].lat, brenner[1].lon) < 500.0)
+        assertTrue(road !in kept && resia in kept && nauders in kept)
+        // il numero di luoghi, non di punti
+        assertEquals(brenner, Transfers.onePerPlace(all, ::detour, 1))
+    }
+
     @Suppress("UNCHECKED_CAST")
     private fun summary(res: Map<String, Any?>) = ((res["features"] as List<Map<String, Any?>>)[0]["properties"] as Map<String, Any?>)["summary"]
 }
