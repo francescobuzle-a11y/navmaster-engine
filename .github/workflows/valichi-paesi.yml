@@ -1,0 +1,97 @@
+# Le prove per Paese sui grafi veri (pacchetti dati-<paese> dell'app): per ogni coppia di Paesi
+# confinanti i viaggi a cavallo del confine contro il riferimento esaustivo, per ogni Paese i viaggi
+# interni (core contro ricerca piena, CH contro Dijkstra). Francia e Germania non hanno ancora il
+# grafo del motore. Una coppia per lavoro, in parallelo.
+name: Valichi per Paese
+
+on:
+  workflow_dispatch:
+    inputs:
+      trips:
+        description: "Viaggi per confine"
+        default: "6"
+      internal:
+        description: "Viaggi interni per Paese"
+        default: "12"
+      only:
+        description: "Solo queste coppie (es. italy-austria,spain-portugal), vuoto per tutte"
+        default: ""
+
+jobs:
+  paese:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        pair: [
+          italy-austria, italy-switzerland, italy-slovenia, austria-switzerland, austria-liechtenstein, switzerland-liechtenstein,
+          austria-czech-republic, austria-slovakia, austria-hungary, austria-slovenia, slovenia-croatia, slovenia-hungary,
+          croatia-hungary, croatia-serbia, croatia-bosnia-herzegovina, croatia-montenegro, hungary-slovakia, hungary-ukraine,
+          hungary-romania, hungary-serbia, slovakia-czech-republic, slovakia-poland, slovakia-ukraine, czech-republic-poland,
+          poland-lithuania, poland-belarus, poland-ukraine, lithuania-latvia, lithuania-belarus, latvia-estonia, latvia-belarus,
+          belarus-ukraine, ukraine-moldova, ukraine-romania, moldova-romania, romania-serbia, romania-bulgaria, bulgaria-serbia,
+          bulgaria-macedonia, bulgaria-greece, bulgaria-turkey, serbia-bosnia-herzegovina, serbia-montenegro, serbia-kosovo,
+          serbia-macedonia, bosnia-herzegovina-montenegro, montenegro-albania, montenegro-kosovo, albania-kosovo, albania-macedonia,
+          albania-greece, macedonia-kosovo, macedonia-greece, greece-turkey, turkey-georgia, spain-portugal, spain-andorra,
+          netherlands-belgium, belgium-luxembourg, denmark-sweden, sweden-norway, sweden-finland, norway-finland,
+          iceland, malta, cyprus, faroe-islands, isle-of-man, guernsey-jersey, great-britain, ireland-and-northern-ireland, monaco
+        ]
+    steps:
+      - name: Coppia richiesta?
+        id: want
+        env:
+          ONLY: ${{ inputs.only }}
+          PAIR: ${{ matrix.pair }}
+        run: |
+          if [ -z "$ONLY" ] || [[ ",$ONLY," == *",$PAIR,"* ]]; then echo "run=1" >> "$GITHUB_OUTPUT"; else echo "salto $PAIR"; fi
+      - uses: actions/checkout@v4
+        if: steps.want.outputs.run == '1'
+      - uses: actions/setup-java@v4
+        if: steps.want.outputs.run == '1'
+        with: {distribution: temurin, java-version: "17"}
+      - name: Grafi
+        if: steps.want.outputs.run == '1'
+        env:
+          PAIR: ${{ matrix.pair }}
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          # i nomi dei Paesi hanno trattini: le coppie note si separano qui
+          case "$PAIR" in
+            bosnia-herzegovina-montenegro) list="bosnia-herzegovina montenegro" ;;
+            croatia-bosnia-herzegovina) list="croatia bosnia-herzegovina" ;;
+            serbia-bosnia-herzegovina) list="serbia bosnia-herzegovina" ;;
+            austria-czech-republic) list="austria czech-republic" ;;
+            slovakia-czech-republic) list="slovakia czech-republic" ;;
+            czech-republic-poland) list="czech-republic poland" ;;
+            faroe-islands|isle-of-man|guernsey-jersey|great-britain|ireland-and-northern-ireland) list="$PAIR" ;;
+            *-*) list="${PAIR%%-*} ${PAIR#*-}" ;;
+            *) list="$PAIR" ;;
+          esac
+          spec=""
+          for c in $list; do
+            d=/mnt/grafi/$c
+            sudo mkdir -p "$d" && sudo chown "$USER" "$d"
+            curl -fsSL "https://github.com/francescobuzle-a11y/navmaster/releases/download/dati-$c/nm.tar.gz" | tar -xz -C "$d"
+            g=$(dirname "$(find "$d" -name profiles | head -1)")
+            echo "$c: $g ($(du -sh "$g" | cut -f1))"
+            spec="$spec${spec:+,}$c=$g"
+          done
+          echo "NM_CB=$spec" >> "$GITHUB_ENV"
+      - name: Prova
+        if: steps.want.outputs.run == '1'
+        env:
+          NM_CB_TRIPS: ${{ inputs.trips || '6' }}
+          NM_INTERNAL: ${{ inputs.internal || '12' }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :engine-core:test --tests it.navmaster.engine.api.CrossBorderRealReferenceTest -i 2>&1 | tee prova.log | grep -E "^\s{4}|PASSED|FAILED|BUILD" || true
+          grep -q "BUILD SUCCESSFUL" prova.log
+      - name: Registro
+        if: always() && steps.want.outputs.run == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: paese-${{ matrix.pair }}
+          path: prova.log
