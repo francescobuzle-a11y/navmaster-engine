@@ -9,7 +9,7 @@ import it.navmaster.engine.osm.OsmWay
  * `maxspeed:hgv*` hanno la precedenza, i valori `hgv/goods/bus/agricultural/forestry/delivery`
  * aprono l'accesso, e la priorità favorisce le grandi arterie.
  */
-class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumGradeLevel = 1)) : VehicleProfile(
+class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumGradeLevel = 1, useAcceleration = true, blockFords = false)) : VehicleProfile(
     options,
     HgvSpeedTables.highway, HgvSpeedTables.surface, HgvSpeedTables.trackType, HgvSpeedTables.countryMaxSpeeds,
 ) {

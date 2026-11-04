@@ -3,7 +3,7 @@ package it.navmaster.engine.profile
 import it.navmaster.engine.osm.OsmWay
 
 /** Profilo automobile (ORS `CarFlagEncoder`, encoder `car-ors`, profilo API `driving-car`). */
-class CarProfile(options: VehicleProfileOptions = VehicleProfileOptions()) : VehicleProfile(
+class CarProfile(options: VehicleProfileOptions = VehicleProfileOptions(useAcceleration = true, blockFords = false)) : VehicleProfile(
     options,
     CarSpeedTables.highway, CarSpeedTables.surface, CarSpeedTables.trackType, CarSpeedTables.countryMaxSpeeds,
 ) {

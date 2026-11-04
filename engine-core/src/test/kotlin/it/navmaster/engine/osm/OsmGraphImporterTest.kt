@@ -45,7 +45,8 @@ class OsmGraphImporterTest {
                 if (it.get(encoding.shared.roadClass) == RoadClass.MOTORWAY) {
                     motorways++
                     if (it.get(car.access)) {
-                        assertTrue(it.get(car.speed) >= 60.0, "autostrada lenta per l'auto: ${it.get(car.speed)}")
+                        // gli svincoli (motorway_link) hanno il modello di accelerazione di ORS: i tratti corti scendono
+                        if (it.distance >= 1000.0) assertTrue(it.get(car.speed) >= 60.0, "autostrada lenta per l'auto: ${it.get(car.speed)}")
                     }
                 }
                 if (it.get(car.access) && it.get(hgv.access) && it.get(hgv.speed) < it.get(car.speed)) truckSlowerSomewhere = true

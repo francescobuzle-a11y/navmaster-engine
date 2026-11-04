@@ -121,7 +121,9 @@ class HgvProfileTest {
         assertTrue(hgv.isBarrier(mapOf("barrier" to "gate"))) // blockBarriers=true
         assertFalse(HgvProfile(VehicleProfileOptions(blockBarriers = false)).isBarrier(mapOf("barrier" to "gate")))
         assertTrue(hgv.isBarrier(mapOf("barrier" to "gate", "access" to "no")))
-        assertTrue(hgv.isBarrier(mapOf("ford" to "yes")))
+        // i guadi: passabili come nei predefiniti di ORS (block_fords: false), bloccati con l'opzione
+        assertFalse(hgv.isBarrier(mapOf("ford" to "yes")))
+        assertTrue(HgvProfile(VehicleProfileOptions(blockFords = true)).isBarrier(mapOf("ford" to "yes")))
         assertFalse(car.isBarrier(mapOf("barrier" to "bollard", "motorcar" to "yes")))
         assertTrue(car.isBarrier(mapOf("barrier" to "bus_trap")))
     }

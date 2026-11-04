@@ -192,9 +192,9 @@ class Router(
      * search's path is taken even when it uses a road to avoid (an estimate, for choosing).
      */
     fun route(from: Snap, to: Snap, arrival: PathEdge? = null, fromHeading: Double = Double.NaN, toHeading: Double = Double.NaN,
-              maxWeight: Double = Double.POSITIVE_INFINITY, exact: Boolean = true): RoutePath {
+              maxWeight: Double = Double.POSITIVE_INFINITY, exact: Boolean = true, relaxDirection: Boolean = false): RoutePath {
         if (quick != null && quickAccepts != null) {
-            val p = try { quick.route(from, to, arrival, fromHeading, toHeading, maxWeight) } catch (e: RouteNotFoundException) { null }
+            val p = try { quick.route(from, to, arrival, fromHeading, toHeading, maxWeight, relaxDirection = relaxDirection) } catch (e: RouteNotFoundException) { null }
             if (p != null && (!exact || p.edges.all { e -> it.setEdge(e.edge, e.baseNode); quickAccepts.accept(it) })) return p
             // no path even without the filter (or none under the limit): none with it either
             if (p == null) throw RouteNotFoundException("Nessun percorso trovato fra i punti richiesti")
@@ -202,10 +202,15 @@ class Router(
         var fromParts = splitEdge(from, asTarget = false).map { penalised(it, from, fromHeading, asTarget = false) }
         val toParts = splitEdge(to, asTarget = true).map { penalised(it, to, toHeading, asTarget = true) }
         var best: RoutePath? = null
+        // continue_straight: si riparte nel verso d'arrivo; se così non c'è percorso (un vicolo cieco),
+        // [relaxDirection]: il verso opposto paga la penalità di direzione (300 s), come il pass_through
+        // di GraphHopper, invece di «nessun percorso»
         val keepDirection = arrival != null && from.position != SnapPosition.TOWER && arrival.edge == from.edge
-        if (keepDirection) {
+        if (keepDirection && !relaxDirection) {
             val same = fromParts.filter { part -> part.reverse == arrival!!.reverse }
             if (same.isNotEmpty()) fromParts = same
+        } else if (keepDirection) fromParts = fromParts.map { part ->
+            if (part.reverse == arrival!!.reverse) part else EdgePart(part.node, part.weight + HEADING_PENALTY, part.distance, part.millis, part.geometry, part.edge, part.reverse, part.snapEdge)
         }
 
         // caso speciale: stesso arco, tratto diretto fra i due punti
@@ -217,8 +222,9 @@ class Router(
                 val bad = (!fromHeading.isNaN() && angle(dir, fromHeading) > HEADING_TOLERANCE) || (!toHeading.isNaN() && angle(dir, toHeading) > HEADING_TOLERANCE)
                 if (bad) best = RoutePath(best.edges, best.distance, best.millis, best.weight + HEADING_PENALTY)
             }
-            // continue_straight: il tratto diretto vale solo se prosegue nel verso d'arrivo
-            if (keepDirection && best != null && best.edges.isNotEmpty() && best.edges[0].reverse != arrival!!.reverse) best = null
+            // continue_straight: il tratto diretto nel verso opposto a quello d'arrivo non vale (o paga la penalità)
+            if (keepDirection && best != null && best.edges.isNotEmpty() && best.edges[0].reverse != arrival!!.reverse)
+                best = if (relaxDirection) RoutePath(best.edges, best.distance, best.millis, best.weight + HEADING_PENALTY) else null
         }
 
         val sp = search(fromParts, toParts, maxWeight)
@@ -228,6 +234,7 @@ class Router(
             val candidate = assemble(sp, startPart, endPart)
             if (best == null || candidate.weight < best.weight) best = candidate
         }
+        if (best == null && keepDirection && !relaxDirection) return route(from, to, arrival, fromHeading, toHeading, maxWeight, exact, relaxDirection = true)
         return best ?: throw RouteNotFoundException("Nessun percorso trovato fra i punti richiesti")
     }
 
