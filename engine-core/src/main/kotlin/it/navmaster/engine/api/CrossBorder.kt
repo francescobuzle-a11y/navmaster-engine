@@ -611,6 +611,6 @@ class CrossBorderDirections(
         const val TRANSFER_RADIUS = 3.0
 
         /** Diagnostica: registra anche la scelta di un valico alla volta (con le sue ricerche) per confronto. */
-        @Volatile @JvmStatic var compareOneByOne = true
+        @Volatile @JvmStatic var compareOneByOne = false
     }
 }
