@@ -256,11 +256,35 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
     val routingGraph: RoutingGraph get() = graphs
 
     fun handle(request: DirectionsRequest, format: ResponseFormat): Map<String, Any?> {
-        val routeOptions = routeOptions(request)
+        val encoder = encoder(request)
+        val routes = routes(request)
+        val docs = routes.map { buildRoute(request, it, encoder) }
+        val all = BBox.empty()
+        for (d in docs) { all.include(d.bbox[1], d.bbox[0]); all.include(d.bbox[3], d.bbox[2]) }
+        val bboxArr = doubleArrayOf(r6(all.minLon), r6(all.minLat), r6(all.maxLon), r6(all.maxLat))
+        val metadata = metadata(request)
+        return when (format) {
+            ResponseFormat.JSON -> linkedMapOf("bbox" to bboxArr, "routes" to docs.map { it.json }, "metadata" to metadata)
+            ResponseFormat.GEOJSON -> linkedMapOf("type" to "FeatureCollection", "bbox" to bboxArr, "features" to docs.map { it.feature }, "metadata" to metadata)
+        }
+    }
+
+    /** L'encoder del profilo della richiesta (errore ORS se sconosciuto o assente da questo server). */
+    private fun encoder(request: DirectionsRequest): String {
         val encoder = try { graphs.encoderName(request.profile) } catch (e: IllegalArgumentException) {
             throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'profile' has incorrect value of '${request.profile}'.")
         }
         if (encoder !in graphs.profileNames) throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Profile '${request.profile}' is not available on this server.")
+        return encoder
+    }
+
+    /**
+     * I percorsi di una richiesta, quelli che [handle] mette nella risposta: convalida, aggancio dei
+     * punti, un tratto fra ogni coppia di punti (o le alternative). Errori come ORS ([ApiException]).
+     */
+    fun routes(request: DirectionsRequest): List<List<RoutePath>> {
+        val routeOptions = routeOptions(request)
+        encoder(request)
         if (request.coordinates.size > limits.maximumWaypoints) throw ApiException(400, RoutingErrorCodes.REQUEST_EXCEEDS_SERVER_LIMIT, "The specified number of waypoints must not be greater than ${limits.maximumWaypoints}.")
         var beeline = 0.0
         for (i in 1 until request.coordinates.size) {
@@ -303,15 +327,7 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
             }
             routes += legs
         }
-        val docs = routes.map { buildRoute(request, it, encoder) }
-        val all = BBox.empty()
-        for (d in docs) { all.include(d.bbox[1], d.bbox[0]); all.include(d.bbox[3], d.bbox[2]) }
-        val bboxArr = doubleArrayOf(r6(all.minLon), r6(all.minLat), r6(all.maxLon), r6(all.maxLat))
-        val metadata = metadata(request)
-        return when (format) {
-            ResponseFormat.JSON -> linkedMapOf("bbox" to bboxArr, "routes" to docs.map { it.json }, "metadata" to metadata)
-            ResponseFormat.GEOJSON -> linkedMapOf("type" to "FeatureCollection", "bbox" to bboxArr, "features" to docs.map { it.feature }, "metadata" to metadata)
-        }
+        return routes
     }
 
     /** Un percorso nelle due forme (oggetto `routes[i]` del JSON, `features[i]` del GeoJSON) e il suo bbox. */

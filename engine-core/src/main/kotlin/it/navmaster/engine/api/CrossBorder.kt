@@ -160,6 +160,8 @@ class CrossBorderDirections(
     /** Il peso del viaggio scelto all'ultimo confine e i suoi valichi (diagnostica, prove). */
     internal var lastWeight = Double.NaN; private set
     internal var lastCrossings: List<Transfer> = emptyList(); private set
+    /** I pezzi dell'ultimo viaggio tra Paesi: il grafo e la richiesta di ciascuno (prove). */
+    internal var lastPieces: List<Pair<CountryGraph, DirectionsRequest>> = emptyList(); private set
 
     /** Un pezzo del viaggio dentro un grafo: i suoi punti (le tappe e i passaggi di confine). */
     private class Piece(val graph: CountryGraph, val points: MutableList<Pair<Double, Double>>, val radiuses: MutableList<Double>,
@@ -181,9 +183,26 @@ class CrossBorderDirections(
             g.graph.router(if (o.maximumSpeed.isFinite() && o.maximumSpeed >= DirectionsRequest.MAXIMUM_SPEED_LOWER_BOUND) o.copy(maximumSpeedTimeOnly = true) else o)
         }
 
-        /** L'aggancio di un punto ([exact]: un passaggio di confine, senza il controllo delle reti isolate). */
-        fun snap(g: CountryGraph, p: LL, radius: Double, exact: Boolean = radius == TRANSFER_RADIUS): Snap? = snaps.getOrPut("${g.id}:${p.lat}:${p.lon}:$radius") {
-            try { router(g).snap(p.lat, p.lon, radius, 0, checkNetwork = !exact) } catch (e: PointNotFoundException) { null }
+        /**
+         * L'aggancio di un punto come lo fa il pezzo finale ([exact]: un passaggio di confine, senza il
+         * controllo delle reti isolate; [heading]: ORS `bearings`).
+         */
+        fun snap(g: CountryGraph, p: LL, radius: Double, exact: Boolean = radius == TRANSFER_RADIUS, heading: Double = Double.NaN): Snap? =
+            snaps.getOrPut("${g.id}:${p.lat}:${p.lon}:$radius:$exact:$heading") {
+                try { router(g).snap(p.lat, p.lon, radius, 0, checkNetwork = !exact, heading = heading) } catch (e: PointNotFoundException) { null }
+            }
+
+        /**
+         * Il peso di un pezzo come lo calcola il percorso finale ([DirectionsService.routes] con tutte le
+         * impostazioni della richiesta); +∞ quando non c'è percorso.
+         */
+        fun pieceWeight(g: CountryGraph, piece: DirectionsRequest): Double {
+            queries++
+            val t0 = System.currentTimeMillis()
+            val w = try { g.service.routes(piece).single().sumOf { it.weight } } catch (e: ApiException) { Double.POSITIVE_INFINITY }
+            val ms = System.currentTimeMillis() - t0
+            if (ms > 300) log?.invoke("    pezzo ${g.id} ${if (w.isFinite()) "%.0f".format(w) else "∞"} in $ms ms")
+            return w
         }
 
         /** The weight from [a] to [b] in [g], or +∞ when there is no path lighter than [limit]. */
@@ -229,7 +248,10 @@ class CrossBorderDirections(
         var cur = Piece(of[0], mutableListOf(request.coordinates[0]), mutableListOf(radius(0)), bearings = mutableListOf(request.bearings?.getOrNull(0)))
         for (i in 1 until pts.size) {
             if (of[i] !== cur.graph) {
-                val chain = chain(ctx, pts[i - 1], radius(i - 1), cur.graph, pts[i], radius(i), of[i])
+                // i punti dopo il confine nello stesso grafo (il pezzo che comincia al valico)
+                var end = i
+                while (end + 1 < pts.size && of[end + 1] === of[i]) end++
+                val chain = chain(ctx, cur, i..end, radius, of[i])
                     ?: throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points ${i - 1} (%.7f %.7f) and $i (%.7f %.7f).".format(
                         pts[i - 1].lon, pts[i - 1].lat, pts[i].lon, pts[i].lat))
                 for ((t, next) in chain) {
@@ -241,8 +263,10 @@ class CrossBorderDirections(
             cur.points += request.coordinates[i]; cur.radiuses += radius(i); cur.exact += false; cur.bearings += request.bearings?.getOrNull(i)
         }
         pieces += cur
-        val docs = pieces.map { p ->
-            val r = p.graph.service.handle(request.withPoints(p.points, p.radiuses.toDoubleArray(), p.exact.toBooleanArray(), p.bearings), ResponseFormat.GEOJSON)
+        val pieceRequests = pieces.map { p -> p.graph to request.withPoints(p.points, p.radiuses.toDoubleArray(), p.exact.toBooleanArray(), p.bearings) }
+        lastPieces = pieceRequests
+        val docs = pieceRequests.map { (g, r0) ->
+            val r = g.service.handle(r0, ResponseFormat.GEOJSON)
             @Suppress("UNCHECKED_CAST")
             (r["features"] as List<Map<String, Any?>>).first()
         }
@@ -313,12 +337,15 @@ class CrossBorderDirections(
      * I passaggi di confine del percorso migliore da p (grafo [ga]) a q (grafo [gb]), con il grafo
      * in cui si entra a ciascuno; null quando nessuna sequenza di Paesi ha un percorso.
      */
-    private fun chain(ctx: Ctx, p: LL, rp: Double, ga: CountryGraph, q: LL, rq: Double, gb: CountryGraph, together: Boolean = oneSearch): List<Pair<Transfer, CountryGraph>>? {
+    private fun chain(ctx: Ctx, prefix: Piece, suffix: IntRange, radius: (Int) -> Double, gb: CountryGraph, together: Boolean = oneSearch): List<Pair<Transfer, CountryGraph>>? {
+        val ga = prefix.graph
+        val p = prefix.points.last().let { LL(it.first, it.second) }; val rp = prefix.radiuses.last()
+        val q = ctx.request.coordinates[suffix.first].let { LL(it.first, it.second) }; val rq = radius(suffix.first)
         if (together && compareOneByOne && log != null) {
             // diagnostica: la scelta di un valico alla volta, con ricerche sue, per confronto
             val t0 = System.currentTimeMillis()
             val c2 = Ctx(ctx.request)
-            val other = chain(c2, p, rp, ga, q, rq, gb, together = false)
+            val other = chain(c2, prefix, suffix, radius, gb, together = false)
             log.invoke("  confronto, un valico alla volta: ${other?.joinToString { "%.5f,%.5f".format(it.first.lat, it.first.lon) } ?: "nessuno"} peso ${"%.0f".format(lastWeight)}, ${c2.queries} ricerche, ${System.currentTimeMillis() - t0} ms")
         }
         var best = Double.POSITIVE_INFINITY
@@ -335,12 +362,14 @@ class CrossBorderDirections(
                     // il passaggio deve essere percorribile dal mezzo in entrambi i grafi
                     .map { pl -> pl.filter { t -> LL(t.lat, t.lon).let { ctx.snap(from, it, TRANSFER_RADIUS) != null && ctx.snap(to, it, TRANSFER_RADIUS) != null } } }
                     .filter { it.isNotEmpty() }
-                val cands = places.flatten()
-                log?.invoke("  ${path.joinToString("-") { it.id }} confine ${from.id}/${to.id}: ${cands.size} candidati in ${places.size} luoghi")
+                // due Paesi: tutti i passaggi (anche uno alla volta: senza core la ricerca è la CH, rapida); in transito i candidati
+                val cands = if (path.size == 2) transfers(from, to).filter { t -> LL(t.lat, t.lon).let { ctx.snap(from, it, TRANSFER_RADIUS) != null && ctx.snap(to, it, TRANSFER_RADIUS) != null } }
+                    else places.flatten()
+                log?.invoke("  ${path.joinToString("-") { it.id }} confine ${from.id}/${to.id}: ${cands.size} candidati${if (path.size > 2) " in ${places.size} luoghi" else ""}")
                 if (cands.isEmpty()) { ok = false; break }
-                // due Paesi: il valico con una ricerca per lato (sotto, uno alla volta quando non si può)
+                // due Paesi: fra tutti i passaggi del confine, pesati come i pezzi finali (sotto, uno alla volta quando non si può)
                 if (path.size == 2 && together) {
-                    val c = chooseTogether(ctx, p, rp, from, q, rq, to, places, best)
+                    val c = chooseExact(ctx, prefix, suffix, radius, to, cands, best)
                     if (c != null) {
                         if (c.weight < best && c.transfer != null) { best = c.weight; bestChain = listOf(c.transfer to to) }
                         ok = false; break
@@ -356,8 +385,12 @@ class CrossBorderDirections(
                         // two countries: the whole trip through this crossing at once, so that the
                         // next crossings are looked for under its weight
                         if (path.size == 2 && w.isFinite()) {
+                            // the weights of the search are a lower bound: the whole trip weighed as the final pieces
                             val total = w + ctx.weight(path[1], tl, TRANSFER_RADIUS, q, rq, best - w)
-                            if (total < best) { best = total; bestChain = listOf(t to path[1]) }
+                            if (total < best) {
+                                val exact = exactChain(ctx, prefix, suffix, radius, path, listOf(t))
+                                if (exact < best) { best = exact; bestChain = listOf(t to path[1]) }
+                            }
                             continue
                         }
                     } else for ((pt, pw, pc) in layer) {
@@ -377,78 +410,108 @@ class CrossBorderDirections(
             for ((t, w, via) in layer) {
                 if (w >= best) continue
                 val total = w + ctx.weight(last, LL(t.lat, t.lon), TRANSFER_RADIUS, q, rq, best - w)
-                if (total < best) { best = total; bestChain = via.mapIndexed { i, tr -> tr to path[i + 1] } }
+                if (total >= best) continue
+                // come sopra: il viaggio pesato come i pezzi finali
+                val exact = exactChain(ctx, prefix, suffix, radius, path, via)
+                if (exact < best) { best = exact; bestChain = via.mapIndexed { i, tr -> tr to path[i + 1] } }
             }
         }
         lastWeight = best; lastCrossings = bestChain?.map { it.first }.orEmpty()
         return bestChain
     }
 
+    /**
+     * Il peso del viaggio attraverso i passaggi [via] lungo la sequenza di Paesi [path], come i pezzi
+     * finali: il pezzo prima del primo confine, quelli nei Paesi di transito, quello dopo l'ultimo.
+     */
+    private fun exactChain(ctx: Ctx, prefix: Piece, suffix: IntRange, radius: (Int) -> Double, path: List<CountryGraph>, via: List<Transfer>): Double {
+        val request = ctx.request
+        var w = ctx.pieceWeight(path[0], request.withPoints(prefix.points + (via[0].lat to via[0].lon), (prefix.radiuses + TRANSFER_RADIUS).toDoubleArray(),
+            (prefix.exact + true).toBooleanArray(), prefix.bearings + null))
+        for (k in 1 until via.size) {
+            if (w.isInfinite()) return w
+            w += ctx.pieceWeight(path[k], request.withPoints(listOf(via[k - 1].lat to via[k - 1].lon, via[k].lat to via[k].lon),
+                doubleArrayOf(TRANSFER_RADIUS, TRANSFER_RADIUS), booleanArrayOf(true, true), null))
+        }
+        if (w.isInfinite()) return w
+        val t = via.last()
+        return w + ctx.pieceWeight(path.last(), request.withPoints(listOf(t.lat to t.lon) + suffix.map { request.coordinates[it] },
+            (listOf(TRANSFER_RADIUS) + suffix.map { radius(it) }).toDoubleArray(), (listOf(true) + suffix.map { false }).toBooleanArray(),
+            listOf<Double?>(null) + suffix.map { request.bearings?.getOrNull(it) }))
+    }
+
     /** Il valico scelto e il peso del viaggio intero che ci passa (+∞ senza). */
     private class Choice(val weight: Double, val transfer: Transfer?)
 
     /**
-     * Il valico migliore fra due Paesi senza due ricerche per valico. Per ogni valico un limite
-     * inferiore del peso su entrambi i lati, subito dai landmark ([Router.manyToOne], senza ricerca);
-     * dal lato in cui il capo del viaggio è più vicino al confine una ricerca sola dà poi i pesi veri
-     * di tutti i valichi, in ordine di peso e solo fin dove serve. I valichi si provano in ordine di
-     * limite del viaggio intero: dal lato lontano una ricerca normale fino al valico, col limite del
-     * viaggio migliore trovato; quando il limite del valico successivo supera il viaggio migliore,
-     * nessun altro valico può batterlo. Null quando i router non cercano sul core: un valico alla volta.
+     * Il valico migliore fra due Paesi, esatto: fra tutti i passaggi del confine quello col peso
+     * minimo del viaggio, ogni pezzo pesato come il percorso finale (avoid_features, maximum_speed,
+     * bearings, tappe, continue_straight: [Ctx.pieceWeight]). Per non pesarli tutti, un limite
+     * inferiore per ognuno su entrambi i lati: la ricerca sul core senza avoid_features né limite di
+     * velocità e senza direzioni ([Router.manyToOne]) — togliere strade, rallentarle o vincolare una
+     * direzione può solo aumentare un peso. Dal lato vicino al confine una ricerca sola dà i limiti
+     * dal suo capo a tutti i passaggi, in ordine e solo fin dove serve; dal lato lontano i landmark.
+     * I passaggi si pesano in ordine di limite del viaggio intero, prima il lato vicino (costa poco),
+     * finché il limite del successivo non supera il viaggio migliore: nessun altro può batterlo.
+     * Null quando i router non cercano sul core: allora un valico alla volta.
      */
-    private fun chooseTogether(ctx: Ctx, p: LL, rp: Double, ga: CountryGraph, q: LL, rq: Double, gb: CountryGraph, places: List<List<Transfer>>, limit: Double): Choice? {
+    private fun chooseExact(ctx: Ctx, prefix: Piece, suffix: IntRange, radius: (Int) -> Double, gb: CountryGraph, cands: List<Transfer>, limit: Double): Choice? {
         val none = Choice(Double.POSITIVE_INFINITY, null)
-        val cands = places.flatten()
-        // il luogo di ogni punto e quelli prima di lui nel suo luogo (più importanti)
-        val before = ArrayList<IntRange>(cands.size)
-        run { var start = 0; for (pl in places) { for (k in pl.indices) before += start until start + k; start += pl.size } }
-        val sp = ctx.snap(ga, p, rp) ?: return none
-        val sq = ctx.snap(gb, q, rq) ?: return none
-        // i candidati sono agganciati in entrambi i grafi (filtrati da chain)
+        if (cands.isEmpty()) return none
+        val ga = prefix.graph
+        val request = ctx.request
+        // i capi del viaggio vicino al confine, agganciati come nei pezzi finali
+        val pl = prefix.points.last()
+        val sp = ctx.snap(ga, LL(pl.first, pl.second), prefix.radiuses.last(), prefix.exact.last(), prefix.bearings.last() ?: Double.NaN) ?: return none
+        val qi = suffix.first
+        val sq = ctx.snap(gb, LL(request.coordinates[qi].first, request.coordinates[qi].second), radius(qi), false, request.bearings?.getOrNull(qi) ?: Double.NaN) ?: return none
         val inA = cands.map { ctx.snap(ga, LL(it.lat, it.lon), TRANSFER_RADIUS)!! }
         val inB = cands.map { ctx.snap(gb, LL(it.lat, it.lon), TRANSFER_RADIUS)!! }
-        // il lato vicino: il capo più vicino ai suoi valichi
-        val nearA = cands.minOf { DistanceCalc.haversine(p.lat, p.lon, it.lat, it.lon) }
-        val nearB = cands.minOf { DistanceCalc.haversine(it.lat, it.lon, q.lat, q.lon) }
+        // i pezzi finali con il passaggio t: prima del confine i punti del pezzo più t, dopo t più i punti nel grafo seguente
+        fun pieceA(t: Transfer) = request.withPoints(prefix.points + (t.lat to t.lon), (prefix.radiuses + TRANSFER_RADIUS).toDoubleArray(),
+            (prefix.exact + true).toBooleanArray(), prefix.bearings + null)
+        fun pieceB(t: Transfer) = request.withPoints(listOf(t.lat to t.lon) + suffix.map { request.coordinates[it] },
+            (listOf(TRANSFER_RADIUS) + suffix.map { radius(it) }).toDoubleArray(), (listOf(true) + suffix.map { false }).toBooleanArray(),
+            listOf<Double?>(null) + suffix.map { request.bearings?.getOrNull(it) })
+        // il lato vicino: il capo più vicino ai suoi passaggi
+        val nearA = cands.minOf { DistanceCalc.haversine(sp.queryLat, sp.queryLon, it.lat, it.lon) }
+        val nearB = cands.minOf { DistanceCalc.haversine(it.lat, it.lon, sq.queryLat, sq.queryLon) }
         val shortIsB = nearB <= nearA
         val near = if (shortIsB) gb else ga; val far = if (shortIsB) ga else gb
+        fun nearPiece(t: Transfer) = if (shortIsB) pieceB(t) else pieceA(t)
+        fun farPiece(t: Transfer) = if (shortIsB) pieceA(t) else pieceB(t)
         val t0 = System.currentTimeMillis()
         val mNear = (if (shortIsB) ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true) else ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false)) ?: return null
         val mFar = (if (shortIsB) ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false) else ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true)) ?: return null
-        ctx.queries += 2
         val farBounds = DoubleArray(cands.size) { mFar.lowerBound(it) }
+        val nearWeight = DoubleArray(cands.size) { Double.NaN }
         val farWeight = DoubleArray(cands.size) { Double.NaN }
-        // un punto che non si raggiunge da un lato (o non batte il viaggio migliore): vale il successivo del suo luogo
-        val failed = BooleanArray(cands.size)
-        var best = limit; var bestI = -1; var farMs = 0L; var searches = 0
+        var best = limit; var bestI = -1; var nearCount = 0; var farCount = 0; var farMs = 0L
         while (true) {
-            for (j in cands.indices) if (!failed[j] && farWeight[j].isNaN() && (farBounds[j].isInfinite() || mNear.lowerBound(j).isInfinite())) failed[j] = true
-            // il valico col limite più basso del viaggio intero, non ancora cercato dal lato lontano: in ogni
-            // luogo il punto più importante fra quelli non falliti
+            // il passaggio col limite più basso del viaggio intero, non ancora pesato dal lato lontano
             var i = -1; var key = Double.POSITIVE_INFINITY
-            for (j in cands.indices) if (farWeight[j].isNaN() && !failed[j] && before[j].all { failed[it] }) {
-                val k = farBounds[j] + mNear.lowerBound(j)
+            for (j in cands.indices) if (farWeight[j].isNaN()) {
+                val k = farBounds[j] + if (nearWeight[j].isNaN()) mNear.lowerBound(j) else nearWeight[j]
                 if (k < key) { key = k; i = j }
             }
             if (i < 0 || key >= best) break
-            if (!mNear.isFinal(i)) {
-                // il suo peso vero dal lato vicino, o finché il limite non lo mette dopo un altro
-                mNear.advance { mNear.isFinal(i) || farBounds[i] + mNear.lowerBound(i) > key }
+            if (nearWeight[i].isNaN()) {
+                // prima il limite vero del lato vicino (la sua ricerca va avanti solo fin lì), poi il pezzo
+                if (!mNear.isFinal(i)) { mNear.advance { mNear.isFinal(i) || farBounds[i] + mNear.lowerBound(i) > key }; continue }
+                nearWeight[i] = ctx.pieceWeight(near, nearPiece(cands[i])); nearCount++
                 continue
             }
-            val b = mNear.weight(i)
-            val tl = LL(cands[i].lat, cands[i].lon)
             val t1 = System.currentTimeMillis()
-            val f = if (shortIsB) ctx.weight(ga, p, rp, tl, TRANSFER_RADIUS, best - b) else ctx.weight(gb, tl, TRANSFER_RADIUS, q, rq, best - b)
-            farMs += System.currentTimeMillis() - t1; searches++
-            farWeight[i] = f
-            if (f.isInfinite()) failed[i] = true
-            if (f + b < best) { best = f + b; bestI = i }
+            farWeight[i] = ctx.pieceWeight(far, farPiece(cands[i])); farCount++
+            farMs += System.currentTimeMillis() - t1
+            val total = nearWeight[i] + farWeight[i]
+            if (total < best) { best = total; bestI = i }
         }
-        log?.invoke("    valico scelto: ${if (bestI < 0) "nessuno" else "%.5f,%.5f peso %.0f".format(cands[bestI].lat, cands[bestI].lon, best)}; " +
-            "lato vicino ${near.id} ${mNear.stats}; lato lontano ${far.id} $searches ricerche $farMs ms; in tutto ${System.currentTimeMillis() - t0} ms")
+        log?.invoke("    valico scelto: ${if (bestI < 0) "nessuno" else "%.5f,%.5f peso %.0f".format(cands[bestI].lat, cands[bestI].lon, best)} fra ${cands.size} passaggi; " +
+            "lato vicino ${near.id} ${mNear.stats}, $nearCount pezzi; lato lontano ${far.id} $farCount pezzi in $farMs ms; in tutto ${System.currentTimeMillis() - t0} ms")
         fun w(x: Double) = if (x.isFinite()) "%.0f".format(x) else "∞"
-        for ((j, t) in cands.withIndex()) log?.invoke("      ${if (before[j].isEmpty()) "luogo" else "  …  "} %.5f,%.5f r${t.rank}: ${near.id} ${if (mNear.isFinal(j)) w(mNear.weight(j)) else "≥" + w(mNear.lowerBound(j))}, ${far.id} ${if (farWeight[j].isNaN()) "≥" + w(farBounds[j]) else w(farWeight[j])}".format(t.lat, t.lon))
+        for ((j, t) in cands.withIndex()) if (!nearWeight[j].isNaN() || !farWeight[j].isNaN() || mNear.lowerBound(j) + farBounds[j] < best + 600)
+            log?.invoke("      %.5f,%.5f r${t.rank}: ${near.id} ${if (nearWeight[j].isNaN()) "≥" + w(mNear.lowerBound(j)) else w(nearWeight[j])}, ${far.id} ${if (farWeight[j].isNaN()) "≥" + w(farBounds[j]) else w(farWeight[j])}".format(t.lat, t.lon))
         return if (bestI < 0) none else Choice(best, cands[bestI])
     }
 
