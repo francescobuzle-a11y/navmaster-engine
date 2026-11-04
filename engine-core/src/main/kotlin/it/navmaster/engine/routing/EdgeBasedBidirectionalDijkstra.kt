@@ -149,14 +149,24 @@ class EdgeBasedBidirectionalDijkstra(
         if (total < bestWeight) { bestWeight = total; meetingKey = key; meetingNode = -1 }
     }
 
+    /**
+     * Il percorso migliore. Può ripercorrere un arco nel verso opposto: con le inversioni a U
+     * vietate il mezzo che deve tornare indietro gira intorno a un isolato e ripassa sulla stessa
+     * strada (come in GraphHopper/ORS). Non è un anello da scartare: è il percorso legale più
+     * leggero, e [run] ne ha già trovato il peso.
+     */
     fun extractPath(): SearchPath? {
         if (meetingNode >= 0 && meetingKey < 0) return SearchPath(intArrayOf(meetingNode), IntArray(0), bestWeight)
         if (meetingKey < 0) return null
-        return pathVia(meetingKey)
+        return pathVia(meetingKey, allowRepeatedEdges = true)
     }
 
-    /** Il percorso che passa per la chiave [viaKey] (raggiunta da entrambe le direzioni): catena avanti fino a essa, poi catena indietro. */
-    fun pathVia(viaKey: Int): SearchPath? {
+    /**
+     * Il percorso che passa per la chiave [viaKey] (raggiunta da entrambe le direzioni): catena avanti
+     * fino a essa, poi catena indietro. Senza [allowRepeatedEdges] (le alternative) un percorso in cui
+     * la catena indietro ripassa su un arco già percorso è un anello: null.
+     */
+    fun pathVia(viaKey: Int, allowRepeatedEdges: Boolean = false): SearchPath? {
         if (!fwd.weight.containsKey(viaKey) || !bwd.weight.containsKey(viaKey)) return null
         val edges = ArrayList<Int>(); val nodes = ArrayList<Int>()
         // all'indietro lungo la catena avanti: ogni chiave → arco; parentNode della prima voce è il nodo sorgente
@@ -177,10 +187,10 @@ class EdgeBasedBidirectionalDijkstra(
         // poi in avanti lungo la catena indietro, saltando l'arco d'incontro già incluso
         k = bwd.parentNode.getOrDefault(viaKey, Int.MIN_VALUE)
         var pe = bwd.parentEdge.getOrDefault(viaKey, -1)
-        val seen = IntHashSet(edges.size).also { s -> edges.forEach { s.add(it) } }
+        val seen = if (allowRepeatedEdges) null else IntHashSet(edges.size).also { s -> edges.forEach { s.add(it) } }
         while (pe >= 0 && k != Int.MIN_VALUE) {
             val e = k ushr 1
-            if (!seen.add(e)) return null // un anello: scartato
+            if (seen != null && !seen.add(e)) return null // un anello: scartato
             edges.add(e)
             n = if (graph.nodeA(e) == n) graph.nodeB(e) else graph.nodeA(e)
             nodeList.add(n)
