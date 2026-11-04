@@ -1,0 +1,112 @@
+# Confronto fianco a fianco tra openrouteservice vero (immagine Docker ufficiale) e navmaster-engine
+# sullo stesso estratto (data/heidelberg.test.pbf): le stesse richieste a entrambi, rapporto per caso.
+# Vedi tools/confronto-ors/confronta.py per i casi e le misure.
+name: Confronto con openrouteservice
+
+on:
+  workflow_dispatch:
+    inputs:
+      requests:
+        description: "Richieste per caso"
+        default: "30"
+      seed:
+        description: "Seme casuale"
+        default: "42"
+      cases:
+        description: "Casi separati da virgola (vuoto = tutti; vedi CASES in confronta.py)"
+        default: ""
+
+jobs:
+  confronto:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # La sorgente ORS di riferimento è 10.2.0-SNAPSHOT (nessun tag Docker): si usa l'ultima
+      # versione pubblicata, v10.1.0 (CHANGELOG 2026-10-13), tag esistente su Docker Hub.
+      ORS_IMAGE: openrouteservice/openrouteservice:v10.1.0
+      ORS_URL: http://localhost:8080
+      ENGINE_URL: http://localhost:8082
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      # ORS parte subito e costruisce i suoi grafi mentre noi compiliamo il motore.
+      # La cartella ors-run è montata come /home/ors: l'entrypoint usa config/ors-config.yml se c'è,
+      # scrive grafi e registri lì (l'utente del contenitore è 1001, perciò i permessi larghi).
+      - name: Avvio di openrouteservice
+        run: |
+          set -euo pipefail
+          mkdir -p ors-run/config ors-run/files ors-run/graphs ors-run/logs ors-run/elevation_cache
+          cp tools/confronto-ors/ors-config.yml ors-run/config/ors-config.yml
+          cp data/heidelberg.test.pbf ors-run/files/heidelberg.test.pbf
+          chmod -R a+rwX ors-run
+          docker pull -q "$ORS_IMAGE"
+          docker run -d --name ors -p 8080:8082 \
+            -v "$PWD/ors-run:/home/ors" \
+            -e REBUILD_GRAPHS=True -e XMS=1g -e XMX=3g -e CONTAINER_LOG_LEVEL=INFO \
+            "$ORS_IMAGE"
+
+      - name: Compilazione del motore e grafo di Heidelberg
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon -q :engine-server:installDist :engine-cli:installDist
+          engine-cli/build/install/engine-cli/bin/engine-cli import data/heidelberg.test.pbf graphs/heidelberg --profiles=car,hgv | tee import.log
+
+      - name: Avvio del motore
+        run: |
+          set -euo pipefail
+          nohup engine-server/build/install/engine-server/bin/engine-server --graph=graphs/heidelberg --port=8082 > engine.log 2>&1 &
+          echo $! > engine.pid
+
+      - name: Attesa dei due server
+        run: |
+          set -uo pipefail
+          pronto() { curl -fs "$1/ors/v2/health" 2>/dev/null | grep -Eq '"status" *: *"ready"'; }
+          for i in $(seq 1 180); do
+            o=0; e=0
+            pronto "$ORS_URL" && o=1
+            pronto "$ENGINE_URL" && e=1
+            if [ $o = 1 ] && [ $e = 1 ]; then echo "pronti dopo $((i*10)) s"; exit 0; fi
+            if ! docker ps -q --filter name=ors --filter status=running | grep -q .; then
+              echo "il contenitore ORS si è fermato"; docker logs ors | tail -100; exit 1
+            fi
+            if ! kill -0 "$(cat engine.pid)" 2>/dev/null; then echo "il motore si è fermato"; tail -50 engine.log; exit 1; fi
+            [ $((i % 6)) = 0 ] && echo "attendo… ORS=$o motore=$e ($((i*10)) s)"
+            sleep 10
+          done
+          echo "tempo scaduto: ORS=$o motore=$e"; docker logs ors | tail -100; tail -50 engine.log; exit 1
+
+      - name: Confronto
+        env:
+          N: ${{ inputs.requests || '30' }}
+          SEED: ${{ inputs.seed || '42' }}
+          CASES: ${{ inputs.cases }}
+        run: |
+          set -euo pipefail
+          python3 tools/confronto-ors/confronta.py --ors "$ORS_URL" --engine "$ENGINE_URL" \
+            --n "$N" --seed "$SEED" --cases "$CASES" --out confronto-out | tee confronto.log
+          cat confronto-out/rapporto.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostica
+        if: failure()
+        run: |
+          echo "=== ORS ==="; docker logs ors 2>&1 | tail -200 || true
+          echo "=== motore ==="; tail -100 engine.log || true
+
+      - name: Artefatti
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: confronto-ors-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            confronto-out/
+            confronto.log
+            import.log
+            engine.log
+            ors-run/logs/

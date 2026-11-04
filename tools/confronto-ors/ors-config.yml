@@ -1,0 +1,100 @@
+# Configurazione minima di openrouteservice per il confronto con navmaster-engine sullo stesso
+# estratto (data/heidelberg.test.pbf). Montata in /home/ors/config/ors-config.yml nel contenitore
+# ufficiale openrouteservice/openrouteservice; l'entrypoint la usa se esiste in quel percorso.
+#
+# Le chiavi seguono l'esempio ors-config.yml della sorgente ORS 10.x (sezione commentata
+# "ors.engine.profiles"); gli ext_storages senza valore sono voluti (sono mappe vuote).
+ors:
+  endpoints:
+    routing:
+      enabled: true
+      maximum_alternative_routes: 3
+  engine:
+    init_threads: 1
+    profile_default:
+      graph_path: /home/ors/graphs
+      build:
+        source_file: /home/ors/files/heidelberg.test.pbf
+        # niente quota: il motore nostro non la usa e così ORS non scarica le tessere SRTM in CI
+        elevation: false
+        instructions: true
+        preparation:
+          min_network_size: 200
+      service:
+        # l'estratto è piccolo; limiti larghi perché nessuna richiesta sia rifiutata per lunghezza
+        maximum_distance: 1000000
+        maximum_distance_dynamic_weights: 1000000
+        maximum_distance_avoid_areas: 1000000
+        maximum_distance_alternative_routes: 1000000
+        maximum_distance_round_trip_routes: 1000000
+        maximum_waypoints: 50
+        maximum_snapping_radius: 400
+        maximum_visited_nodes: 1000000
+    profiles:
+      driving-car:
+        enabled: true
+        encoder_name: driving-car
+        build:
+          encoder_options:
+            turn_costs: true
+            block_fords: false
+            use_acceleration: true
+          preparation:
+            min_network_size: 200
+            methods:
+              ch:
+                enabled: true
+                threads: 1
+                weightings: fastest
+              lm:
+                enabled: false
+              core:
+                enabled: true
+                threads: 1
+                weightings: fastest,shortest
+                landmarks: 64
+                lmsets: highways;allow_all
+          ext_storages:
+            WayCategory:
+            HeavyVehicle:
+            Tollways:
+            WaySurfaceType:
+        service:
+          execution:
+            methods:
+              core:
+                active_landmarks: 6
+      driving-hgv:
+        enabled: true
+        encoder_name: driving-hgv
+        build:
+          encoder_options:
+            turn_costs: true
+            block_fords: false
+            use_acceleration: true
+          preparation:
+            min_network_size: 200
+            methods:
+              ch:
+                enabled: true
+                threads: 1
+                weightings: recommended
+              lm:
+                enabled: false
+              core:
+                enabled: true
+                threads: 1
+                weightings: recommended,shortest
+                landmarks: 64
+                lmsets: highways;allow_all
+          ext_storages:
+            WayCategory:
+            HeavyVehicle:
+              restrictions: true
+            Tollways:
+            WaySurfaceType:
+        service:
+          execution:
+            methods:
+              core:
+                active_landmarks: 6
