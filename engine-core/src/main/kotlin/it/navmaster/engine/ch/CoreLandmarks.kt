@@ -141,7 +141,7 @@ class CoreLandmarks private constructor(
          * Prepara [count] landmark scegliendo ogni volta il nodo del core più lontano da quelli già scelti
          * (selezione "farthest" di GraphHopper), poi calcola le distanze in entrambi i versi.
          */
-        fun prepare(ch: CHGraph, weighting: Weighting, count: Int = 16, log: ((String) -> Unit)? = null): CoreLandmarks {
+        fun prepare(ch: CHGraph, weighting: Weighting, count: Int = 16, log: ((String) -> Unit)? = null, seed: Long = 123): CoreLandmarks {
             val base = ch.base; val storage = ch.storage
             val n = base.nodeCount
             val coreLevel = n
@@ -172,19 +172,36 @@ class CoreLandmarks private constructor(
                     }
                 }
             }
-            // primo landmark: il nodo del core più lontano da un nodo del core casuale
-            val rnd = Random(123)
-            var start = rnd.nextInt(n)
-            while (coreIndex[start] < 0) start = (start + 1) % n
+            // la parte principale del core: da un nodo casuale si può finire in una zona chiusa (sensi
+            // unici, restrizioni) da cui si raggiunge poco; allora tutti i landmark starebbero lì e le
+            // distanze sarebbero infinite per il resto (limiti nulli). Fra alcuni nodi a caso quello che
+            // raggiunge ed è raggiunto dalla parte più grande; i landmark solo in quella parte
+            val rnd = Random(seed)
+            val coreNodes = IntArray(coreCount).also { a -> var c = 0; for (v in 0 until n) if (coreIndex[v] >= 0) a[c++] = v }
+            var start = coreNodes[0]; var main = java.util.BitSet(n); var mainSize = -1
+            for (attempt in 0 until 12) {
+                val s = coreNodes[rnd.nextInt(coreCount)]
+                explore(s, false, dist)
+                val reached = java.util.BitSet(n)
+                for (v in coreNodes) if (dist[v].isFinite()) reached.set(v)
+                explore(s, true, dist)
+                val both = java.util.BitSet(n)
+                for (v in coreNodes) if (reached.get(v) && dist[v].isFinite()) both.set(v)
+                val size = both.cardinality()
+                if (size > mainSize) { mainSize = size; main = both; start = s }
+                if (mainSize * 2 >= coreCount) break
+            }
+            log?.invoke("landmark: parte principale del core ${mainSize} nodi su $coreCount")
+            // primo landmark: il nodo della parte principale più lontano dal nodo di partenza
             explore(start, false, dist)
             var farthest = start; var best = -1.0
-            for (v in 0 until n) if (coreIndex[v] >= 0 && dist[v].isFinite() && dist[v] > best) { best = dist[v]; farthest = v }
+            for (v in coreNodes) if (main.get(v) && dist[v].isFinite() && dist[v] > best) { best = dist[v]; farthest = v }
             lms[0] = farthest
             val distances = FloatArray(coreCount * 2 * k)
             for (l in 0 until k) {
                 if (l > 0) {
                     var cand = -1; var cbest = -1.0
-                    for (v in 0 until n) if (coreIndex[v] >= 0 && minDist[v].isFinite() && minDist[v] > cbest) { cbest = minDist[v]; cand = v }
+                    for (v in coreNodes) if (main.get(v) && minDist[v].isFinite() && minDist[v] > cbest) { cbest = minDist[v]; cand = v }
                     lms[l] = if (cand < 0) lms[0] else cand
                 }
                 val lmNode = lms[l]
