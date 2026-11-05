@@ -532,7 +532,7 @@ class CrossBorderDirections(
             }
             done[ky] = true
         }
-        log?.invoke("    due valichi insieme, transito (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)} fra ${c01.size}×${c12.size} coppie, ${done.count { it }} uscite esaminate, $searches ricerche, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms")
+        log?.invoke("    due valichi insieme, transito (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)} fra ${c01.size}×${c12.size} coppie, ${done.count { it }} uscite esaminate, $searches ricerche, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms; ${ga.id} ${m0.stats}; ${gMid.id} ${mm.stats}; ${gEnd.id} ${m2.stats}")
         return if (bx < 0) none else Triple(c01[bx], c12[by], best)
     }
 
@@ -579,6 +579,7 @@ class CrossBorderDirections(
         val m2 = ctx.router(gEnd).manyToOne(sq, inE, rootIsTarget = true) ?: return null
         if (mid == null) return chooseTransit(ctx, ga, gMid, gEnd, c01, c12, inM1, inM2, m0, m2, ::pieceA, ::pieceMid, ::pieceEnd, limit, t0)
         val lb1: (Int, Int) -> Double
+        var midStats = ""
         run {
             val f = request.coordinates[mid.first]; val l = request.coordinates[mid.last]
             val sm1 = ctx.snap(gMid, LL(f.first, f.second), radius(mid.first), false, request.bearings?.getOrNull(mid.first) ?: Double.NaN) ?: return none
@@ -587,7 +588,8 @@ class CrossBorderDirections(
             val mB = ctx.router(gMid).manyToOne(sm2, inM2, rootIsTarget = false) ?: return null
             // le ricerche nel Paese di mezzo e dal primo capo portate a termine: i limiti dei soli landmark
             // lasciavano pesare decine di pezzi (Soncino → Innsbruck → Monaco: 741 passaggi, 42 s)
-            mA.advance { false }; mB.advance { false }; m0.advance { false }
+            mA.advance { false }; mB.advance { false }
+            midStats = "${mA.stats} / ${mB.stats}"
             // più le tappe interne del blocco di mezzo (un pezzo da sole pesa al più quanto dentro il pezzo intero)
             val inner = if (mid.first == mid.last) 0.0 else ctx.pieceWeight(gMid, request.withPoints(mid.map { request.coordinates[it] },
                 mid.map { radius(it) }.toDoubleArray(), mid.map { false }.toBooleanArray(), mid.map { request.bearings?.getOrNull(it) }))
@@ -626,7 +628,7 @@ class CrossBorderDirections(
                 }
             }
         }
-        log?.invoke("    due valichi insieme (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)} fra ${c01.size}×${c12.size} coppie, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms")
+        log?.invoke("    due valichi insieme (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)} fra ${c01.size}×${c12.size} coppie, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms; ${ga.id} ${m0.stats}; ${gMid.id} $midStats; ${gEnd.id} ${m2.stats}")
         return if (bx < 0) none else Triple(c01[bx], c12[by], best)
     }
 
