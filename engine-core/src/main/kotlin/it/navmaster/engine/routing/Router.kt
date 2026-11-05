@@ -256,15 +256,22 @@ class Router(
      * pesi di [route] (con la ricerca rapida quando c'è, come `route(exact = false)`); null quando
      * questo router non cerca sul core.
      */
-    fun manyToOne(root: Snap, others: List<Snap>, rootIsTarget: Boolean): CoreManyToOne? {
-        if (quick != null && quickAccepts != null) return quick.manyToOne(root, others, rootIsTarget)
+    fun manyToOne(root: Snap, others: List<Snap>, rootIsTarget: Boolean): CoreManyToOne? = manyToOne(listOf(root to 0.0), others, rootIsTarget)
+
+    /**
+     * Come [manyToOne] con più radici, ognuna con un peso di partenza: per ogni altro punto il minimo
+     * fra le radici del peso di partenza più quello del percorso (una radice con peso infinito non conta).
+     */
+    fun manyToOne(roots: List<Pair<Snap, Double>>, others: List<Snap>, rootIsTarget: Boolean): CoreManyToOne? {
+        if (quick != null && quickAccepts != null) return quick.manyToOne(roots, others, rootIsTarget)
         val c = core ?: return null
         val m = CoreManyToOne(c, weighting, filter, turnCosts, landmarks, rootIsTarget, others.size)
-        for (p in splitEdge(root, asTarget = rootIsTarget)) m.addRoot(p.node, p.weight, p.snapEdge)
+        val live = roots.filter { it.second.isFinite() }
+        for ((root, offset) in live) for (p in splitEdge(root, asTarget = rootIsTarget)) m.addRoot(p.node, p.weight + offset, p.snapEdge)
         for ((i, s) in others.withIndex()) {
-            // sullo stesso arco della radice vale anche il tratto diretto (come in route)
-            if (s.edge == root.edge && (s.position != SnapPosition.TOWER || root.position != SnapPosition.TOWER)) {
-                (if (rootIsTarget) sameEdgeRoute(s, root) else sameEdgeRoute(root, s))?.let { m.addDirect(i, it.weight) }
+            // sullo stesso arco di una radice vale anche il tratto diretto (come in route)
+            for ((root, offset) in live) if (s.edge == root.edge && (s.position != SnapPosition.TOWER || root.position != SnapPosition.TOWER)) {
+                (if (rootIsTarget) sameEdgeRoute(s, root) else sameEdgeRoute(root, s))?.let { m.addDirect(i, it.weight + offset) }
             }
             for (p in splitEdge(s, asTarget = !rootIsTarget)) m.addOther(i, p.node, p.weight, p.snapEdge)
         }

@@ -1,6 +1,7 @@
 package it.navmaster.engine.api
 
 import it.navmaster.engine.RoutingGraph
+import it.navmaster.engine.ch.CoreManyToOne
 import it.navmaster.engine.index.Snap
 import it.navmaster.engine.index.SnapPosition
 import it.navmaster.engine.instructions.InstructionTranslator
@@ -479,6 +480,62 @@ class CrossBorderDirections(
     /** Quante volte due valichi sono stati scelti insieme (diagnostica dei test). */
     internal var twoChoices = 0
 
+    /**
+     * I due valichi di un transito (nessuna tappa nel Paese di mezzo), scelti insieme fra tutte le
+     * coppie: con molti passaggi sul secondo confine (Austria/Germania: centinaia) una ricerca per
+     * ogni X costerebbe troppo. Qui: i pesi di ricerca dal capo a ogni X ([m0], portata a termine);
+     * nel Paese di mezzo una ricerca sola da tutte le X insieme (ognuna col suo peso) verso ogni Y,
+     * che dà per ogni Y il limite inferiore del viaggio fin lì; dall'altro capo i limiti di [m2].
+     * Gli Y si esaminano in ordine di limite: il pezzo finale, poi i pesi di ricerca da ogni X a
+     * quell'Y (una ricerca) e, in ordine di limite della coppia, i pezzi esatti finché il limite
+     * della coppia successiva non supera il viaggio migliore. I pesi di ricerca sono limiti
+     * inferiori dei pezzi (senza avoid_features, velocità massima né direzioni).
+     */
+    private fun chooseTransit(ctx: Ctx, ga: CountryGraph, gMid: CountryGraph, gEnd: CountryGraph, c01: List<Transfer>, c12: List<Transfer>,
+                              inM1: List<Snap>, inM2: List<Snap>, m0: CoreManyToOne, m2: CoreManyToOne,
+                              pieceA: (Transfer) -> DirectionsRequest, pieceMid: (Transfer, Transfer) -> DirectionsRequest, pieceEnd: (Transfer) -> DirectionsRequest,
+                              limit: Double, t0: Long): Triple<Transfer?, Transfer?, Double>? {
+        val none = Triple<Transfer?, Transfer?, Double>(null, null, Double.POSITIVE_INFINITY)
+        m0.advance { false }
+        val roots = c01.indices.map { inM1[it] to m0.weight(it) }
+        if (roots.none { it.second.isFinite() }) return none
+        val mm = ctx.router(gMid).manyToOne(roots, inM2, rootIsTarget = false) ?: return null
+        mm.advance { false }
+        ctx.queries += 3
+        val b1 = DoubleArray(c12.size) { mm.weight(it) }
+        val w0 = DoubleArray(c01.size) { Double.NaN }; val w2 = DoubleArray(c12.size) { Double.NaN }
+        val done = BooleanArray(c12.size)
+        var best = limit; var bx = -1; var by = -1; var evaluated = 0; var searches = 0
+        while (true) {
+            var ky = -1; var key = Double.POSITIVE_INFINITY
+            for (y in c12.indices) if (!done[y]) {
+                val k = b1[y] + (if (w2[y].isNaN()) m2.lowerBound(y) else w2[y])
+                if (k < key) { key = k; ky = y }
+            }
+            if (ky < 0 || key >= best) break
+            if (w2[ky].isNaN()) {
+                if (!m2.isFinal(ky)) { m2.advance { m2.isFinal(ky) || b1[ky] + m2.lowerBound(ky) > key }; continue }
+                w2[ky] = ctx.pieceWeight(gEnd, pieceEnd(c12[ky])); evaluated++
+                continue
+            }
+            // i pesi di ricerca da ogni X a questo Y, poi le coppie in ordine di limite
+            val my = ctx.router(gMid).manyToOne(inM2[ky], inM1, rootIsTarget = true) ?: return null
+            my.advance { false }; searches++
+            val order = c01.indices.filter { m0.weight(it).isFinite() && my.weight(it).isFinite() }.sortedBy { m0.weight(it) + my.weight(it) }
+            for (x in order) {
+                if (m0.weight(x) + my.weight(x) + w2[ky] >= best) break
+                if (w0[x].isNaN()) { w0[x] = ctx.pieceWeight(ga, pieceA(c01[x])); evaluated++ }
+                if (w0[x] + my.weight(x) + w2[ky] >= best) continue
+                val w1 = ctx.pieceWeight(gMid, pieceMid(c01[x], c12[ky])); evaluated++
+                val total = w0[x] + w1 + w2[ky]
+                if (total < best) { best = total; bx = x; by = ky }
+            }
+            done[ky] = true
+        }
+        log?.invoke("    due valichi insieme, transito (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)} fra ${c01.size}×${c12.size} coppie, ${done.count { it }} uscite esaminate, $searches ricerche, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms")
+        return if (bx < 0) none else Triple(c01[bx], c12[by], best)
+    }
+
     /** Il valico scelto e il peso del viaggio intero che ci passa (+∞ senza). */
     private class Choice(val weight: Double, val transfer: Transfer?)
 
@@ -507,29 +564,6 @@ class CrossBorderDirections(
         val inE = c12.map { ctx.snap(gEnd, LL(it.lat, it.lon), TRANSFER_RADIUS)!! }
         val t0 = System.currentTimeMillis()
         twoChoices++
-        // i limiti inferiori
-        val m0 = ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false) ?: return null
-        val m2 = ctx.router(gEnd).manyToOne(sq, inE, rootIsTarget = true) ?: return null
-        val lb1: (Int, Int) -> Double
-        if (mid != null) {
-            val f = request.coordinates[mid.first]; val l = request.coordinates[mid.last]
-            val sm1 = ctx.snap(gMid, LL(f.first, f.second), radius(mid.first), false, request.bearings?.getOrNull(mid.first) ?: Double.NaN) ?: return none
-            val sm2 = ctx.snap(gMid, LL(l.first, l.second), radius(mid.last), false, request.bearings?.getOrNull(mid.last) ?: Double.NaN) ?: return none
-            val mA = ctx.router(gMid).manyToOne(sm1, inM1, rootIsTarget = true) ?: return null
-            val mB = ctx.router(gMid).manyToOne(sm2, inM2, rootIsTarget = false) ?: return null
-            // più le tappe interne del blocco di mezzo (un pezzo da sole pesa al più quanto dentro il pezzo intero)
-            val inner = if (mid.first == mid.last) 0.0 else ctx.pieceWeight(gMid, request.withPoints(mid.map { request.coordinates[it] },
-                mid.map { radius(it) }.toDoubleArray(), mid.map { false }.toBooleanArray(), mid.map { request.bearings?.getOrNull(it) }))
-            if (inner.isInfinite()) return none
-            lb1 = { x, y -> mA.lowerBound(x) + mB.lowerBound(y) + inner }
-        } else {
-            // transito: da ogni X a tutti gli Y (i soli limiti dei landmark, senza ricerca)
-            val perX = c01.indices.map { x -> ctx.router(gMid).manyToOne(inM1[x], inM2, rootIsTarget = false) ?: return null }
-            lb1 = { x, y -> perX[x].lowerBound(y) }
-        }
-        ctx.queries += 2
-        val w0 = DoubleArray(c01.size) { Double.NaN }; val w2 = DoubleArray(c12.size) { Double.NaN }
-        val w1 = Array(c01.size) { DoubleArray(c12.size) { Double.NaN } }
         fun pieceA(x: Transfer) = request.withPoints(prefix.points + (x.lat to x.lon), (prefix.radiuses + TRANSFER_RADIUS).toDoubleArray(), (prefix.exact + true).toBooleanArray(), prefix.bearings + null)
         fun pieceMid(x: Transfer, y: Transfer): DirectionsRequest {
             val ps = ArrayList<Pair<Double, Double>>(); val rs = ArrayList<Double>(); val ex = ArrayList<Boolean>(); val bs = ArrayList<Double?>()
@@ -540,6 +574,26 @@ class CrossBorderDirections(
         }
         fun pieceEnd(y: Transfer) = request.withPoints(listOf(y.lat to y.lon) + suffix.map { request.coordinates[it] },
             (listOf(TRANSFER_RADIUS) + suffix.map { radius(it) }).toDoubleArray(), (listOf(true) + suffix.map { false }).toBooleanArray(), listOf<Double?>(null) + suffix.map { request.bearings?.getOrNull(it) })
+        // i limiti inferiori
+        val m0 = ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false) ?: return null
+        val m2 = ctx.router(gEnd).manyToOne(sq, inE, rootIsTarget = true) ?: return null
+        if (mid == null) return chooseTransit(ctx, ga, gMid, gEnd, c01, c12, inM1, inM2, m0, m2, ::pieceA, ::pieceMid, ::pieceEnd, limit, t0)
+        val lb1: (Int, Int) -> Double
+        run {
+            val f = request.coordinates[mid.first]; val l = request.coordinates[mid.last]
+            val sm1 = ctx.snap(gMid, LL(f.first, f.second), radius(mid.first), false, request.bearings?.getOrNull(mid.first) ?: Double.NaN) ?: return none
+            val sm2 = ctx.snap(gMid, LL(l.first, l.second), radius(mid.last), false, request.bearings?.getOrNull(mid.last) ?: Double.NaN) ?: return none
+            val mA = ctx.router(gMid).manyToOne(sm1, inM1, rootIsTarget = true) ?: return null
+            val mB = ctx.router(gMid).manyToOne(sm2, inM2, rootIsTarget = false) ?: return null
+            // più le tappe interne del blocco di mezzo (un pezzo da sole pesa al più quanto dentro il pezzo intero)
+            val inner = if (mid.first == mid.last) 0.0 else ctx.pieceWeight(gMid, request.withPoints(mid.map { request.coordinates[it] },
+                mid.map { radius(it) }.toDoubleArray(), mid.map { false }.toBooleanArray(), mid.map { request.bearings?.getOrNull(it) }))
+            if (inner.isInfinite()) return none
+            lb1 = { x, y -> mA.lowerBound(x) + mB.lowerBound(y) + inner }
+        }
+        ctx.queries += 4
+        val w0 = DoubleArray(c01.size) { Double.NaN }; val w2 = DoubleArray(c12.size) { Double.NaN }
+        val w1 = Array(c01.size) { DoubleArray(c12.size) { Double.NaN } }
         var best = limit; var bx = -1; var by = -1; var evaluated = 0
         while (true) {
             // la coppia col limite più basso del viaggio intero fra quelle non ancora pesate del tutto
