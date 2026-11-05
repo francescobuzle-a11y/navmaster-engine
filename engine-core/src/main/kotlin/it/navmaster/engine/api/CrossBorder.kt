@@ -481,6 +481,22 @@ class CrossBorderDirections(
     internal var twoChoices = 0
 
     /**
+     * La ricerca portata avanti fin oltre una volta e mezza il peso del passaggio più vicino (più
+     * mezz'ora): i passaggi più lontani, o irraggiungibili, restano con un limite inferiore (la
+     * frontiera), che basta a scartarli; portarla a termine costerebbe tutto il core (Italia: 3 s).
+     */
+    private fun CoreManyToOne.advanceAround() {
+        advance {
+            var near = Double.POSITIVE_INFINITY
+            for (i in 0 until otherCount) if (isFinal(i) && weight(i) < near) near = weight(i)
+            near.isFinite() && bound > near * 1.5 + 1800
+        }
+    }
+
+    /** Un passo di ricerca che valga la pena: oltre [key] di un poco (il ciclo sopra ripesa le coppie a ogni ritorno). */
+    private fun slack(key: Double) = maxOf(60.0, key * 0.02)
+
+    /**
      * I due valichi di un transito (nessuna tappa nel Paese di mezzo), scelti insieme fra tutte le
      * coppie: con molti passaggi sul secondo confine (Austria/Germania: centinaia) una ricerca per
      * ogni X costerebbe troppo. Qui: i pesi di ricerca dal capo a ogni X ([m0], portata a termine);
@@ -496,13 +512,14 @@ class CrossBorderDirections(
                               pieceA: (Transfer) -> DirectionsRequest, pieceMid: (Transfer, Transfer) -> DirectionsRequest, pieceEnd: (Transfer) -> DirectionsRequest,
                               limit: Double, t0: Long): Triple<Transfer?, Transfer?, Double>? {
         val none = Triple<Transfer?, Transfer?, Double>(null, null, Double.POSITIVE_INFINITY)
-        m0.advance { false }
-        val roots = c01.indices.map { inM1[it] to m0.weight(it) }
+        m0.advanceAround()
+        // le radici coi limiti inferiori (i pesi, dove definitivi): i limiti restano tali
+        val roots = c01.indices.map { inM1[it] to m0.lowerBound(it) }
         if (roots.none { it.second.isFinite() }) return none
         val mm = ctx.router(gMid).manyToOne(roots, inM2, rootIsTarget = false) ?: return null
-        mm.advance { false }
+        mm.advanceAround()
         ctx.queries += 3
-        val b1 = DoubleArray(c12.size) { mm.weight(it) }
+        val b1 = DoubleArray(c12.size) { mm.lowerBound(it) }
         val w0 = DoubleArray(c01.size) { Double.NaN }; val w2 = DoubleArray(c12.size) { Double.NaN }
         val done = BooleanArray(c12.size)
         var best = limit; var bx = -1; var by = -1; var evaluated = 0; var searches = 0
@@ -520,12 +537,12 @@ class CrossBorderDirections(
             }
             // i pesi di ricerca da ogni X a questo Y, poi le coppie in ordine di limite
             val my = ctx.router(gMid).manyToOne(inM2[ky], inM1, rootIsTarget = true) ?: return null
-            my.advance { false }; searches++
-            val order = c01.indices.filter { m0.weight(it).isFinite() && my.weight(it).isFinite() }.sortedBy { m0.weight(it) + my.weight(it) }
+            my.advanceAround(); searches++
+            val order = c01.indices.filter { m0.lowerBound(it).isFinite() && my.lowerBound(it).isFinite() }.sortedBy { m0.lowerBound(it) + my.lowerBound(it) }
             for (x in order) {
-                if (m0.weight(x) + my.weight(x) + w2[ky] >= best) break
+                if (m0.lowerBound(x) + my.lowerBound(x) + w2[ky] >= best) break
                 if (w0[x].isNaN()) { w0[x] = ctx.pieceWeight(ga, pieceA(c01[x])); evaluated++ }
-                if (w0[x] + my.weight(x) + w2[ky] >= best) continue
+                if (w0[x] + my.lowerBound(x) + w2[ky] >= best) continue
                 val w1 = ctx.pieceWeight(gMid, pieceMid(c01[x], c12[ky])); evaluated++
                 val total = w0[x] + w1 + w2[ky]
                 if (total < best) { best = total; bx = x; by = ky }
@@ -588,7 +605,7 @@ class CrossBorderDirections(
             val mB = ctx.router(gMid).manyToOne(sm2, inM2, rootIsTarget = false) ?: return null
             // le ricerche nel Paese di mezzo e dal primo capo portate a termine: i limiti dei soli landmark
             // lasciavano pesare decine di pezzi (Soncino → Innsbruck → Monaco: 741 passaggi, 42 s)
-            mA.advance { false }; mB.advance { false }
+            mA.advanceAround(); mB.advanceAround()
             midStats = "${mA.stats} / ${mB.stats}"
             // più le tappe interne del blocco di mezzo (un pezzo da sole pesa al più quanto dentro il pezzo intero)
             val inner = if (mid.first == mid.last) 0.0 else ctx.pieceWeight(gMid, request.withPoints(mid.map { request.coordinates[it] },
@@ -617,9 +634,9 @@ class CrossBorderDirections(
             val rest1 = if (w1[kx][ky].isNaN()) lb1(kx, ky) else w1[kx][ky]
             when {
                 // prima il limite vero del capo (la sua ricerca va avanti solo fin lì), poi il pezzo
-                !m0.isFinal(kx) && w0[kx].isNaN() -> m0.advance { m0.isFinal(kx) || m0.lowerBound(kx) + rest1 + (if (w2[ky].isNaN()) m2.lowerBound(ky) else w2[ky]) > key }
+                !m0.isFinal(kx) && w0[kx].isNaN() -> m0.advance { m0.isFinal(kx) || m0.lowerBound(kx) + rest1 + (if (w2[ky].isNaN()) m2.lowerBound(ky) else w2[ky]) > key + slack(key) }
                 w0[kx].isNaN() -> { w0[kx] = ctx.pieceWeight(ga, pieceA(c01[kx])); evaluated++ }
-                !m2.isFinal(ky) && w2[ky].isNaN() -> m2.advance { m2.isFinal(ky) || w0[kx] + rest1 + m2.lowerBound(ky) > key }
+                !m2.isFinal(ky) && w2[ky].isNaN() -> m2.advance { m2.isFinal(ky) || w0[kx] + rest1 + m2.lowerBound(ky) > key + slack(key) }
                 w2[ky].isNaN() -> { w2[ky] = ctx.pieceWeight(gEnd, pieceEnd(c12[ky])); evaluated++ }
                 else -> {
                     w1[kx][ky] = ctx.pieceWeight(gMid, pieceMid(c01[kx], c12[ky])); evaluated++
