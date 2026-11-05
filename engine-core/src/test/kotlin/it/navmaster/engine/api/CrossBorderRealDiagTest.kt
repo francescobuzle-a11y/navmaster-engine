@@ -51,7 +51,9 @@ class CrossBorderRealDiagTest {
             // il primo confine: limiti e pesi veri dai due capi, per ogni passaggio
             val (ga, _) = cb.lastPieces[0]; val (gb, _) = cb.lastPieces[1]
             val all = transfers(ga, gb)
-            for ((g, root, rootIsTarget) in listOf(Triple(ga, pts.first(), false), Triple(gb, pts.last(), true))) {
+            // dal lato di là il capo è la fine del secondo pezzo (una tappa o, in transito, il valico seguente)
+            val qEnd = cb.lastPieces[1].second.coordinates.last()
+            for ((g, root, rootIsTarget) in listOf(Triple(ga, pts.first(), false), Triple(gb, qEnd, true))) {
                 val o = g.service.routeOptions(req).copy(hasBearings = false, maximumSpeedTimeOnly = true)
                 val router = g.graph.router(o)
                 val sr = router.snap(root.first, root.second, 400.0, 0)
