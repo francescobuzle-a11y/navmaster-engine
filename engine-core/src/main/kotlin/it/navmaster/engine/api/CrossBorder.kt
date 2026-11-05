@@ -667,7 +667,6 @@ class CrossBorderDirections(
         val t0 = System.currentTimeMillis()
         val mNear = (if (shortIsB) ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true) else ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false)) ?: return null
         val mFar = (if (shortIsB) ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false) else ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true)) ?: return null
-        val farBounds = DoubleArray(cands.size) { mFar.lowerBound(it) }
         val nearWeight = DoubleArray(cands.size) { Double.NaN }
         val farWeight = DoubleArray(cands.size) { Double.NaN }
         var best = limit; var bestI = -1; var nearCount = 0; var farCount = 0; var farMs = 0L
@@ -675,16 +674,19 @@ class CrossBorderDirections(
             // il passaggio col limite più basso del viaggio intero, non ancora pesato dal lato lontano
             var i = -1; var key = Double.POSITIVE_INFINITY
             for (j in cands.indices) if (farWeight[j].isNaN()) {
-                val k = farBounds[j] + if (nearWeight[j].isNaN()) mNear.lowerBound(j) else nearWeight[j]
+                val k = mFar.lowerBound(j) + if (nearWeight[j].isNaN()) mNear.lowerBound(j) else nearWeight[j]
                 if (k < key) { key = k; i = j }
             }
             if (i < 0 || key >= best) break
             if (nearWeight[i].isNaN()) {
                 // prima il limite vero del lato vicino (la sua ricerca va avanti solo fin lì), poi il pezzo
-                if (!mNear.isFinal(i)) { mNear.advance { mNear.isFinal(i) || farBounds[i] + mNear.lowerBound(i) > key }; continue }
+                if (!mNear.isFinal(i)) { mNear.advance { mNear.isFinal(i) || mFar.lowerBound(i) + mNear.lowerBound(i) > key }; continue }
                 nearWeight[i] = ctx.pieceWeight(near, nearPiece(cands[i])); nearCount++
                 continue
             }
+            // poi il limite vero del lato lontano (una ricerca sola per tutti i passaggi, fin dove serve):
+            // i pezzi lontani costano (evita pedaggi: secondi) e così ne serve di solito uno
+            if (!mFar.isFinal(i)) { mFar.advance { mFar.isFinal(i) || nearWeight[i] + mFar.lowerBound(i) > key }; continue }
             val t1 = System.currentTimeMillis()
             farWeight[i] = ctx.pieceWeight(far, farPiece(cands[i])); farCount++
             farMs += System.currentTimeMillis() - t1
@@ -692,10 +694,10 @@ class CrossBorderDirections(
             if (total < best) { best = total; bestI = i }
         }
         log?.invoke("    valico scelto: ${if (bestI < 0) "nessuno" else "%.5f,%.5f peso %.0f".format(cands[bestI].lat, cands[bestI].lon, best)} fra ${cands.size} passaggi; " +
-            "lato vicino ${near.id} ${mNear.stats}, $nearCount pezzi; lato lontano ${far.id} $farCount pezzi in $farMs ms; in tutto ${System.currentTimeMillis() - t0} ms")
+            "lato vicino ${near.id} ${mNear.stats}, $nearCount pezzi; lato lontano ${far.id} ${mFar.stats}, $farCount pezzi in $farMs ms; in tutto ${System.currentTimeMillis() - t0} ms")
         fun w(x: Double) = if (x.isFinite()) "%.0f".format(x) else "∞"
-        for ((j, t) in cands.withIndex()) if (!nearWeight[j].isNaN() || !farWeight[j].isNaN() || mNear.lowerBound(j) + farBounds[j] < best + 600)
-            log?.invoke("      %.5f,%.5f r${t.rank}: ${near.id} ${if (nearWeight[j].isNaN()) "≥" + w(mNear.lowerBound(j)) else w(nearWeight[j])}, ${far.id} ${if (farWeight[j].isNaN()) "≥" + w(farBounds[j]) else w(farWeight[j])}".format(t.lat, t.lon))
+        for ((j, t) in cands.withIndex()) if (!nearWeight[j].isNaN() || !farWeight[j].isNaN() || mNear.lowerBound(j) + mFar.lowerBound(j) < best + 600)
+            log?.invoke("      %.5f,%.5f r${t.rank}: ${near.id} ${if (nearWeight[j].isNaN()) "≥" + w(mNear.lowerBound(j)) else w(nearWeight[j])}, ${far.id} ${if (farWeight[j].isNaN()) "≥" + w(mFar.lowerBound(j)) else w(farWeight[j])}".format(t.lat, t.lon))
         return if (bestI < 0) none else Choice(best, cands[bestI])
     }
 
