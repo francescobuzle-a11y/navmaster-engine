@@ -585,6 +585,9 @@ class CrossBorderDirections(
             val sm2 = ctx.snap(gMid, LL(l.first, l.second), radius(mid.last), false, request.bearings?.getOrNull(mid.last) ?: Double.NaN) ?: return none
             val mA = ctx.router(gMid).manyToOne(sm1, inM1, rootIsTarget = true) ?: return null
             val mB = ctx.router(gMid).manyToOne(sm2, inM2, rootIsTarget = false) ?: return null
+            // le ricerche nel Paese di mezzo e dal primo capo portate a termine: i limiti dei soli landmark
+            // lasciavano pesare decine di pezzi (Soncino → Innsbruck → Monaco: 741 passaggi, 42 s)
+            mA.advance { false }; mB.advance { false }; m0.advance { false }
             // più le tappe interne del blocco di mezzo (un pezzo da sole pesa al più quanto dentro il pezzo intero)
             val inner = if (mid.first == mid.last) 0.0 else ctx.pieceWeight(gMid, request.withPoints(mid.map { request.coordinates[it] },
                 mid.map { radius(it) }.toDoubleArray(), mid.map { false }.toBooleanArray(), mid.map { request.bearings?.getOrNull(it) }))
