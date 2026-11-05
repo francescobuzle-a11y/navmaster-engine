@@ -33,7 +33,7 @@ class CrossBorderRealReferenceTest {
         val rnd = Random(System.getenv("NM_SEED")?.toLongOrNull() ?: 1L)
         val graphs = spec.split(',').map { it.split('=') }.map { (id, path) ->
             val g = RoutingGraph.load(File(path), true)
-            println("$id: ${g.graph.nodeCount} nodi, ${g.graph.edgeCount} archi, preparazioni ${g.chStorages.keys}, landmark ${g.landmarks.mapValues { it.value.landmarkCount }}")
+            println("$id: ${g.graph.nodeCount} nodi, ${g.graph.edgeCount} archi, preparazioni ${g.chStorages.keys}, landmark ${g.landmarks.mapValues { it.value.landmarkCount }}, insiemi in più ${g.landmarkSetNames}")
             CountryGraph(id, DirectionsService(g, DirectionsLimits(50, 6_000_000.0, 6_000_000.0, 400.0)))
         }
         val cache = HashMap<String, List<Transfer>>()
@@ -97,7 +97,10 @@ class CrossBorderRealReferenceTest {
         }
 
         // ---- i landmark di ogni core: ognuno deve raggiungere ed essere raggiunto da quasi tutto il core
-        for (g in graphs) for ((key, lm) in g.graph.landmarks) {
+        // (gli insiemi con strade escluse, per esempio «senza pedaggi», non coprono i nodi del core raggiungibili
+        // solo per quelle strade: la soglia è più bassa, e vale la parte del core che resta connessa)
+        val allSets = graphs.flatMap { g -> g.graph.landmarks.map { (key, lm) -> Triple(g, key, lm) } + g.graph.avoidLandmarks.flatMap { (key, sets) -> sets.map { Triple(g, key, it) } } }
+        for ((g, key, lm) in allSets) {
             val st = g.graph.chStorages[key] ?: continue
             val n = g.graph.graph.nodeCount
             val sample = (0 until n step maxOf(1, n / 200_000)).filter { st.level(it) >= n }
@@ -105,9 +108,10 @@ class CrossBorderRealReferenceTest {
                 100 * sample.count { lm.fromLandmark(l, it).isFinite() } / maxOf(1, sample.size) to 100 * sample.count { lm.toLandmark(l, it).isFinite() } / maxOf(1, sample.size)
             }
             val worst = cov.minOfOrNull { minOf(it.first, it.second) } ?: 100
-            val line = "  ${g.id} landmark $key: ${cov.joinToString(" ") { "${it.first}/${it.second}" }} (raggiunge/raggiunto da, % del core)"
+            val line = "  ${g.id} landmark $key ${lm.setName}: ${cov.joinToString(" ") { "${it.first}/${it.second}" }} (raggiunge/raggiunto da, % del core)"
             println(line)
-            if (worst < 50) problems += "${g.id} landmark $key: un landmark copre solo il $worst % del core (limiti nulli, ricerche lente)"
+            val threshold = if (lm.avoidFeatures == 0) 50 else 25
+            if (worst < threshold) problems += "${g.id} landmark $key ${lm.setName}: un landmark copre solo il $worst % del core (limiti nulli, ricerche lente)"
         }
 
         // ---- viaggi interni di ogni Paese: core contro ricerca piena, CH contro Dijkstra

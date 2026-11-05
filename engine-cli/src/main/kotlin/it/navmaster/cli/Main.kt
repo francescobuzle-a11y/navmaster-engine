@@ -3,6 +3,7 @@ package it.navmaster.cli
 import it.navmaster.engine.Engine
 import it.navmaster.engine.RouteOptions
 import it.navmaster.engine.RoutingGraph
+import it.navmaster.engine.ch.CoreLandmarks
 import it.navmaster.engine.osm.OsmGraphImporter
 import it.navmaster.engine.profile.AvoidFeatureFlags
 import it.navmaster.engine.weighting.VehicleParameters
@@ -21,7 +22,9 @@ import kotlin.system.exitProcess
 private const val USAGE = """
 navmaster-engine
 
-  import <file.osm.pbf> <cartella-grafo> [--profiles=car,hgv] [--no-ch] [--no-width-from-carriageway] [--mmap] [--core=narrow]   costruisce il grafo (--mmap: file su disco invece che in RAM; --core=narrow: core ridotto, senza autostrade e strade veloci)
+  import <file.osm.pbf> <cartella-grafo> [--profiles=car,hgv] [--no-ch] [--no-width-from-carriageway] [--mmap] [--core=narrow] [--landmark-sets=tollways,highways]
+                                         costruisce il grafo (--mmap: file su disco invece che in RAM; --core=narrow: core ridotto, senza autostrade e strade veloci;
+                                         --landmark-sets: gli insiemi di landmark in più, con quelle strade escluse, come gli `lmsets` di ORS; predefinito tollways, `none` per nessuno)
   info <cartella-grafo>                                          riepilogo del grafo
   route <cartella-grafo> <lat,lon> <lat,lon> [--profile=driving-hgv] [--weighting=fastest|shortest|recommended]
         [--avoid=highways,tollways,ferries,fords] [--height=4.0 --weight=40 --width=2.55 --length=18.75 --hazmat] [--no-turn-costs] [--no-ch]
@@ -138,7 +141,9 @@ private fun importGraph(args: List<String>) {
         println("grafo: %,d nodi, %,d archi (%,d pillar, %,d archi barriera), divieti di svolta %,d applicati su %,d, %.1f s".format(
             stats.towers, stats.edges, stats.pillars, stats.barrierEdges, stats.turnRestrictions, stats.turnRestrictionRelations, stats.millis / 1000.0))
         println("bbox: ${it.graph.bounds}")
-        if (!args.contains("--no-ch")) it.prepareCH(log = { msg -> println(msg) }, coreWide = opt(args, "core") != "narrow")
+        val sets = opt(args, "landmark-sets")?.let { v -> if (v == "none") emptyList() else v.split(',').map { CoreLandmarks.parseSetName(it) }.filter { it != 0 } }
+            ?: RoutingGraph.DEFAULT_LANDMARK_SETS
+        if (!args.contains("--no-ch")) it.prepareCH(log = { msg -> println(msg) }, coreWide = opt(args, "core") != "narrow", landmarkSets = sets)
     }
 }
 
@@ -150,5 +155,7 @@ private fun info(args: List<String>) {
         println("%,d nodi, %,d archi, %,d voci di costo di svolta, bbox ${graph.bounds}".format(graph.nodeCount, graph.edgeCount, rg.turnCosts.count))
         println("valori codificati (${graph.intsForFlags} int per arco): ${graph.encodedValues.all.joinToString { it.name }}")
         println("indice spaziale: ${rg.index.cells} celle, ${rg.index.entries} voci")
+        println("preparazioni: ${rg.chStorages.keys.joinToString()}; core ${if (rg.coreWide) "largo" else "ridotto"} (regola ${rg.coreVersion})")
+        for ((key, lm) in rg.landmarks) println("landmark $key: ${lm.landmarkCount} allow_all" + (rg.avoidLandmarks[key]?.joinToString("") { ", ${it.landmarkCount} ${it.setName}" } ?: ""))
     }
 }

@@ -24,6 +24,7 @@ import it.navmaster.engine.storage.TurnCostEncoding
 import it.navmaster.engine.storage.TurnCostStorage
 import it.navmaster.engine.weighting.EdgeFilter
 import it.navmaster.engine.profile.HeavyVehicleAttributes
+import it.navmaster.engine.profile.AvoidFeatureFlags
 import it.navmaster.engine.weighting.EdgeFilterFactory
 import it.navmaster.engine.weighting.AvoidFeaturesEdgeFilter
 import it.navmaster.engine.weighting.TurnCostProvider
@@ -95,8 +96,31 @@ class RoutingGraph private constructor(
 
     /** CH disponibili, per chiave `<encoder>_<weighting>` (es. `heavyvehicle_recommended`). */
     val chStorages = LinkedHashMap<String, CHStorage>()
-    /** Landmark del core, per chiave della preparazione core. */
+    /** Landmark del core (l'insieme completo, `allow_all`), per chiave della preparazione core. */
     val landmarks = LinkedHashMap<String, CoreLandmarks>()
+    /**
+     * Gli altri insiemi di landmark di ogni core, preparati con delle strade escluse (ORS `lmsets`,
+     * per esempio `tollways`): per chiave della preparazione core, nell'ordine di preparazione.
+     */
+    val avoidLandmarks = LinkedHashMap<String, MutableList<CoreLandmarks>>()
+
+    /**
+     * L'insieme di landmark per una richiesta che evita [avoidFeatures] (già ridotti a quelli del
+     * profilo): fra quelli ammissibili (le strade escluse nella preparazione sono tutte evitate dalla
+     * richiesta, così i limiti restano inferiori) quello con più strade escluse, cioè coi limiti più
+     * stretti; ORS prende il primo ammissibile nell'ordine della configurazione (`highways;allow_all`).
+     */
+    fun landmarksFor(coreKey: String, avoidFeatures: Int): CoreLandmarks? {
+        var best = landmarks[coreKey]
+        for (lm in avoidLandmarks[coreKey] ?: return best) {
+            if (!lm.admissibleFor(avoidFeatures)) continue
+            if (best == null || Integer.bitCount(lm.avoidFeatures) > Integer.bitCount(best.avoidFeatures)) best = lm
+        }
+        return best
+    }
+
+    /** Gli insiemi di landmark con strade escluse preparati (nomi come `tollways`), letti dal file `profiles`. */
+    var landmarkSetNames: List<String> = emptyList(); private set
 
     val profileNames: List<String> get() = encoding.profiles.map { it.profile.name }
 
@@ -109,7 +133,9 @@ class RoutingGraph private constructor(
      * Prepara per ogni profilo la CH completa (richieste "statiche") e il Core (richieste con restrizioni,
      * avoid_features o divieti di svolta), come le preparazioni `ch` e `core` di ORS, e le salva.
      */
-    fun prepareCH(log: ((String) -> Unit)? = null, withCore: Boolean = true, landmarkCount: Int = 16, coreWide: Boolean = true) {
+    fun prepareCH(log: ((String) -> Unit)? = null, withCore: Boolean = true, landmarkCount: Int = 16, coreWide: Boolean = true,
+                  landmarkSets: List<Int> = DEFAULT_LANDMARK_SETS) {
+        val setNames = LinkedHashSet<String>()
         for (pe in encoding.profiles) for (method in listOf(defaultCHWeighting(pe.profile.name), WeightingMethod.SHORTEST)) {
             val name = pe.profile.name
             val w = WeightingFactory.create(encoding, pe, method)
@@ -135,17 +161,33 @@ class RoutingGraph private constructor(
                 log?.invoke("Core $coreKey: ${coreStorage.coreNodeCount} nodi nel core (${100 * coreStorage.coreNodeCount / maxOf(1, graph.nodeCount)} %), ${coreStorage.shortcutCount} shortcut in ${System.currentTimeMillis() - t0} ms")
                 chStorages[coreKey] = coreStorage
                 t0 = System.currentTimeMillis()
-                val lm = CoreLandmarks.prepare(CHGraph(graph, coreStorage, w), w, landmarkCount)
+                val chg = CHGraph(graph, coreStorage, w)
+                val lm = CoreLandmarks.prepare(chg, w, landmarkCount, log)
                 lm.save(GraphDirectory(dir, mmap = false), coreKey)
                 landmarks[coreKey] = lm
                 log?.invoke("Landmark $coreKey: ${lm.landmarkCount} in ${System.currentTimeMillis() - t0} ms")
+                // gli insiemi con delle strade escluse (ORS `lmsets`): solo col core largo, dove quelle
+                // strade sono archi del core e non stanno in nessuno shortcut (vedi CHGraph.Iterator.accepts)
+                if (coreWide) for (set in landmarkSets) {
+                    val avoid = set and AvoidFeatureFlags.forCategory(pe.profile.category)
+                    if (avoid == 0 || avoidLandmarks[coreKey]?.any { it.avoidFeatures == avoid } == true) continue
+                    t0 = System.currentTimeMillis()
+                    val filter = AvoidFeaturesEdgeFilter(encoding.shared, avoid, pe.profile.category, name == "heavyvehicle")
+                    val set2 = CoreLandmarks.prepare(chg, w, landmarkCount, log, filter = filter, avoidFeatures = avoid)
+                    set2.save(GraphDirectory(dir, mmap = false), CoreLandmarks.fileName(coreKey, avoid), withIndex = false)
+                    avoidLandmarks.getOrPut(coreKey) { ArrayList() }.add(set2)
+                    setNames += set2.setName
+                    log?.invoke("Landmark $coreKey ${set2.setName}: ${set2.landmarkCount} in ${System.currentTimeMillis() - t0} ms")
+                }
             }
         }
         coreVersion = CoreEdgeSelector.CORE_VERSION
         this.coreWide = coreWide && withCore
+        landmarkSetNames = setNames.toList()
         GraphProperties(File(dir, "profiles")).apply {
             load(); set("profiles", profileNames.joinToString(",")); set("ch", chStorages.keys.joinToString(","))
-            set("core_version", coreVersion.toString()); set("core_kind", if (this@RoutingGraph.coreWide) "wide" else "narrow"); save()
+            set("core_version", coreVersion.toString()); set("core_kind", if (this@RoutingGraph.coreWide) "wide" else "narrow")
+            set("landmark_sets", landmarkSetNames.joinToString(",")); save()
         }
     }
 
@@ -190,7 +232,8 @@ class RoutingGraph private constructor(
         // le misure dell'auto (camper, furgoni): nel core solo dall'edizione 2 della regola; prima, ricerca piena
         val coreFits = name == "heavyvehicle" || options.vehicleParameters?.hasDimensions != true || coreVersion >= 2
         val core = if (ch == null && options.allowCH && !needsFullSearch(options) && coreFits) coreStorage?.let { CHGraph(graph, it, weighting) } else null
-        val lm = if (core != null) landmarks["${key}_core"] else null
+        // l'insieme di landmark della richiesta: con «evita pedaggi» quello preparato senza i pedaggi, se c'è
+        val lm = if (core != null) landmarksFor("${key}_core", options.avoidFeatures and AvoidFeatureFlags.forCategory(pe.profile.category)) else null
         // avoid_features alone: first the quick search without them; its path is the best one with
         // them too when it uses none of the roads to avoid (the filter only takes roads away), else
         // the full search (ORS keeps those roads in its core; our reduced core does not, the wide one does)
@@ -205,11 +248,20 @@ class RoutingGraph private constructor(
 
     override fun close() {
         graph.close(); turnCosts.close(); guidance?.close(); points?.close(); chStorages.values.forEach { it.close() }
+        avoidLandmarks.values.forEach { l -> l.forEach { it.close() } }
         landmarks.values.forEach { it.close() }
         if (this::index.isInitialized) index.close()
     }
 
     companion object {
+        /**
+         * Gli insiemi di landmark con strade escluse preparati per ogni core oltre a quello completo
+         * (ORS: `lmsets: highways;allow_all`): «evita pedaggi», il filtro dell'app che senza il suo
+         * insieme esplorava un terzo del core italiano (9 s sul tablet). Ognuno costa un file di
+         * `2·16` float per nodo del core (~90 MB per core in Italia) e ~20 s di preparazione.
+         */
+        val DEFAULT_LANDMARK_SETS: List<Int> = listOf(AvoidFeatureFlags.TOLLWAYS)
+
         fun profileByName(name: String): VehicleProfile = when (name) {
             "car", "driving-car", "car-ors" -> CarProfile()
             "hgv", "driving-hgv", "truck", "heavyvehicle" -> HgvProfile()
@@ -246,10 +298,18 @@ class RoutingGraph private constructor(
             val rg = RoutingGraph(dir, encoding, graph, tc, GuidanceStore.load(gdir, graph.names), PointStore.load(gdir))
             rg.coreVersion = props.get("core_version")?.toIntOrNull() ?: 1
             rg.coreWide = props.get("core_kind") == "wide"
+            rg.landmarkSetNames = (props.get("landmark_sets") ?: "").split(',').filter { it.isNotBlank() }
             for (key in (props.get("ch") ?: "").split(',').filter { it.isNotBlank() }) {
                 val st = CHStorage(gdir, key, graph.edgeCount, graph.nodeCount)
                 if (st.loadExisting()) rg.chStorages[key] = st else st.close()
-                if (key.endsWith("_core")) CoreLandmarks.load(gdir, key, graph.nodeCount)?.let { rg.landmarks[key] = it }
+                if (key.endsWith("_core")) CoreLandmarks.load(gdir, key, graph.nodeCount)?.let { base ->
+                    rg.landmarks[key] = base
+                    for (set in rg.landmarkSetNames) {
+                        val avoid = CoreLandmarks.parseSetName(set)
+                        if (avoid == 0) continue
+                        CoreLandmarks.load(gdir, CoreLandmarks.fileName(key, avoid), graph.nodeCount, base)?.let { rg.avoidLandmarks.getOrPut(key) { ArrayList() }.add(it) }
+                    }
+                }
             }
             rg.index = LocationIndex.load(graph, gdir) ?: LocationIndex.build(graph)
             return rg

@@ -27,6 +27,13 @@ class CHGraph(val base: BaseGraph, val storage: CHStorage, private val weighting
         var weight = Double.POSITIVE_INFINITY; private set
         val isShortcut get() = chEdge >= baseEdges
 
+        /**
+         * Whether [filter] lets the current edge through. A shortcut always does (as ORS's
+         * `AvoidFeaturesCoreEdgeFilter`): the roads a request can exclude are core edges, and the
+         * core's shortcuts are made of non-core edges only.
+         */
+        fun accepts(filter: it.navmaster.engine.weighting.EdgeFilter): Boolean = isShortcut || filter.accept(baseIt)
+
         fun setBaseNode(n: Int, reverse: Boolean): Iterator {
             node = n; reverseSearch = reverse
             sc = storage.lastShortcut(n); inShortcuts = true

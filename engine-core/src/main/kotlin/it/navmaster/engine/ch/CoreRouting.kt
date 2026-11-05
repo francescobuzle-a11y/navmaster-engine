@@ -135,6 +135,8 @@ class CoreDijkstra(
     private val coreLevel = base.nodeCount
     private fun inCore(node: Int) = storage.level(node) >= coreLevel
     private val potentials: CorePotentials? = landmarks?.takeIf { it.landmarkCount > 0 }?.let { CorePotentials(it) }
+    /** The landmark set in use (`allow_all`, `tollways`…), for the stats. */
+    private val landmarkSet = landmarks?.takeIf { it.landmarkCount > 0 }?.setName
 
     private class State {
         val weight = IntDoubleHashMap(1024)
@@ -204,7 +206,7 @@ class CoreDijkstra(
             if (fk + bk >= bestWeight) break
             if (fk <= bk) settleCore(cFwd, false) else settleCore(cBwd, true)
         }
-        stats = "fase1 $v1 nodi ${(t1 - t0) / 1_000_000} ms, core ${visitedNodes - v1} nodi ${(System.nanoTime() - t1) / 1_000_000} ms" + (if (potentials != null) " ALT" else "")
+        stats = "fase1 $v1 nodi ${(t1 - t0) / 1_000_000} ms, core ${visitedNodes - v1} nodi ${(System.nanoTime() - t1) / 1_000_000} ms" + (if (potentials != null) " ALT" + (if (landmarkSet != "allow_all") " $landmarkSet" else "") else "")
         return meetingNode >= 0 || coreMet
     }
 

@@ -21,7 +21,7 @@ class CrossBorderRealDiagTest {
         val graphs = spec.split(',').map { it.split('=') }.map { (id, path) ->
             val t0 = System.currentTimeMillis()
             val g = RoutingGraph.load(File(path), true)
-            println("$id aperto in ${System.currentTimeMillis() - t0} ms: ${g.graph.nodeCount} nodi, ${g.graph.edgeCount} archi, landmark ${g.landmarks.mapValues { it.value.landmarkCount }}")
+            println("$id aperto in ${System.currentTimeMillis() - t0} ms: ${g.graph.nodeCount} nodi, ${g.graph.edgeCount} archi, landmark ${g.landmarks.mapValues { it.value.landmarkCount }}, insiemi in più ${g.landmarkSetNames}")
             CountryGraph(id, DirectionsService(g, DirectionsLimits(50, 6_000_000.0, 6_000_000.0, 400.0)))
         }
         val cache = HashMap<String, List<Transfer>>()
@@ -38,7 +38,8 @@ class CrossBorderRealDiagTest {
         for (pts in trips) {
             val body = linkedMapOf<String, Any?>(
                 "coordinates" to pts.map { listOf(it.second, it.first) }, "preference" to "recommended", "instructions" to true, "language" to "it",
-                "options" to linkedMapOf<String, Any?>("avoid_features" to listOf("ferries"), "vehicle_type" to "hgv",
+                // NM_AVOID: le strade da evitare (es. `tollways,ferries`), per misurare l'alternativa senza pedaggi dell'app
+                "options" to linkedMapOf<String, Any?>("avoid_features" to (System.getenv("NM_AVOID")?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() } ?: listOf("ferries")), "vehicle_type" to "hgv",
                     "profile_params" to mapOf("restrictions" to mapOf("height" to 4.0, "width" to 2.55, "length" to 16.5, "weight" to 27.0, "axleload" to 11.5))),
                 "maximum_speed" to 80.0,
             )
