@@ -56,7 +56,8 @@ class CrossBorderRealDiagTest {
             for ((g, root, rootIsTarget) in listOf(Triple(ga, pts.first(), false), Triple(gb, qEnd, true))) {
                 val o = g.service.routeOptions(req).copy(hasBearings = false, maximumSpeedTimeOnly = true)
                 val router = g.graph.router(o)
-                val sr = router.snap(root.first, root.second, 400.0, 0)
+                // senza il controllo delle reti isolate: il capo di là può essere un valico (la strada esce dall'estratto)
+                val sr = router.snap(root.first, root.second, 400.0, 0, checkNetwork = false)
                 val usable = all.filter { t -> runCatching { router.snap(t.lat, t.lon, 3.0, 0, checkNetwork = false) }.isSuccess }
                 val snaps = usable.map { t -> router.snap(t.lat, t.lon, 3.0, 0, checkNetwork = false) }
                 val tm = System.currentTimeMillis()
