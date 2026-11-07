@@ -248,33 +248,45 @@ class RoutingGraph private constructor(
      * Riscaldamento: carica nella cache del sistema i file che una ricerca col core per [profile]
      * tocca a caso (sul tablet la prima ricerca dopo l'avvio costava 6 volte quelle dopo: 28 s contro
      * 16 s fino a Komjatice). In ordine di resa per byte: i livelli del core, i landmark (l'insieme
-     * completo e quello per [avoidFeatures]), gli shortcut del core, i nodi, gli archi; si ferma
-     * oltre [budget] byte. Da chiamare in sottofondo, a bassa priorità; in RAM non fa nulla.
-     * Ritorna una riga di diagnostica (file e MB toccati, tempo).
+     * completo e quello per [avoidFeatures]), gli shortcut del core, i nodi, gli archi; un file
+     * entra solo se con esso si resta entro [budget] byte (il primo sempre). [progress] riceve i
+     * byte letti e quelli previsti, più volte per file (una schermata d'avvio con la barra). Da
+     * chiamare in sottofondo; in RAM non fa nulla. Ritorna una riga di diagnostica.
      */
-    fun warm(profile: String, weighting: WeightingMethod? = null, avoidFeatures: Int = AvoidFeatureFlags.TOLLWAYS, budget: Long = 1L shl 30): String {
+    fun warm(profile: String, weighting: WeightingMethod? = null, avoidFeatures: Int = AvoidFeatureFlags.TOLLWAYS, budget: Long = 1L shl 30,
+             progress: ((done: Long, total: Long) -> Unit)? = null): String {
         val t0 = System.currentTimeMillis()
         val name = encoderName(profile)
         val pe = encoding.profile(name)
         val w = WeightingFactory.create(encoding, pe, weighting ?: defaultCHWeighting(name))
         val coreKey = "${chKey(name, w)}_core"
-        var bytes = 0L
-        val done = ArrayList<String>()
-        fun step(label: String, run: () -> Long): Boolean {
-            if (bytes >= budget) return false
-            val b = run(); bytes += b
-            if (b > 0) done += "$label ${b shr 20} MB"
-            return true
-        }
+        val avoid = avoidFeatures and AvoidFeatureFlags.forCategory(pe.profile.category)
         val core = chStorages[coreKey]
-        step("livelli") { core?.touch(withShortcuts = false) ?: 0 } &&
-            step("landmark") { landmarks[coreKey]?.touch() ?: 0 } &&
-            step("landmark ${CoreLandmarks.setName(avoidFeatures and AvoidFeatureFlags.forCategory(pe.profile.category))}") {
-                landmarksFor(coreKey, avoidFeatures and AvoidFeatureFlags.forCategory(pe.profile.category))?.takeIf { it.avoidFeatures != 0 }?.touch() ?: 0 } &&
-            step("shortcut") { core?.touch(withShortcuts = true)?.let { it - (core.touch(withShortcuts = false)) } ?: 0 } &&
-            step("nodi") { graph.touch(withNodes = true, withEdges = false, withGeometry = false) } &&
-            step("archi") { graph.touch(withNodes = false, withEdges = true, withGeometry = false) }
-        return "riscaldamento $coreKey: ${bytes shr 20} MB in ${System.currentTimeMillis() - t0} ms (${done.joinToString()})"
+        val set = landmarksFor(coreKey, avoid)?.takeIf { it.avoidFeatures != 0 }
+        // the plan: each file with its bytes and how to touch it (progress: bytes within the file)
+        class Step(val label: String, val bytes: Long, val run: (((Long) -> Unit)?) -> Long)
+        val all = listOf(
+            Step("livelli", core?.bytes(false) ?: 0) { p -> core?.touch(false, p) ?: 0 },
+            Step("landmark", landmarks[coreKey]?.bytes ?: 0) { p -> landmarks[coreKey]?.touch(p) ?: 0 },
+            Step("landmark ${CoreLandmarks.setName(avoid)}", set?.bytes ?: 0) { p -> set?.touch(p) ?: 0 },
+            Step("shortcut", core?.let { it.bytes(true) - it.bytes(false) } ?: 0) { p ->
+                core?.let { c -> val lv = c.bytes(false); c.touch(true) { b -> if (p != null && b > lv) p(b - lv) } - lv } ?: 0 },
+            Step("nodi", graph.bytes(true, false, false)) { p -> graph.touch(true, false, false, p) },
+            Step("archi", graph.bytes(false, true, false)) { p -> graph.touch(false, true, false, p) },
+        ).filter { it.bytes > 0 }
+        val plan = ArrayList<Step>()
+        var planned = 0L
+        for (step in all) { if (plan.isNotEmpty() && planned + step.bytes > budget) break; plan += step; planned += step.bytes }
+        var done = 0L
+        val lines = ArrayList<String>()
+        for (step in plan) {
+            val base = done
+            step.run(progress?.let { p -> { b: Long -> p(minOf(base + b, planned), planned) } })
+            done = base + step.bytes
+            progress?.invoke(done, planned)
+            lines += "${step.label} ${step.bytes shr 20} MB"
+        }
+        return "riscaldamento $coreKey: ${done shr 20} MB in ${System.currentTimeMillis() - t0} ms (${lines.joinToString()})"
     }
 
     fun flush() { graph.flush(); turnCosts.flush(); guidance?.flush(graph.edgeCount); points?.flush(); GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); save() } }

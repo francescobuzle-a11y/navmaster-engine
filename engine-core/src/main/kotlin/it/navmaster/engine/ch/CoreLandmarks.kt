@@ -117,7 +117,12 @@ class CoreLandmarks private constructor(
     fun close() { if (ownsIndex) coreIndex.close(); distanceBits.close() }
 
     /** Riscaldamento (vedi [DataAccess.touch]): le distanze e, se è suo, l'indice del core. Byte toccati. */
-    fun touch(): Long = distanceBits.touch() + (if (ownsIndex) coreIndex.touch() else 0)
+    fun touch(progress: ((Long) -> Unit)? = null): Long {
+        val a = distanceBits.touch(progress)
+        return a + (if (ownsIndex) coreIndex.touch(progress?.let { p -> { b: Long -> p(a + b) } }) else 0)
+    }
+    /** I byte che [touch] leggerebbe. */
+    val bytes: Long get() = distanceBits.bytes + (if (ownsIndex) coreIndex.bytes else 0)
 
     /**
      * Salva nel file `landmarks_<name>`; [withIndex] falso per un insieme con strade escluse, che al

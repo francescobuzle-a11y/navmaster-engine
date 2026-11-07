@@ -21,8 +21,11 @@ class WarmTest {
         fun weightOf(g: RoutingGraph): Double { val r = g.router(options); return r.route(r.snap(a.first, a.second, 400.0, 0), r.snap(b.first, b.second, 400.0, 1)).weight }
         RoutingGraph.load(dir, mmap = true).use { g ->
             val before = weightOf(g)
-            val line = g.warm("driving-hgv")
+            val seen = ArrayList<Pair<Long, Long>>()
+            val line = g.warm("driving-hgv") { d, t -> seen += d to t }
             println(line)
+            // l'avanzamento: crescente, fino al totale previsto
+            assertTrue(seen.isNotEmpty() && seen.last().first == seen.last().second && seen.zipWithNext().all { (a, b) -> b.first >= a.first && a.second == b.second }, seen.toString())
             assertTrue(line.startsWith("riscaldamento heavyvehicle_recommended_core:"), line)
             for (part in listOf("livelli", "landmark ", "landmark tollways", "shortcut", "nodi", "archi")) assertTrue(part in line, "manca $part: $line")
             // un bilancio piccolo: si ferma dopo i primi file

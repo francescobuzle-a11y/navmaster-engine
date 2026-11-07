@@ -39,7 +39,9 @@ abstract class DataAccess(val name: String, segmentSize: Int) : Closeable {
      * Carica il file nella cache del sistema (riscaldamento: sul tablet la prima ricerca dopo
      * l'avvio legge i file a caso e costa 6 volte quelle dopo). Byte toccati; 0 quando è in RAM.
      */
-    open fun touch(): Long = 0
+    open fun touch(progress: ((Long) -> Unit)? = null): Long = 0
+    /** I byte che [touch] leggerebbe: 0 in RAM. */
+    open val touchBytes: Long get() = 0
     protected abstract fun addSegments(count: Int)
     protected abstract fun segment(index: Int): ByteBuffer
 
@@ -241,8 +243,11 @@ class MmapDataAccess(name: String, private val file: File, segmentSize: Int = Da
         r.channel.force(true)
     }
 
-    override fun touch(): Long {
-        for (s in segs) s.load()
+    override val touchBytes: Long get() = capacity
+
+    override fun touch(progress: ((Long) -> Unit)?): Long {
+        var done = 0L
+        for (s in segs) { s.load(); done += segmentSize; progress?.invoke(done) }
         return capacity
     }
 

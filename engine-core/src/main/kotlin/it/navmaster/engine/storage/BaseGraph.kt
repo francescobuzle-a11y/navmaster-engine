@@ -333,8 +333,17 @@ class BaseGraph(
     }
 
     /** Riscaldamento (vedi [DataAccess.touch]) dei file scelti. Byte toccati. */
-    fun touch(withNodes: Boolean, withEdges: Boolean, withGeometry: Boolean): Long =
-        (if (withNodes) nodes.touch() else 0) + (if (withEdges) edges.touch() else 0) + (if (withGeometry) geometry.touch() else 0)
+    fun touch(withNodes: Boolean, withEdges: Boolean, withGeometry: Boolean, progress: ((Long) -> Unit)? = null): Long {
+        var done = 0L
+        fun one(da: DataAccess) { done += da.touch(progress?.let { p -> val base = done; { b: Long -> p(base + b) } }) }
+        if (withNodes) one(nodes)
+        if (withEdges) one(edges)
+        if (withGeometry) one(geometry)
+        return done
+    }
+    /** I byte che [touch] leggerebbe. */
+    fun bytes(withNodes: Boolean, withEdges: Boolean, withGeometry: Boolean): Long =
+        (if (withNodes) nodes.touchBytes else 0) + (if (withEdges) edges.touchBytes else 0) + (if (withGeometry) geometry.touchBytes else 0)
 
     override fun close() { nodes.close(); edges.close(); geometry.close(); names.close() }
 
