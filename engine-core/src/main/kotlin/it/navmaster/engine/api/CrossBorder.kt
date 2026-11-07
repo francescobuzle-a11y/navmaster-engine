@@ -581,6 +581,18 @@ class CrossBorderDirections(
      */
     private class Ends(val startExact: Boolean, val startInner: Double, val endExact: Boolean, val endInner: Double)
 
+    /** Gli [Ends] di un viaggio da [prefix] (grafo di partenza) ai punti [suffix] in [gEnd]; null quando un capo con più tappe non ha percorso. */
+    private fun ends(ctx: Ctx, prefix: Piece, suffix: IntRange, radius: (Int) -> Double, gEnd: CountryGraph): Ends? {
+        val request = ctx.request
+        val startExact = prefix.bearings.last() == null && (prefix.points.size == 1 || !request.continueStraight)
+        val startInner = if (!startExact || prefix.points.size == 1) 0.0 else ctx.pieceWeight(prefix.graph, request.withPoints(prefix.points, prefix.radiuses.toDoubleArray(), prefix.exact.toBooleanArray(), prefix.bearings))
+        val suffixPts = suffix.map { request.coordinates[it] }
+        val endExact = request.bearings?.getOrNull(suffix.first) == null && (suffixPts.size == 1 || !request.continueStraight)
+        val endInner = if (!endExact || suffixPts.size == 1) 0.0 else ctx.pieceWeight(gEnd, request.withPoints(suffixPts, suffix.map { radius(it) }.toDoubleArray(), suffix.map { false }.toBooleanArray(), suffix.map { request.bearings?.getOrNull(it) }))
+        if (startInner.isInfinite() || endInner.isInfinite()) return null
+        return Ends(startExact, startInner, endExact, endInner)
+    }
+
     /**
      * I due valichi di un viaggio che attraversa due confini, scelti insieme: da [prefix] (grafo A)
      * al grafo [gMid] (coi punti [mid], o nessuno in transito) al grafo [gEnd] (punti [suffix]).
@@ -620,13 +632,7 @@ class CrossBorderDirections(
         val m0 = ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false) ?: return null
         val m2 = ctx.router(gEnd).manyToOne(sq, inE, rootIsTarget = true) ?: return null
         // dove i pesi di ricerca ai capi sono quelli dei pezzi (vedi Ends)
-        val startExact = prefix.bearings.last() == null && (prefix.points.size == 1 || !request.continueStraight)
-        val startInner = if (!startExact || prefix.points.size == 1) 0.0 else ctx.pieceWeight(ga, request.withPoints(prefix.points, prefix.radiuses.toDoubleArray(), prefix.exact.toBooleanArray(), prefix.bearings))
-        val suffixPts = suffix.map { request.coordinates[it] }
-        val endExact = request.bearings?.getOrNull(qi) == null && (suffixPts.size == 1 || !request.continueStraight)
-        val endInner = if (!endExact || suffixPts.size == 1) 0.0 else ctx.pieceWeight(gEnd, request.withPoints(suffixPts, suffix.map { radius(it) }.toDoubleArray(), suffix.map { false }.toBooleanArray(), suffix.map { request.bearings?.getOrNull(it) }))
-        if (startInner.isInfinite() || endInner.isInfinite()) return none
-        val ends = Ends(startExact, startInner, endExact, endInner)
+        val ends = ends(ctx, prefix, suffix, radius, gEnd) ?: return none
         if (mid == null) return chooseTransit(ctx, ga, gMid, gEnd, c01, c12, inM1, inM2, m0, m2, ::pieceA, ::pieceMid, ::pieceEnd, ends, limit, t0)
         val lb1: (Int, Int) -> Double
         /** Il peso vero del pezzo di mezzo dalle ricerche, quando è esatto (null se no): vedi Ends. */
@@ -730,6 +736,10 @@ class CrossBorderDirections(
         val t0 = System.currentTimeMillis()
         val mNear = (if (shortIsB) ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true) else ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false)) ?: return null
         val mFar = (if (shortIsB) ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false) else ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true)) ?: return null
+        // dove i pesi di ricerca sono quelli dei pezzi (vedi Ends): allora niente pezzo, la ricerca va avanti fino al passaggio
+        val ends = ends(ctx, prefix, suffix, radius, gb) ?: return none
+        val nearExact = if (shortIsB) ends.endExact else ends.startExact; val nearInner = if (shortIsB) ends.endInner else ends.startInner
+        val farExact = if (shortIsB) ends.startExact else ends.endExact; val farInner = if (shortIsB) ends.startInner else ends.endInner
         val nearWeight = DoubleArray(cands.size) { Double.NaN }
         val farWeight = DoubleArray(cands.size) { Double.NaN }
         var best = limit; var bestI = -1; var nearCount = 0; var farCount = 0; var farMs = 0L
@@ -744,14 +754,14 @@ class CrossBorderDirections(
             if (nearWeight[i].isNaN()) {
                 // prima il limite vero del lato vicino (la sua ricerca va avanti solo fin lì), poi il pezzo
                 if (!mNear.isFinal(i)) { mNear.advance { mNear.isFinal(i) || mFar.lowerBound(i) + mNear.lowerBound(i) > key }; continue }
-                nearWeight[i] = ctx.pieceWeight(near, nearPiece(cands[i])); nearCount++
+                nearWeight[i] = if (nearExact) nearInner + mNear.weight(i) else { nearCount++; ctx.pieceWeight(near, nearPiece(cands[i])) }
                 continue
             }
             // poi il limite vero del lato lontano (una ricerca sola per tutti i passaggi, fin dove serve):
             // i pezzi lontani costano (evita pedaggi: secondi) e così ne serve di solito uno
             if (!mFar.isFinal(i)) { mFar.advance { mFar.isFinal(i) || nearWeight[i] + mFar.lowerBound(i) > key }; continue }
             val t1 = System.currentTimeMillis()
-            farWeight[i] = ctx.pieceWeight(far, farPiece(cands[i])); farCount++
+            farWeight[i] = if (farExact) farInner + mFar.weight(i) else { farCount++; ctx.pieceWeight(far, farPiece(cands[i])) }
             farMs += System.currentTimeMillis() - t1
             val total = nearWeight[i] + farWeight[i]
             if (total < best) { best = total; bestI = i }
