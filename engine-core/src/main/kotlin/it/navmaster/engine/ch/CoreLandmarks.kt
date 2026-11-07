@@ -116,6 +116,9 @@ class CoreLandmarks private constructor(
 
     fun close() { if (ownsIndex) coreIndex.close(); distanceBits.close() }
 
+    /** Riscaldamento (vedi [DataAccess.touch]): le distanze e, se è suo, l'indice del core. Byte toccati. */
+    fun touch(): Long = distanceBits.touch() + (if (ownsIndex) coreIndex.touch() else 0)
+
     /**
      * Salva nel file `landmarks_<name>`; [withIndex] falso per un insieme con strade escluse, che al
      * caricamento prende l'indice del core dall'insieme completo (28 MB in meno per l'Italia).

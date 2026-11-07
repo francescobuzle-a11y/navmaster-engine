@@ -9,6 +9,8 @@ abstract class IntSource {
     abstract val size: Int
     abstract operator fun get(i: Int): Int
     open fun close() {}
+    /** Carica nella cache del sistema i byte letti (vedi [DataAccess.touch]); 0 in RAM. */
+    open fun touch(): Long = 0
 
     class OfArray(private val a: IntArray) : IntSource() {
         override val size get() = a.size
@@ -19,6 +21,7 @@ abstract class IntSource {
     class OfData(private val da: DataAccess, private val offset: Long, override val size: Int) : IntSource() {
         override fun get(i: Int) = da.getInt(offset + i.toLong() * 4)
         override fun close() { da.close() }
+        override fun touch(): Long = da.touch()
         /** [count] interi da [from] in [dst] in un colpo solo. */
         fun read(from: Int, dst: IntArray, count: Int) = da.getInts(offset + from.toLong() * 4, dst, 0, count)
     }

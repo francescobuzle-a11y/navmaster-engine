@@ -81,6 +81,9 @@ class CHStorage(private val dir: GraphDirectory, val name: String, val baseEdges
         return true
     }
 
+    /** Riscaldamento (vedi [DataAccess.touch]): i livelli dei nodi e, se [withShortcuts], gli shortcut. Byte toccati. */
+    fun touch(withShortcuts: Boolean): Long = nodes.touch() + (if (withShortcuts) shortcuts.touch() else 0)
+
     override fun close() { shortcuts.close(); nodes.close() }
 
     companion object {

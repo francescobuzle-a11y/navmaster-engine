@@ -34,6 +34,12 @@ abstract class DataAccess(val name: String, segmentSize: Int) : Closeable {
     /** Capacità attuale in byte (multiplo della dimensione del segmento). */
     abstract val capacity: Long
     protected abstract fun segments(): Int
+
+    /**
+     * Carica il file nella cache del sistema (riscaldamento: sul tablet la prima ricerca dopo
+     * l'avvio legge i file a caso e costa 6 volte quelle dopo). Byte toccati; 0 quando è in RAM.
+     */
+    open fun touch(): Long = 0
     protected abstract fun addSegments(count: Int)
     protected abstract fun segment(index: Int): ByteBuffer
 
@@ -233,6 +239,11 @@ class MmapDataAccess(name: String, private val file: File, segmentSize: Int = Da
         for (s in segs) s.force()
         writeFileHeader(r, capacity, segmentSize, header)
         r.channel.force(true)
+    }
+
+    override fun touch(): Long {
+        for (s in segs) s.load()
+        return capacity
     }
 
     override fun close() {

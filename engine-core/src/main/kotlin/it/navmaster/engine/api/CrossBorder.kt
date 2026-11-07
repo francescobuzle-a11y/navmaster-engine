@@ -485,11 +485,18 @@ class CrossBorderDirections(
      * mezz'ora): i passaggi più lontani, o irraggiungibili, restano con un limite inferiore (la
      * frontiera), che basta a scartarli; portarla a termine costerebbe tutto il core (Italia: 3 s).
      */
+    /**
+     * Porta avanti una ricerca di limite fin oltre il passaggio più vicino di [WINDOW_FACTOR] più
+     * [WINDOW_SLACK] secondi: per i passaggi più lontani restano i limiti dei landmark e della
+     * frontiera. La finestra non tocca l'esattezza (sono limiti inferiori comunque), solo quanti
+     * pezzi si pesano poi; con 1,5× + 30 min la ricerca dall'Italia verso l'Austria esplorava 461 000
+     * nodi del core (quasi tutta l'Italia: 10 s sul tablet).
+     */
     private fun CoreManyToOne.advanceAround() {
         advance {
             var near = Double.POSITIVE_INFINITY
             for (i in 0 until otherCount) if (isFinal(i) && weight(i) < near) near = weight(i)
-            near.isFinite() && bound > near * 1.5 + 1800
+            near.isFinite() && bound > near * WINDOW_FACTOR + WINDOW_SLACK
         }
     }
 
@@ -878,6 +885,9 @@ class CrossBorderDirections(
     private fun round1(v: Double) = Math.round(v * 10) / 10.0
 
     companion object {
+        /** La finestra delle ricerche di limite oltre il passaggio più vicino (vedi [advanceAround]): un decimo più dieci minuti. */
+        const val WINDOW_FACTOR = 1.1
+        const val WINDOW_SLACK = 600.0
         /** Il raggio di aggancio di un passaggio di confine: il punto è un nodo della strada. */
         const val TRANSFER_RADIUS = 3.0
 

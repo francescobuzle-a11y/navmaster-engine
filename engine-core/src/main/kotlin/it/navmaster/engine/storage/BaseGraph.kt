@@ -332,6 +332,10 @@ class BaseGraph(
         return true
     }
 
+    /** Riscaldamento (vedi [DataAccess.touch]) dei file scelti. Byte toccati. */
+    fun touch(withNodes: Boolean, withEdges: Boolean, withGeometry: Boolean): Long =
+        (if (withNodes) nodes.touch() else 0) + (if (withEdges) edges.touch() else 0) + (if (withGeometry) geometry.touch() else 0)
+
     override fun close() { nodes.close(); edges.close(); geometry.close(); names.close() }
 
     companion object {

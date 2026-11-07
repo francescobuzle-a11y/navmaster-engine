@@ -244,6 +244,39 @@ class RoutingGraph private constructor(
             quick = quick, quickAccepts = avoid)
     }
 
+    /**
+     * Riscaldamento: carica nella cache del sistema i file che una ricerca col core per [profile]
+     * tocca a caso (sul tablet la prima ricerca dopo l'avvio costava 6 volte quelle dopo: 28 s contro
+     * 16 s fino a Komjatice). In ordine di resa per byte: i livelli del core, i landmark (l'insieme
+     * completo e quello per [avoidFeatures]), gli shortcut del core, i nodi, gli archi; si ferma
+     * oltre [budget] byte. Da chiamare in sottofondo, a bassa priorità; in RAM non fa nulla.
+     * Ritorna una riga di diagnostica (file e MB toccati, tempo).
+     */
+    fun warm(profile: String, weighting: WeightingMethod? = null, avoidFeatures: Int = AvoidFeatureFlags.TOLLWAYS, budget: Long = 1L shl 30): String {
+        val t0 = System.currentTimeMillis()
+        val name = encoderName(profile)
+        val pe = encoding.profile(name)
+        val w = WeightingFactory.create(encoding, pe, weighting ?: defaultCHWeighting(name))
+        val coreKey = "${chKey(name, w)}_core"
+        var bytes = 0L
+        val done = ArrayList<String>()
+        fun step(label: String, run: () -> Long): Boolean {
+            if (bytes >= budget) return false
+            val b = run(); bytes += b
+            if (b > 0) done += "$label ${b shr 20} MB"
+            return true
+        }
+        val core = chStorages[coreKey]
+        step("livelli") { core?.touch(withShortcuts = false) ?: 0 } &&
+            step("landmark") { landmarks[coreKey]?.touch() ?: 0 } &&
+            step("landmark ${CoreLandmarks.setName(avoidFeatures and AvoidFeatureFlags.forCategory(pe.profile.category))}") {
+                landmarksFor(coreKey, avoidFeatures and AvoidFeatureFlags.forCategory(pe.profile.category))?.takeIf { it.avoidFeatures != 0 }?.touch() ?: 0 } &&
+            step("shortcut") { core?.touch(withShortcuts = true)?.let { it - (core.touch(withShortcuts = false)) } ?: 0 } &&
+            step("nodi") { graph.touch(withNodes = true, withEdges = false, withGeometry = false) } &&
+            step("archi") { graph.touch(withNodes = false, withEdges = true, withGeometry = false) }
+        return "riscaldamento $coreKey: ${bytes shr 20} MB in ${System.currentTimeMillis() - t0} ms (${done.joinToString()})"
+    }
+
     fun flush() { graph.flush(); turnCosts.flush(); guidance?.flush(graph.edgeCount); points?.flush(); GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); save() } }
 
     override fun close() {
