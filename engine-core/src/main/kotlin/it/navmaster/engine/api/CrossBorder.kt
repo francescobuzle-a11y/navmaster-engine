@@ -517,7 +517,7 @@ class CrossBorderDirections(
     private fun chooseTransit(ctx: Ctx, ga: CountryGraph, gMid: CountryGraph, gEnd: CountryGraph, c01: List<Transfer>, c12: List<Transfer>,
                               inM1: List<Snap>, inM2: List<Snap>, m0: CoreManyToOne, m2: CoreManyToOne,
                               pieceA: (Transfer) -> DirectionsRequest, pieceMid: (Transfer, Transfer) -> DirectionsRequest, pieceEnd: (Transfer) -> DirectionsRequest,
-                              limit: Double, t0: Long): Triple<Transfer?, Transfer?, Double>? {
+                              ends: Ends, limit: Double, t0: Long): Triple<Transfer?, Transfer?, Double>? {
         val none = Triple<Transfer?, Transfer?, Double>(null, null, Double.POSITIVE_INFINITY)
         m0.advanceAround()
         // le radici coi limiti inferiori (i pesi, dove definitivi): i limiti restano tali
@@ -539,7 +539,8 @@ class CrossBorderDirections(
             if (ky < 0 || key >= best) break
             if (w2[ky].isNaN()) {
                 if (!m2.isFinal(ky)) { m2.advance { m2.isFinal(ky) || b1[ky] + m2.lowerBound(ky) > key }; continue }
-                w2[ky] = ctx.pieceWeight(gEnd, pieceEnd(c12[ky])); evaluated++
+                // il peso di ricerca è quello del pezzo quando niente lo distingue (vedi Ends); se no il pezzo
+                w2[ky] = if (ends.endExact) ends.endInner + m2.weight(ky) else { evaluated++; ctx.pieceWeight(gEnd, pieceEnd(c12[ky])) }
                 continue
             }
             // i pesi di ricerca da ogni X a questo Y, poi le coppie in ordine di limite
@@ -547,10 +548,18 @@ class CrossBorderDirections(
             my.advanceAround(); searches++
             val order = c01.indices.filter { m0.lowerBound(it).isFinite() && my.lowerBound(it).isFinite() }.sortedBy { m0.lowerBound(it) + my.lowerBound(it) }
             for (x in order) {
-                if (m0.lowerBound(x) + my.lowerBound(x) + w2[ky] >= best) break
-                if (w0[x].isNaN()) { w0[x] = ctx.pieceWeight(ga, pieceA(c01[x])); evaluated++ }
+                if (m0.lowerBound(x) + my.lowerBound(x) + w2[ky] >= best) continue
+                if (w0[x].isNaN()) {
+                    // prima il peso vero del capo dalla sua ricerca (va avanti solo fin lì), poi, se serve, il pezzo
+                    if (!m0.isFinal(x)) m0.advance { m0.isFinal(x) || m0.lowerBound(x) + my.lowerBound(x) + w2[ky] >= best }
+                    if (!m0.isFinal(x)) continue
+                    w0[x] = if (ends.startExact) ends.startInner + m0.weight(x) else { evaluated++; ctx.pieceWeight(ga, pieceA(c01[x])) }
+                }
                 if (w0[x] + my.lowerBound(x) + w2[ky] >= best) continue
-                val w1 = ctx.pieceWeight(gMid, pieceMid(c01[x], c12[ky])); evaluated++
+                // in transito il pezzo di mezzo va da valico a valico senza tappe né direzioni: il peso di ricerca è esatto
+                if (!my.isFinal(x)) my.advance { my.isFinal(x) || w0[x] + my.lowerBound(x) + w2[ky] >= best }
+                if (!my.isFinal(x)) continue
+                val w1 = my.weight(x)
                 val total = w0[x] + w1 + w2[ky]
                 if (total < best) { best = total; bx = x; by = ky }
             }
@@ -562,6 +571,15 @@ class CrossBorderDirections(
 
     /** Il valico scelto e il peso del viaggio intero che ci passa (+∞ senza). */
     private class Choice(val weight: Double, val transfer: Transfer?)
+
+    /**
+     * Quando il peso di ricerca ([Router.manyToOne], stessi pesi e filtri del percorso finale) di un
+     * capo è esattamente quello del pezzo: senza direzione (`bearings`) al punto del capo e, con
+     * più punti nel capo, senza `continue_straight` (che lega le tappe fra loro); allora il pezzo
+     * pesa la ricerca più le tappe interne del capo ([startInner]/[endInner], pesate una volta).
+     * Se no la ricerca resta un limite inferiore e il pezzo si calcola.
+     */
+    private class Ends(val startExact: Boolean, val startInner: Double, val endExact: Boolean, val endInner: Double)
 
     /**
      * I due valichi di un viaggio che attraversa due confini, scelti insieme: da [prefix] (grafo A)
@@ -601,8 +619,18 @@ class CrossBorderDirections(
         // i limiti inferiori
         val m0 = ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false) ?: return null
         val m2 = ctx.router(gEnd).manyToOne(sq, inE, rootIsTarget = true) ?: return null
-        if (mid == null) return chooseTransit(ctx, ga, gMid, gEnd, c01, c12, inM1, inM2, m0, m2, ::pieceA, ::pieceMid, ::pieceEnd, limit, t0)
+        // dove i pesi di ricerca ai capi sono quelli dei pezzi (vedi Ends)
+        val startExact = prefix.bearings.last() == null && (prefix.points.size == 1 || !request.continueStraight)
+        val startInner = if (!startExact || prefix.points.size == 1) 0.0 else ctx.pieceWeight(ga, request.withPoints(prefix.points, prefix.radiuses.toDoubleArray(), prefix.exact.toBooleanArray(), prefix.bearings))
+        val suffixPts = suffix.map { request.coordinates[it] }
+        val endExact = request.bearings?.getOrNull(qi) == null && (suffixPts.size == 1 || !request.continueStraight)
+        val endInner = if (!endExact || suffixPts.size == 1) 0.0 else ctx.pieceWeight(gEnd, request.withPoints(suffixPts, suffix.map { radius(it) }.toDoubleArray(), suffix.map { false }.toBooleanArray(), suffix.map { request.bearings?.getOrNull(it) }))
+        if (startInner.isInfinite() || endInner.isInfinite()) return none
+        val ends = Ends(startExact, startInner, endExact, endInner)
+        if (mid == null) return chooseTransit(ctx, ga, gMid, gEnd, c01, c12, inM1, inM2, m0, m2, ::pieceA, ::pieceMid, ::pieceEnd, ends, limit, t0)
         val lb1: (Int, Int) -> Double
+        /** Il peso vero del pezzo di mezzo dalle ricerche, quando è esatto (null se no): vedi Ends. */
+        var midWeight: ((Int, Int) -> Double?)? = null
         var midStats = ""
         run {
             val f = request.coordinates[mid.first]; val l = request.coordinates[mid.last]
@@ -619,6 +647,12 @@ class CrossBorderDirections(
                 mid.map { radius(it) }.toDoubleArray(), mid.map { false }.toBooleanArray(), mid.map { request.bearings?.getOrNull(it) }))
             if (inner.isInfinite()) return none
             lb1 = { x, y -> mA.lowerBound(x) + mB.lowerBound(y) + inner }
+            // esatto senza continue_straight (lega le tappe) e senza direzione all'ultima tappa (vale per la partenza da lì)
+            if (!request.continueStraight && request.bearings?.getOrNull(mid.last) == null) midWeight = { x, y ->
+                if (!mA.isFinal(x)) mA.advance { mA.isFinal(x) }
+                if (!mB.isFinal(y)) mB.advance { mB.isFinal(y) }
+                mA.weight(x) + inner + mB.weight(y)
+            }
         }
         ctx.queries += 4
         val w0 = DoubleArray(c01.size) { Double.NaN }; val w2 = DoubleArray(c12.size) { Double.NaN }
@@ -642,11 +676,11 @@ class CrossBorderDirections(
             when {
                 // prima il limite vero del capo (la sua ricerca va avanti solo fin lì), poi il pezzo
                 !m0.isFinal(kx) && w0[kx].isNaN() -> m0.advance { m0.isFinal(kx) || m0.lowerBound(kx) + rest1 + (if (w2[ky].isNaN()) m2.lowerBound(ky) else w2[ky]) > key + slack(key) }
-                w0[kx].isNaN() -> { w0[kx] = ctx.pieceWeight(ga, pieceA(c01[kx])); evaluated++ }
+                w0[kx].isNaN() -> w0[kx] = if (ends.startExact) ends.startInner + m0.weight(kx) else { evaluated++; ctx.pieceWeight(ga, pieceA(c01[kx])) }
                 !m2.isFinal(ky) && w2[ky].isNaN() -> m2.advance { m2.isFinal(ky) || w0[kx] + rest1 + m2.lowerBound(ky) > key + slack(key) }
-                w2[ky].isNaN() -> { w2[ky] = ctx.pieceWeight(gEnd, pieceEnd(c12[ky])); evaluated++ }
+                w2[ky].isNaN() -> w2[ky] = if (ends.endExact) ends.endInner + m2.weight(ky) else { evaluated++; ctx.pieceWeight(gEnd, pieceEnd(c12[ky])) }
                 else -> {
-                    w1[kx][ky] = ctx.pieceWeight(gMid, pieceMid(c01[kx], c12[ky])); evaluated++
+                    w1[kx][ky] = midWeight?.invoke(kx, ky) ?: run { evaluated++; ctx.pieceWeight(gMid, pieceMid(c01[kx], c12[ky])) }
                     val total = w0[kx] + w1[kx][ky] + w2[ky]
                     if (total < best) { best = total; bx = kx; by = ky }
                 }
