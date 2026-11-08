@@ -165,8 +165,11 @@ class CrossBorderDirections(
      */
     internal var windowFactor = WINDOW_FACTOR
     internal var windowSlack = WINDOW_SLACK
-    internal var startWindowFactor = WINDOW_FACTOR
-    internal var startWindowSlack = WINDOW_SLACK
+    // dal primo capo in transito basta arrivare al passaggio più vicino: le radici del Paese di mezzo
+    // prendono i limiti degli altri dalla frontiera (Soncino → Monaco di Baviera: in Italia 92 000 nodi
+    // invece di 176 000, stessi valichi; per Komjatice uguale, la ricerca deve arrivare a Tarvisio)
+    internal var startWindowFactor = 1.0
+    internal var startWindowSlack = 0.0
 
     /** Il peso del viaggio scelto all'ultimo confine e i suoi valichi (diagnostica, prove). */
     internal var lastWeight = Double.NaN; private set
