@@ -35,7 +35,13 @@ class CrossBorderRealDiagTest {
             t.split(';').map { p -> p.split(',').let { it[0].trim().toDouble() to it[1].trim().toDouble() } }
         }
         val cb = CrossBorderDirections(graphs, transfers, { println("  $it") })
-        for (pts in trips) {
+        // NM_WINDOW: finestre delle ricerche di limite da provare, "fattore,secondi,fattore capo,secondi capo|…"
+        val windows = (System.getenv("NM_WINDOW") ?: "").split('|').filter { it.isNotBlank() }.map { w -> w.split(',').map { it.trim().toDouble() } }
+        for (w in windows.ifEmpty { listOf(null) }) for (pts in trips) {
+            if (w != null) {
+                cb.windowFactor = w[0]; cb.windowSlack = w[1]; cb.startWindowFactor = w.getOrElse(2) { w[0] }; cb.startWindowSlack = w.getOrElse(3) { w[1] }
+                println("== finestra ${w.joinToString(",")}")
+            }
             val body = linkedMapOf<String, Any?>(
                 "coordinates" to pts.map { listOf(it.second, it.first) }, "preference" to "recommended", "instructions" to true, "language" to "it",
                 // NM_AVOID: le strade da evitare (es. `tollways,ferries`), per misurare l'alternativa senza pedaggi dell'app

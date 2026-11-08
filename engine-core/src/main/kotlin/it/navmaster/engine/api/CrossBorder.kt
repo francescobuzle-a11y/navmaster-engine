@@ -158,6 +158,16 @@ class CrossBorderDirections(
 ) {
     private class LL(val lat: Double, val lon: Double)
 
+    /**
+     * La finestra delle ricerche di limite oltre il passaggio più vicino ([advanceAround]): un fattore
+     * e dei secondi; [startWindowFactor]/[startWindowSlack] per la ricerca dal primo capo in transito
+     * (in Italia la più grande). Non toccano l'esattezza, solo il lavoro: modificabili per le prove.
+     */
+    internal var windowFactor = WINDOW_FACTOR
+    internal var windowSlack = WINDOW_SLACK
+    internal var startWindowFactor = WINDOW_FACTOR
+    internal var startWindowSlack = WINDOW_SLACK
+
     /** Il peso del viaggio scelto all'ultimo confine e i suoi valichi (diagnostica, prove). */
     internal var lastWeight = Double.NaN; private set
     internal var lastCrossings: List<Transfer> = emptyList(); private set
@@ -492,11 +502,11 @@ class CrossBorderDirections(
      * pezzi si pesano poi; con 1,5× + 30 min la ricerca dall'Italia verso l'Austria esplorava 461 000
      * nodi del core (quasi tutta l'Italia: 10 s sul tablet).
      */
-    private fun CoreManyToOne.advanceAround() {
+    private fun CoreManyToOne.advanceAround(factor: Double = windowFactor, slack: Double = windowSlack) {
         advance {
             var near = Double.POSITIVE_INFINITY
             for (i in 0 until otherCount) if (isFinal(i) && weight(i) < near) near = weight(i)
-            near.isFinite() && bound > near * WINDOW_FACTOR + WINDOW_SLACK
+            near.isFinite() && bound > near * factor + slack
         }
     }
 
@@ -519,7 +529,8 @@ class CrossBorderDirections(
                               pieceA: (Transfer) -> DirectionsRequest, pieceMid: (Transfer, Transfer) -> DirectionsRequest, pieceEnd: (Transfer) -> DirectionsRequest,
                               ends: Ends, limit: Double, t0: Long): Triple<Transfer?, Transfer?, Double>? {
         val none = Triple<Transfer?, Transfer?, Double>(null, null, Double.POSITIVE_INFINITY)
-        m0.advanceAround()
+        m0.advanceAround(startWindowFactor, startWindowSlack)
+        val m0Window = m0.stats
         // le radici coi limiti inferiori (i pesi, dove definitivi): i limiti restano tali
         val roots = c01.indices.map { inM1[it] to m0.lowerBound(it) }
         if (roots.none { it.second.isFinite() }) return none
@@ -565,7 +576,7 @@ class CrossBorderDirections(
             }
             done[ky] = true
         }
-        log?.invoke("    due valichi insieme, transito (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)} fra ${c01.size}×${c12.size} coppie, ${done.count { it }} uscite esaminate, $searches ricerche, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms; ${ga.id} ${m0.stats}; ${gMid.id} ${mm.stats}; ${gEnd.id} ${m2.stats}")
+        log?.invoke("    due valichi insieme, transito (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)} fra ${c01.size}×${c12.size} coppie, ${done.count { it }} uscite esaminate, $searches ricerche, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms; ${ga.id} ${m0.stats} (finestra: $m0Window); ${gMid.id} ${mm.stats}; ${gEnd.id} ${m2.stats}")
         return if (bx < 0) none else Triple(c01[bx], c12[by], best)
     }
 

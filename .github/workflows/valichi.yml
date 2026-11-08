@@ -18,6 +18,9 @@ on:
       avoid:
         description: "Strade da evitare nella diagnosi (es. tollways,ferries); vuoto: ferries"
         default: ""
+      window:
+        description: "Finestre delle ricerche di limite da provare (fattore,secondi,fattore capo,secondi capo|…); vuoto: quella del motore"
+        default: ""
   push:
     branches: [main]
     paths: [".github/workflows/valichi.yml"]
@@ -58,10 +61,12 @@ jobs:
           TEST: ${{ inputs.test || 'it.navmaster.engine.api.CrossBorderRealDiagTest' }}
           NM_TRIPS: ${{ inputs.trips }}
           NM_AVOID: ${{ inputs.avoid }}
+          NM_WINDOW: ${{ inputs.window }}
         run: |
           chmod +x gradlew
           [ -n "$NM_TRIPS" ] || unset NM_TRIPS
           [ -n "$NM_AVOID" ] || unset NM_AVOID
+          [ -n "$NM_WINDOW" ] || unset NM_WINDOW
           ./gradlew --no-daemon :engine-core:test --tests "$TEST" -i 2>&1 | tee prova.log | grep -vE "^(> Task|Skipping|Caching|Resolving|Downloading|Download|Starting process|Successfully started|Finished generating)" | grep -E "^\s{4}|PASSED|FAILED|BUILD" || true
           grep -q "BUILD SUCCESSFUL" prova.log
       - name: Registro
