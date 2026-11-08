@@ -135,6 +135,8 @@ class CoreDijkstra(
     private val coreLevel = base.nodeCount
     private fun inCore(node: Int) = storage.level(node) >= coreLevel
     private val potentials: CorePotentials? = landmarks?.takeIf { it.landmarkCount > 0 }?.let { CorePotentials(it) }
+    // i pesi degli archi base vengono dall'iteratore del core: devono essere quelli della ricerca
+    init { require(ch.weighting === weighting) { "il grafo del core e la ricerca devono avere lo stesso weighting" } }
     /** The landmark set in use (`allow_all`, `tollways`…), for the stats. */
     private val landmarkSet = landmarks?.takeIf { it.landmarkCount > 0 }?.setName
 
@@ -353,23 +355,18 @@ class CoreDijkstra(
         coreIt.setBaseNode(node, reverse)
         while (coreIt.next()) {
             val adj = coreIt.adjNode
-            if (!inCore(adj)) continue
+            if (coreIt.adjLevel < coreLevel) continue
             val chEdge = coreIt.chEdge
-            var ew = coreIt.weight
+            // il peso dell'arco base è già quello della richiesta (l'iteratore usa lo stesso weighting, dallo stesso nodo)
+            val ew = coreIt.weight
             var firstBase = chEdge; var lastBase = chEdge
             if (coreIt.isShortcut) {
                 if (edgeBased) {
-                    // primo/ultimo arco base memorizzati nell'orientamento nodeA→nodeB del record
+                    // primo/ultimo arco base nell'orientamento nodeA→nodeB del record: l'iteratore dà solo gli shortcut con nodeA = node
                     val sc = storage.shortcutIndex(chEdge)
-                    if (storage.nodeA(sc) == node) { firstBase = storage.origFirst(sc); lastBase = storage.origLast(sc) }
-                    else { firstBase = storage.origLast(sc); lastBase = storage.origFirst(sc) }
+                    firstBase = storage.origFirst(sc); lastBase = storage.origLast(sc)
                 }
-            } else {
-                baseIt.setEdge(chEdge, node)
-                if (!filter.accept(baseIt)) continue
-                ew = weighting.edgeWeight(baseIt, reverse)
-                if (ew.isInfinite()) continue
-            }
+            } else if (!coreIt.accepts(filter)) continue
             var turn = 0.0
             if (edgeBased && inEdge >= 0) {
                 turn = if (!reverse) turnCosts!!.turnWeight(inEdge, node, firstBase) else turnCosts!!.turnWeight(firstBase, node, inEdge)

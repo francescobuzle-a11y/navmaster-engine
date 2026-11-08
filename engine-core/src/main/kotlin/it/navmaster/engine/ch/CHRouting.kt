@@ -12,7 +12,7 @@ import it.navmaster.engine.weighting.Weighting
  * Vista del grafo per le interrogazioni CH: archi base verso nodi di livello superiore
  * più gli shortcut registrati sul nodo (che vanno sempre "verso l'alto").
  */
-class CHGraph(val base: BaseGraph, val storage: CHStorage, private val weighting: Weighting) {
+class CHGraph(val base: BaseGraph, val storage: CHStorage, internal val weighting: Weighting) {
     private val baseEdges = base.edgeCount
 
     /** Iteratore riutilizzabile sugli archi CH uscenti (o entranti, per la ricerca indietro) di un nodo. */
@@ -26,6 +26,12 @@ class CHGraph(val base: BaseGraph, val storage: CHStorage, private val weighting
         var adjNode = -1; private set
         var weight = Double.POSITIVE_INFINITY; private set
         val isShortcut get() = chEdge >= baseEdges
+        /** The level of [node], read once per node (it was read again at every base edge). */
+        private var myLevel = 0
+        /** The level of [adjNode] when already read (base edges), else -1. */
+        private var adjLevelRead = -1
+        /** The level of [adjNode] (read once: the searches on the core ask it for every edge). */
+        val adjLevel: Int get() { if (adjLevelRead < 0) adjLevelRead = storage.level(adjNode); return adjLevelRead }
 
         /**
          * Whether [filter] lets the current edge through. A shortcut always does (as ORS's
@@ -36,6 +42,7 @@ class CHGraph(val base: BaseGraph, val storage: CHStorage, private val weighting
 
         fun setBaseNode(n: Int, reverse: Boolean): Iterator {
             node = n; reverseSearch = reverse
+            myLevel = storage.level(n)
             sc = storage.lastShortcut(n); inShortcuts = true
             if (sc < 0) { inShortcuts = false; baseIt.setBaseNode(n) }
             return this
@@ -43,19 +50,22 @@ class CHGraph(val base: BaseGraph, val storage: CHStorage, private val weighting
 
         fun next(): Boolean {
             while (inShortcuts) {
-                if (sc < 0 || storage.nodeA(sc) != node) { inShortcuts = false; baseIt.setBaseNode(node); break }
+                val w0 = if (sc < 0) 0 else storage.word0(sc)
+                // the shortcuts of a node are those registered on it (nodeA): every one returned starts at [node]
+                if (sc < 0 || (w0 ushr 1) != node) { inShortcuts = false; baseIt.setBaseNode(node); break }
                 val cur = sc--
-                val ok = if (!reverseSearch) storage.fwd(cur) else storage.bwd(cur)
+                val w1 = storage.word1(cur)
+                val ok = if (!reverseSearch) w0 and 1 == 1 else w1 and 1 == 1
                 if (!ok) continue
-                chEdge = baseEdges + cur; adjNode = storage.nodeB(cur); weight = storage.weight(cur)
+                chEdge = baseEdges + cur; adjNode = w1 ushr 1; weight = storage.weight(cur); adjLevelRead = -1
                 return true
             }
-            val myLevel = storage.level(node)
             while (baseIt.next()) {
-                if (storage.level(baseIt.adjNode) < myLevel) continue // solo verso l'alto (i pari livello sono il core)
+                val lv = storage.level(baseIt.adjNode)
+                if (lv < myLevel) continue // solo verso l'alto (i pari livello sono il core)
                 val w = weighting.edgeWeight(baseIt, reverseSearch)
                 if (w.isInfinite()) continue
-                chEdge = baseIt.edge; adjNode = baseIt.adjNode; weight = w
+                chEdge = baseIt.edge; adjNode = baseIt.adjNode; weight = w; adjLevelRead = lv
                 return true
             }
             return false

@@ -30,6 +30,8 @@ class CoreManyToOne(
 ) {
     private val base = ch.base
     private val storage = ch.storage
+    // i pesi degli archi base vengono dall'iteratore del core: devono essere quelli della ricerca
+    init { require(ch.weighting === weighting) { "il grafo del core e la ricerca devono avere lo stesso weighting" } }
     private val coreLevel = base.nodeCount
     private fun inCore(node: Int) = storage.level(node) >= coreLevel
     private val edgeBased get() = turnCosts != null
@@ -326,22 +328,17 @@ class CoreManyToOne(
         coreIt.setBaseNode(node, rootReverse)
         while (coreIt.next()) {
             val adj = coreIt.adjNode
-            if (!inCore(adj)) continue
+            if (coreIt.adjLevel < coreLevel) continue
             val chEdge = coreIt.chEdge
-            var ew = coreIt.weight
+            // come in CoreDijkstra: peso già della richiesta, shortcut solo con nodeA = node
+            val ew = coreIt.weight
             var firstBase = chEdge; var lastBase = chEdge
             if (coreIt.isShortcut) {
                 if (edgeBased) {
                     val sc = storage.shortcutIndex(chEdge)
-                    if (storage.nodeA(sc) == node) { firstBase = storage.origFirst(sc); lastBase = storage.origLast(sc) }
-                    else { firstBase = storage.origLast(sc); lastBase = storage.origFirst(sc) }
+                    firstBase = storage.origFirst(sc); lastBase = storage.origLast(sc)
                 }
-            } else {
-                baseIt.setEdge(chEdge, node)
-                if (!filter.accept(baseIt)) continue
-                ew = weighting.edgeWeight(baseIt, rootReverse)
-                if (ew.isInfinite()) continue
-            }
+            } else if (!coreIt.accepts(filter)) continue
             var turn = 0.0
             if (edgeBased && inEdge >= 0) {
                 turn = if (!rootReverse) turnCosts!!.turnWeight(inEdge, node, firstBase) else turnCosts!!.turnWeight(firstBase, node, inEdge)

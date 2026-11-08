@@ -57,6 +57,9 @@ class CHStorage(private val dir: GraphDirectory, val name: String, val baseEdges
 
     fun isShortcut(chEdge: Int) = chEdge >= baseEdges
     fun shortcutIndex(chEdge: Int) = chEdge - baseEdges
+    /** Il primo intero del record (`nodeA<<1|fwd`) e il secondo (`nodeB<<1|bwd`): una lettura ciascuno (sul tablet ogni lettura è una chiamata nativa). */
+    fun word0(sc: Int): Int = shortcuts.getInt(sc.toLong() * SHORTCUT_BYTES)
+    fun word1(sc: Int): Int = shortcuts.getInt(sc.toLong() * SHORTCUT_BYTES + 4)
     fun nodeA(sc: Int): Int = shortcuts.getInt(sc.toLong() * SHORTCUT_BYTES) ushr 1
     fun nodeB(sc: Int): Int = shortcuts.getInt(sc.toLong() * SHORTCUT_BYTES + 4) ushr 1
     fun fwd(sc: Int): Boolean = shortcuts.getInt(sc.toLong() * SHORTCUT_BYTES) and 1 == 1
