@@ -255,7 +255,20 @@ class RoutingGraph private constructor(
      * chiamare in sottofondo; in RAM non fa nulla. Ritorna una riga di diagnostica.
      */
     fun warm(profile: String, weighting: WeightingMethod? = null, avoidFeatures: Int = AvoidFeatureFlags.TOLLWAYS, budget: Long = 1L shl 30,
-             parts: Int = WARM_ALL, progress: ((done: Long, total: Long) -> Unit)? = null): String {
+             parts: Int = WARM_ALL, reverse: Boolean = false, dryRun: Boolean = false, progress: ((done: Long, total: Long) -> Unit)? = null): String =
+        warmRun(profile, weighting, avoidFeatures, budget, parts, reverse, dryRun, progress).second
+
+    /**
+     * I byte che [warm] leggerebbe con questo bilancio, senza leggerli: chi scalda più Paesi fa prima
+     * il piano per importanza e poi legge al contrario ([warm] con `reverse`), così se il sistema deve
+     * restituire cache restituisce i file meno utili (sul tablet, letti per primi, i livelli
+     * dell'Italia erano già usciti dalla cache alla prima ricerca: 11,6 s invece di 7,4).
+     */
+    fun warmBytes(profile: String, weighting: WeightingMethod? = null, avoidFeatures: Int = AvoidFeatureFlags.TOLLWAYS, budget: Long = 1L shl 30,
+                  parts: Int = WARM_ALL): Long = warmRun(profile, weighting, avoidFeatures, budget, parts, false, true, null).first
+
+    private fun warmRun(profile: String, weighting: WeightingMethod?, avoidFeatures: Int, budget: Long, parts: Int, reverse: Boolean, dryRun: Boolean,
+                        progress: ((done: Long, total: Long) -> Unit)?): Pair<Long, String> {
         val t0 = System.currentTimeMillis()
         val name = encoderName(profile)
         val pe = encoding.profile(name)
@@ -281,6 +294,9 @@ class RoutingGraph private constructor(
         var planned = 0L
         // un file entra se ci sta; uno grande che non ci sta lascia il posto ai successivi (le svolte dopo gli archi dell'Italia)
         for (step in all) { if (planned + step.bytes > budget) continue; plan += step; planned += step.bytes }
+        if (dryRun) return planned to "piano $coreKey: ${planned shr 20} MB (${plan.joinToString { "${it.label} ${it.bytes shr 20} MB" }})"
+        // al contrario: il più utile per ultimo, il più fresco nella cache
+        if (reverse) plan.reverse()
         var done = 0L
         val lines = ArrayList<String>()
         for (step in plan) {
@@ -290,7 +306,7 @@ class RoutingGraph private constructor(
             progress?.invoke(done, planned)
             lines += "${step.label} ${step.bytes shr 20} MB"
         }
-        return "riscaldamento $coreKey: ${done shr 20} MB in ${System.currentTimeMillis() - t0} ms (${lines.joinToString()})"
+        return done to "riscaldamento $coreKey: ${done shr 20} MB in ${System.currentTimeMillis() - t0} ms (${lines.joinToString()})"
     }
 
     fun flush() { graph.flush(); turnCosts.flush(); guidance?.flush(graph.edgeCount); points?.flush(); GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); save() } }

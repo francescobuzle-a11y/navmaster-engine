@@ -35,6 +35,12 @@ class WarmTest {
             assertTrue("shortcut" in core && "nodi" !in core && "archi" !in core, core)
             val rest = g.warm("driving-hgv", parts = RoutingGraph.WARM_GRAPH)
             assertTrue("svolte" in rest && "archi" in rest && "livelli" !in rest, rest)
+            // il piano senza leggere, e la lettura al contrario (il più utile per ultimo)
+            val planned = g.warmBytes("driving-hgv", parts = RoutingGraph.WARM_CORE)
+            assertTrue(planned > 0)
+            val back = g.warm("driving-hgv", budget = planned, parts = RoutingGraph.WARM_CORE, reverse = true)
+            assertTrue(back.indexOf("shortcut") < back.indexOf("livelli"), back)
+            assertTrue(g.warm("driving-hgv", dryRun = true).startsWith("piano "))
             assertEquals(before, weightOf(g), 1e-9)
         }
         RoutingGraph.load(dir, mmap = false).use { g ->
