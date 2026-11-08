@@ -80,6 +80,14 @@ class TurnCostStorage(private val dir: GraphDirectory, val encoding: TurnCostEnc
         return true
     }
 
+    /** Riscaldamento (vedi [DataAccess.touch]): teste delle liste e voci. Byte toccati. */
+    fun touch(progress: ((Long) -> Unit)? = null): Long {
+        val a = heads.touch(progress)
+        return a + costs.touch(progress?.let { p -> { b: Long -> p(a + b) } })
+    }
+    /** I byte che [touch] leggerebbe. */
+    val touchBytes: Long get() = heads.touchBytes + costs.touchBytes
+
     override fun close() { costs.close(); heads.close() }
 
     companion object {

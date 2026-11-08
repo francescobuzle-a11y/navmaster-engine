@@ -27,10 +27,14 @@ class WarmTest {
             // l'avanzamento: crescente, fino al totale previsto
             assertTrue(seen.isNotEmpty() && seen.last().first == seen.last().second && seen.zipWithNext().all { (a, b) -> b.first >= a.first && a.second == b.second }, seen.toString())
             assertTrue(line.startsWith("riscaldamento heavyvehicle_recommended_core:"), line)
-            for (part in listOf("livelli", "landmark ", "landmark tollways", "shortcut", "nodi", "archi")) assertTrue(part in line, "manca $part: $line")
-            // un bilancio piccolo: si ferma dopo i primi file
-            val short = g.warm("driving-hgv", budget = 1)
-            assertTrue("archi" !in short && "livelli" in short, short)
+            for (part in listOf("livelli", "landmark ", "landmark tollways", "shortcut", "nodi", "svolte", "archi")) assertTrue(part in line, "manca $part: $line")
+            // un bilancio che non basta a nessun file: niente; le parti scelte: solo quei file
+            val none = g.warm("driving-hgv", budget = 1)
+            assertTrue("livelli" !in none && "archi" !in none, none)
+            val core = g.warm("driving-hgv", parts = RoutingGraph.WARM_CORE)
+            assertTrue("shortcut" in core && "nodi" !in core && "archi" !in core, core)
+            val rest = g.warm("driving-hgv", parts = RoutingGraph.WARM_GRAPH)
+            assertTrue("svolte" in rest && "archi" in rest && "livelli" !in rest, rest)
             assertEquals(before, weightOf(g), 1e-9)
         }
         RoutingGraph.load(dir, mmap = false).use { g ->

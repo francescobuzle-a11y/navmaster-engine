@@ -248,13 +248,14 @@ class RoutingGraph private constructor(
      * Riscaldamento: carica nella cache del sistema i file che una ricerca col core per [profile]
      * tocca a caso (sul tablet la prima ricerca dopo l'avvio costava 6 volte quelle dopo: 28 s contro
      * 16 s fino a Komjatice). In ordine di resa per byte: i livelli del core, i landmark (l'insieme
-     * completo e quello per [avoidFeatures]), gli shortcut del core, i nodi, gli archi; un file
-     * entra solo se con esso si resta entro [budget] byte (il primo sempre). [progress] riceve i
+     * completo e quello per [avoidFeatures]), gli shortcut del core, i nodi, le svolte, gli archi;
+     * solo le [parts] chieste; un file entra solo se con esso si resta entro [budget] byte (più Paesi
+     * possono così dividersi un bilancio solo). [progress] riceve i
      * byte letti e quelli previsti, più volte per file (una schermata d'avvio con la barra). Da
      * chiamare in sottofondo; in RAM non fa nulla. Ritorna una riga di diagnostica.
      */
     fun warm(profile: String, weighting: WeightingMethod? = null, avoidFeatures: Int = AvoidFeatureFlags.TOLLWAYS, budget: Long = 1L shl 30,
-             progress: ((done: Long, total: Long) -> Unit)? = null): String {
+             parts: Int = WARM_ALL, progress: ((done: Long, total: Long) -> Unit)? = null): String {
         val t0 = System.currentTimeMillis()
         val name = encoderName(profile)
         val pe = encoding.profile(name)
@@ -264,19 +265,22 @@ class RoutingGraph private constructor(
         val core = chStorages[coreKey]
         val set = landmarksFor(coreKey, avoid)?.takeIf { it.avoidFeatures != 0 }
         // the plan: each file with its bytes and how to touch it (progress: bytes within the file)
-        class Step(val label: String, val bytes: Long, val run: (((Long) -> Unit)?) -> Long)
+        class Step(val label: String, val part: Int, val bytes: Long, val run: (((Long) -> Unit)?) -> Long)
         val all = listOf(
-            Step("livelli", core?.bytes(false) ?: 0) { p -> core?.touch(false, p) ?: 0 },
-            Step("landmark", landmarks[coreKey]?.bytes ?: 0) { p -> landmarks[coreKey]?.touch(p) ?: 0 },
-            Step("landmark ${CoreLandmarks.setName(avoid)}", set?.bytes ?: 0) { p -> set?.touch(p) ?: 0 },
-            Step("shortcut", core?.let { it.bytes(true) - it.bytes(false) } ?: 0) { p ->
+            Step("livelli", WARM_CORE, core?.bytes(false) ?: 0) { p -> core?.touch(false, p) ?: 0 },
+            Step("landmark", WARM_CORE, landmarks[coreKey]?.bytes ?: 0) { p -> landmarks[coreKey]?.touch(p) ?: 0 },
+            Step("landmark ${CoreLandmarks.setName(avoid)}", WARM_CORE, set?.bytes ?: 0) { p -> set?.touch(p) ?: 0 },
+            Step("shortcut", WARM_CORE, core?.let { it.bytes(true) - it.bytes(false) } ?: 0) { p ->
                 core?.let { c -> val lv = c.bytes(false); c.touch(true) { b -> if (p != null && b > lv) p(b - lv) } - lv } ?: 0 },
-            Step("nodi", graph.bytes(true, false, false)) { p -> graph.touch(true, false, false, p) },
-            Step("archi", graph.bytes(false, true, false)) { p -> graph.touch(false, true, false, p) },
-        ).filter { it.bytes > 0 }
+            Step("nodi", WARM_GRAPH, graph.bytes(true, false, false)) { p -> graph.touch(true, false, false, p) },
+            // le teste dei divieti di svolta: lette per ogni nodo delle ricerche edge-based
+            Step("svolte", WARM_GRAPH, turnCosts.touchBytes) { p -> turnCosts.touch(p) },
+            Step("archi", WARM_GRAPH, graph.bytes(false, true, false)) { p -> graph.touch(false, true, false, p) },
+        ).filter { it.bytes > 0 && it.part and parts != 0 }
         val plan = ArrayList<Step>()
         var planned = 0L
-        for (step in all) { if (plan.isNotEmpty() && planned + step.bytes > budget) break; plan += step; planned += step.bytes }
+        // un file entra se ci sta; uno grande che non ci sta lascia il posto ai successivi (le svolte dopo gli archi dell'Italia)
+        for (step in all) { if (planned + step.bytes > budget) continue; plan += step; planned += step.bytes }
         var done = 0L
         val lines = ArrayList<String>()
         for (step in plan) {
@@ -306,6 +310,11 @@ class RoutingGraph private constructor(
          * `2·16` float per nodo del core (~90 MB per core in Italia) e ~20 s di preparazione.
          */
         val DEFAULT_LANDMARK_SETS: List<Int> = listOf(AvoidFeatureFlags.TOLLWAYS)
+
+        /** Le parti di [warm]: i file del core (livelli, landmark, shortcut) e quelli del grafo (nodi, svolte, archi). */
+        const val WARM_CORE = 1
+        const val WARM_GRAPH = 2
+        const val WARM_ALL = WARM_CORE or WARM_GRAPH
 
         fun profileByName(name: String): VehicleProfile = when (name) {
             "car", "driving-car", "car-ors" -> CarProfile()
