@@ -259,6 +259,12 @@ class Router(
     fun manyToOne(root: Snap, others: List<Snap>, rootIsTarget: Boolean): CoreManyToOne? = manyToOne(listOf(root to 0.0), others, rootIsTarget)
 
     /**
+     * Vero se i pesi di [manyToOne] sono quelli esatti di [route] (stessi pesi, filtri e svolte); falso
+     * quando passano dalla ricerca rapida senza `avoid_features` (core ridotto): allora sono solo limiti inferiori.
+     */
+    val searchesExact: Boolean get() = quick == null || quickAccepts == null
+
+    /**
      * Come [manyToOne] con più radici, ognuna con un peso di partenza: per ogni altro punto il minimo
      * fra le radici del peso di partenza più quello del percorso (una radice con peso infinito non conta).
      */
