@@ -25,6 +25,7 @@ import it.navmaster.engine.storage.TurnCostStorage
 import it.navmaster.engine.weighting.EdgeFilter
 import it.navmaster.engine.profile.HeavyVehicleAttributes
 import it.navmaster.engine.profile.AvoidFeatureFlags
+import it.navmaster.engine.routing.PointNotFoundException
 import it.navmaster.engine.weighting.EdgeFilterFactory
 import it.navmaster.engine.weighting.AvoidFeaturesEdgeFilter
 import it.navmaster.engine.weighting.TurnCostProvider
@@ -307,6 +308,51 @@ class RoutingGraph private constructor(
             lines += "${step.label} ${step.bytes shr 20} MB"
         }
         return done to "riscaldamento $coreKey: ${done shr 20} MB in ${System.currentTimeMillis() - t0} ms (${lines.joinToString()})"
+    }
+
+    /**
+     * Riscaldamento del codice: qualche ricerca di prova sul core per [profile] (camion con misure:
+     * core edge-based coi filtri, come le richieste dell'app), così la JVM del tablet compila le parti
+     * calde prima del primo percorso vero. Sul tablet, subito dopo un'installazione o un avvio, il
+     * codice gira interpretato: la prima ricerca per Komjatice costava 13 s, 5,9 s con l'app compilata.
+     * Le ricerche si fermano dopo circa [nodes] nodi del core ciascuna. Ritorna una riga di diagnostica.
+     */
+    fun warmCode(profile: String, nodes: Int = 60_000): String {
+        val t0 = System.currentTimeMillis()
+        val hgv = encoderName(profile) == "heavyvehicle"
+        val params = if (hgv) VehicleParameters(length = 16.5, height = 4.0, width = 2.55, weight = 40.0, axleLoad = 11.5) else null
+        val router = router(RouteOptions(profile = profile, vehicleParameters = params))
+        val b = graph.bounds
+        val cLat = (b.minLat + b.maxLat) / 2; val cLon = (b.minLon + b.maxLon) / 2
+        val dLat = (b.maxLat - b.minLat) / 4; val dLon = (b.maxLon - b.minLon) / 4
+        // points around the middle of the country (some may fall in the sea or in a hole: skipped)
+        val snaps = ArrayList<it.navmaster.engine.index.Snap>()
+        for (i in 0 until 24) {
+            if (snaps.size >= 9) break
+            val a = i * 2.399963 // golden angle
+            val r = 0.3 + 0.7 * (i % 4) / 3.0
+            try { snaps += router.snap(cLat + Math.sin(a) * dLat * r, cLon + Math.cos(a) * dLon * r, 2000.0, 0) } catch (e: PointNotFoundException) { }
+        }
+        if (snaps.size < 2) return "riscaldamento del codice: nessun punto agganciato"
+        var settled = 0
+        // the bound searches of the crossings (many-to-one), stopped after about [nodes] nodes
+        router.manyToOne(snaps[0], snaps.drop(1), rootIsTarget = false)?.let { m ->
+            var steps = 0
+            m.advance { ++steps > nodes }
+            settled += steps
+        }
+        router.manyToOne(snaps[1], snaps.filterIndexed { i, _ -> i != 1 }, rootIsTarget = true)?.let { m ->
+            var steps = 0
+            m.advance { ++steps > nodes / 2 }
+            settled += steps
+        }
+        // a route (core-ALT, bidirectional) between the two points farthest apart
+        var routes = 0
+        for (k in 1 until snaps.size) {
+            if (routes >= 2) break
+            try { router.route(snaps[0], snaps[k]); routes++ } catch (e: Exception) { }
+        }
+        return "riscaldamento del codice: ${snaps.size} punti, $settled passi delle ricerche di limite, $routes percorsi in ${System.currentTimeMillis() - t0} ms"
     }
 
     fun flush() { graph.flush(); turnCosts.flush(); guidance?.flush(graph.edgeCount); points?.flush(); GraphProperties(File(dir, "profiles")).apply { load(); set("profiles", profileNames.joinToString(",")); save() } }

@@ -43,6 +43,12 @@ class WarmTest {
             assertTrue(g.warm("driving-hgv", dryRun = true).startsWith("piano "))
             assertEquals(before, weightOf(g), 1e-9)
         }
+        // il riscaldamento del codice: qualche ricerca di prova, senza errori, coi percorsi trovati
+        RoutingGraph.load(dir, mmap = true).use { g ->
+            val line = g.warmCode("driving-hgv", nodes = 2000)
+            println(line)
+            assertTrue(Regex("(\\d+) percorsi").find(line)!!.groupValues[1].toInt() >= 1, line)
+        }
         RoutingGraph.load(dir, mmap = false).use { g ->
             val line = g.warm("driving-hgv")
             assertTrue(line.contains(" 0 MB "), line)
