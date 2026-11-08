@@ -79,8 +79,10 @@ jobs:
             sudo mkdir -p "$d" && sudo chown "$USER" "$d"
             # the package whole, or in parts (over 2 GB: Germany, France)
             u="https://github.com/francescobuzle-a11y/navmaster/releases/download/dati-$c"
-            if curl -fsSIL "$u/nm.tar.gz" >/dev/null 2>&1; then curl -fsSL "$u/nm.tar.gz" | tar -xz -C "$d"
-            else { i=0; while curl -fsSL "$u/nm.tar.gz.part$i"; do i=$((i+1)); done; } | tar -xz -C "$d"; fi
+            # GitHub answers 504 now and then: each file retried (curl retries 5xx and timeouts; a missing part, 404, ends the loop)
+            R="--retry 6 --retry-delay 20"
+            if curl -fsSIL $R "$u/nm.tar.gz" >/dev/null 2>&1; then curl -fsSL $R "$u/nm.tar.gz" | tar -xz -C "$d"
+            else { i=0; while curl -fsSIL $R "$u/nm.tar.gz.part$i" >/dev/null 2>&1 && curl -fsSL $R "$u/nm.tar.gz.part$i"; do i=$((i+1)); done; } | tar -xz -C "$d"; fi
             g=$(dirname "$(find "$d" -name profiles | head -1)")
             echo "$c: $g ($(du -sh "$g" | cut -f1))"
             spec="$spec${spec:+,}$c=$g"
