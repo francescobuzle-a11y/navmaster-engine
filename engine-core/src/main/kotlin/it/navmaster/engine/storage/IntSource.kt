@@ -14,9 +14,13 @@ abstract class IntSource {
     /** I byte che [touch] leggerebbe. */
     open val bytes: Long get() = 0
 
+    /** [count] interi da [from] in [dst] (da [dstOff]) in un colpo solo: sul file mappato una copia sola invece di [count] chiamate native. */
+    abstract fun readInto(from: Int, dst: IntArray, dstOff: Int, count: Int)
+
     class OfArray(private val a: IntArray) : IntSource() {
         override val size get() = a.size
         override fun get(i: Int) = a[i]
+        override fun readInto(from: Int, dst: IntArray, dstOff: Int, count: Int) = System.arraycopy(a, from, dst, dstOff, count)
     }
 
     /** [size] interi dal byte [offset] di [da]. */
@@ -27,5 +31,6 @@ abstract class IntSource {
         override val bytes: Long get() = da.touchBytes
         /** [count] interi da [from] in [dst] in un colpo solo. */
         fun read(from: Int, dst: IntArray, count: Int) = da.getInts(offset + from.toLong() * 4, dst, 0, count)
+        override fun readInto(from: Int, dst: IntArray, dstOff: Int, count: Int) = da.getInts(offset + from.toLong() * 4, dst, dstOff, count)
     }
 }

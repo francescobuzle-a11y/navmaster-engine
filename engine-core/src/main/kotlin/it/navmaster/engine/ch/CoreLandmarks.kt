@@ -102,6 +102,25 @@ class CoreLandmarks private constructor(
         return java.lang.Float.intBitsToFloat(distanceBits[index]).toDouble()
     }
 
+    /**
+     * Le `2·k` distanze di [node] (d(L→v), d(v→L) per landmark, come [fromLandmark] e [toLandmark])
+     * in [dst] con una lettura sola ([buf] di almeno `2·k` interi); falso se il nodo non è nel core.
+     * Sul tablet ogni lettura singola del file mappato è una chiamata nativa: la ricerca sul core ne
+     * faceva fino a 256 per nodo (Italia → Austria: 9,6 s per 260 000 nodi, 0,9 s sul PC).
+     */
+    fun readNode(node: Int, dst: DoubleArray, buf: IntArray): Boolean {
+        val ci = coreIndex[node]; if (ci < 0) return false
+        val n = 2 * landmarkCount
+        val q = quantized
+        if (q != null) {
+            for (i in 0 until n) { val v = q[ci * n + i].toInt() and 0xFFFF; dst[i] = if (v == INF_STEP) Double.POSITIVE_INFINITY else v * step }
+            return true
+        }
+        distanceBits.readInto(ci * n, buf, 0, n)
+        for (i in 0 until n) dst[i] = java.lang.Float.intBitsToFloat(buf[i]).toDouble()
+        return true
+    }
+
     /** d(L→v); +∞ se v non è nel core o irraggiungibile. */
     fun fromLandmark(l: Int, node: Int): Double {
         val ci = coreIndex[node]; if (ci < 0) return Double.POSITIVE_INFINITY
@@ -340,21 +359,38 @@ class CorePotentials(private val lm: CoreLandmarks) {
     private val sAll = BooleanArray(k) { true }
     private var hasTargets = false; private var hasSources = false
 
+    /**
+     * Le distanze dell'ultimo nodo letto ([CoreLandmarks.readNode], una lettura sola) e i due limiti
+     * calcolati per lui: la ricerca chiede per lo stesso nodo il potenziale e se è irraggiungibile,
+     * in avanti e all'indietro (fino a quattro calcoli). Nessun cambio nei valori, solo meno letture.
+     */
+    private val dist = DoubleArray(2 * k)
+    private val buf = IntArray(2 * k)
+    private var node = -1
+    private var inCore = false
+    private var toT = Double.NaN
+    private var fromS = Double.NaN
+
+    private fun load(v: Int): Boolean {
+        if (v != node) { node = v; inCore = lm.readNode(v, dist, buf); toT = Double.NaN; fromS = Double.NaN }
+        return inCore
+    }
+
     fun addTarget(node: Int, b: Double) {
-        if (!lm.isCoreNode(node)) return
-        hasTargets = true
+        if (!load(node)) return
+        hasTargets = true; toT = Double.NaN; fromS = Double.NaN
         for (l in 0 until k) {
-            val toL = lm.toLandmark(l, node); val fromL = lm.fromLandmark(l, node)
+            val toL = dist[2 * l + 1]; val fromL = dist[2 * l]
             if (toL.isFinite()) tC1[l] = maxOf(tC1[l], toL - b) else tAll[l] = false
             if (fromL.isFinite()) tC2[l] = minOf(tC2[l], fromL + b)
         }
     }
 
     fun addSource(node: Int, f: Double) {
-        if (!lm.isCoreNode(node)) return
-        hasSources = true
+        if (!load(node)) return
+        hasSources = true; toT = Double.NaN; fromS = Double.NaN
         for (l in 0 until k) {
-            val fromL = lm.fromLandmark(l, node); val toL = lm.toLandmark(l, node)
+            val fromL = dist[2 * l]; val toL = dist[2 * l + 1]
             if (fromL.isFinite()) sC1[l] = maxOf(sC1[l], fromL - f) else sAll[l] = false
             if (toL.isFinite()) sC2[l] = minOf(sC2[l], toL + f)
         }
@@ -366,34 +402,38 @@ class CorePotentials(private val lm: CoreLandmarks) {
      * raggiunge: L raggiunge [node], quindi [node] non raggiunge quelle.
      */
     fun toTargets(node: Int): Double {
-        if (!hasTargets || !lm.isCoreNode(node)) return 0.0
+        if (!hasTargets || !load(node)) return 0.0
+        if (!toT.isNaN()) return toT
         var h = 0.0
         for (l in 0 until k) {
             if (tAll[l] && tC1[l].isFinite()) {
-                val toL = lm.toLandmark(l, node)
-                if (toL.isInfinite()) return Double.POSITIVE_INFINITY
+                val toL = dist[2 * l + 1]
+                if (toL.isInfinite()) { toT = Double.POSITIVE_INFINITY; return toT }
                 h = maxOf(h, toL - tC1[l])
             }
-            val fromL = lm.fromLandmark(l, node)
+            val fromL = dist[2 * l]
             if (fromL.isFinite() && tC2[l].isFinite()) h = maxOf(h, tC2[l] - fromL)
         }
-        return maxOf(0.0, h - margin)
+        toT = maxOf(0.0, h - margin)
+        return toT
     }
 
     /** Limite inferiore del costo dalle sorgenti a [node]; +∞ quando nessuna sorgente lo raggiunge (come sopra). */
     fun fromSources(node: Int): Double {
-        if (!hasSources || !lm.isCoreNode(node)) return 0.0
+        if (!hasSources || !load(node)) return 0.0
+        if (!fromS.isNaN()) return fromS
         var h = 0.0
         for (l in 0 until k) {
             if (sAll[l] && sC1[l].isFinite()) {
-                val fromL = lm.fromLandmark(l, node)
-                if (fromL.isInfinite()) return Double.POSITIVE_INFINITY
+                val fromL = dist[2 * l]
+                if (fromL.isInfinite()) { fromS = Double.POSITIVE_INFINITY; return fromS }
                 h = maxOf(h, fromL - sC1[l])
             }
-            val toL = lm.toLandmark(l, node)
+            val toL = dist[2 * l + 1]
             if (toL.isFinite() && sC2[l].isFinite()) h = maxOf(h, sC2[l] - toL)
         }
-        return maxOf(0.0, h - margin)
+        fromS = maxOf(0.0, h - margin)
+        return fromS
     }
 
     /** p_f(v); la ricerca all'indietro usa −p_f. */
