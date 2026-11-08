@@ -109,7 +109,7 @@ class CrossBorderReferenceTest {
             val problems = ArrayList<String>()
             // due volte: con la regola del motore e con la ricerca mirata su ogni passaggio (Reach): sui grafi
             // piccoli della prova la mirata non scatterebbe da sola, e i pesi devono restare quelli esatti
-            for ((mode, focus) in listOf("" to 600.0, " (mirate)" to -1.0)) for (case in cases) {
+            for ((mode, focus) in listOf("" to 0.0, " (mirate)" to -1.0)) for (case in cases) {
                 val cbd = CrossBorderDirections(listOf(a, b, c), case.transfers).also { it.focusBeyond = focus }
                 val ref = CrossBorderReference(listOf(a, b, c), case.transfers)
                 var equal = 0; var noRoute = 0; var multiBorder = 0; val diffs = ArrayList<String>()

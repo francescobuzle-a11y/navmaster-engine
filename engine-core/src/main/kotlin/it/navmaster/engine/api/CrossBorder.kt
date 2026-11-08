@@ -171,11 +171,14 @@ class CrossBorderDirections(
     internal var startWindowFactor = 1.0
     internal var startWindowSlack = 0.0
     /**
-     * La ricerca mirata ([Reach]): per un passaggio il cui limite supera di [focusBeyond] secondi la
-     * frontiera della ricerca verso tutti i passaggi, il peso esatto viene da una ricerca verso i soli
-     * passaggi entro [focusKm] km da lui. Negativo: sempre (prove). Non tocca l'esattezza.
+     * La ricerca mirata ([Reach]): per un passaggio lontano dal capo più di [focusRatio] volte (in linea
+     * d'aria) il passaggio più vicino già fissato dalla ricerca verso tutti, il peso esatto viene da una
+     * ricerca verso i soli passaggi entro [focusKm] km da lui. Il limite dei landmark non serve a dirlo:
+     * per Tarvisio da Canneto (312 km) è più basso della frontiera fissata al Brennero (214 km).
+     * [focusBeyond] negativo: sempre mirata (prove). Non tocca l'esattezza, solo il lavoro.
      */
-    internal var focusBeyond = 600.0
+    internal var focusBeyond = 0.0
+    internal var focusRatio = 1.25
     internal var focusKm = 30.0
 
     /** Il peso del viaggio scelto all'ultimo confine e i suoi valichi (diagnostica, prove). */
@@ -613,10 +616,21 @@ class CrossBorderDirections(
             return if (gi < 0) b else maxOf(b, groups[gi].lowerBound(posInGroup[i]))
         }
 
+        /** In linea d'aria dal capo al passaggio [k], in metri. */
+        private fun beeline(k: Int) = DistanceCalc.haversine(root.queryLat, root.queryLon, where[k].lat, where[k].lon)
+
+        /** Vero se [i] è lontano: oltre [focusRatio] volte il passaggio più vicino (in linea d'aria) già fissato dalla ricerca verso tutti. */
+        private fun far(i: Int): Boolean {
+            if (focusBeyond < 0) return true
+            var near = Double.POSITIVE_INFINITY
+            for (k in where.indices) if (base.isFinal(k) && base.weight(k).isFinite()) near = minOf(near, beeline(k))
+            return near.isFinite() && beeline(i) > near * focusRatio
+        }
+
         /** Avanti finché [i] ha il peso definitivo o [enough] (sul suo limite inferiore) è vero. */
         fun advanceFor(i: Int, enough: (Double) -> Boolean) {
             if (isFinal(i)) return
-            if (groupOf[i] < 0 && base.lowerBound(i) - base.bound <= focusBeyond) { base.advance { base.isFinal(i) || enough(lowerBound(i)) }; return }
+            if (groupOf[i] < 0 && !far(i)) { base.advance { base.isFinal(i) || enough(lowerBound(i)) }; return }
             if (groupOf[i] < 0 && !group(i)) { base.advance { base.isFinal(i) || enough(lowerBound(i)) }; return }
             val m = groups[groupOf[i]]; val j = posInGroup[i]
             m.advance { m.isFinal(j) || enough(lowerBound(i)) }
