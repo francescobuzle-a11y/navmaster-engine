@@ -170,6 +170,13 @@ class CrossBorderDirections(
     // invece di 176 000, stessi valichi; per Komjatice uguale, la ricerca deve arrivare a Tarvisio)
     internal var startWindowFactor = 1.0
     internal var startWindowSlack = 0.0
+    /**
+     * La ricerca mirata ([Reach]): per un passaggio il cui limite supera di [focusBeyond] secondi la
+     * frontiera della ricerca verso tutti i passaggi, il peso esatto viene da una ricerca verso i soli
+     * passaggi entro [focusKm] km da lui. Negativo: sempre (prove). Non tocca l'esattezza.
+     */
+    internal var focusBeyond = 600.0
+    internal var focusKm = 30.0
 
     /** Il peso del viaggio scelto all'ultimo confine e i suoi valichi (diagnostica, prove). */
     internal var lastWeight = Double.NaN; private set
@@ -528,14 +535,15 @@ class CrossBorderDirections(
      * inferiori dei pezzi (senza avoid_features, velocità massima né direzioni).
      */
     private fun chooseTransit(ctx: Ctx, ga: CountryGraph, gMid: CountryGraph, gEnd: CountryGraph, c01: List<Transfer>, c12: List<Transfer>,
-                              inM1: List<Snap>, inM2: List<Snap>, m0: CoreManyToOne, m2: CoreManyToOne,
+                              inM1: List<Snap>, inM2: List<Snap>, r0: Reach, r2: Reach,
                               pieceA: (Transfer) -> DirectionsRequest, pieceMid: (Transfer, Transfer) -> DirectionsRequest, pieceEnd: (Transfer) -> DirectionsRequest,
                               ends: Ends, limit: Double, t0: Long): Triple<Transfer?, Transfer?, Double>? {
         val none = Triple<Transfer?, Transfer?, Double>(null, null, Double.POSITIVE_INFINITY)
+        val m0 = r0.base; val m2 = r2.base
         m0.advanceAround(startWindowFactor, startWindowSlack)
         val m0Window = m0.stats
         // le radici coi limiti inferiori (i pesi, dove definitivi): i limiti restano tali
-        val roots = c01.indices.map { inM1[it] to m0.lowerBound(it) }
+        val roots = c01.indices.map { inM1[it] to r0.lowerBound(it) }
         if (roots.none { it.second.isFinite() }) return none
         val mm = ctx.router(gMid).manyToOne(roots, inM2, rootIsTarget = false) ?: return null
         mm.advanceAround()
@@ -547,27 +555,27 @@ class CrossBorderDirections(
         while (true) {
             var ky = -1; var key = Double.POSITIVE_INFINITY
             for (y in c12.indices) if (!done[y]) {
-                val k = b1[y] + (if (w2[y].isNaN()) m2.lowerBound(y) else w2[y])
+                val k = b1[y] + (if (w2[y].isNaN()) r2.lowerBound(y) else w2[y])
                 if (k < key) { key = k; ky = y }
             }
             if (ky < 0 || key >= best) break
             if (w2[ky].isNaN()) {
-                if (!m2.isFinal(ky)) { m2.advance { m2.isFinal(ky) || b1[ky] + m2.lowerBound(ky) > key }; continue }
+                if (!r2.isFinal(ky)) { r2.advanceFor(ky) { lb -> b1[ky] + lb > key }; continue }
                 // il peso di ricerca è quello del pezzo quando niente lo distingue (vedi Ends); se no il pezzo
-                w2[ky] = if (ends.endExact) ends.endInner + m2.weight(ky) else { evaluated++; ctx.pieceWeight(gEnd, pieceEnd(c12[ky])) }
+                w2[ky] = if (ends.endExact) ends.endInner + r2.weight(ky) else { evaluated++; ctx.pieceWeight(gEnd, pieceEnd(c12[ky])) }
                 continue
             }
             // i pesi di ricerca da ogni X a questo Y, poi le coppie in ordine di limite
             val my = ctx.router(gMid).manyToOne(inM2[ky], inM1, rootIsTarget = true) ?: return null
             my.advanceAround(); searches++
-            val order = c01.indices.filter { m0.lowerBound(it).isFinite() && my.lowerBound(it).isFinite() }.sortedBy { m0.lowerBound(it) + my.lowerBound(it) }
+            val order = c01.indices.filter { r0.lowerBound(it).isFinite() && my.lowerBound(it).isFinite() }.sortedBy { r0.lowerBound(it) + my.lowerBound(it) }
             for (x in order) {
-                if (m0.lowerBound(x) + my.lowerBound(x) + w2[ky] >= best) continue
+                if (r0.lowerBound(x) + my.lowerBound(x) + w2[ky] >= best) continue
                 if (w0[x].isNaN()) {
-                    // prima il peso vero del capo dalla sua ricerca (va avanti solo fin lì), poi, se serve, il pezzo
-                    if (!m0.isFinal(x)) m0.advance { m0.isFinal(x) || m0.lowerBound(x) + my.lowerBound(x) + w2[ky] >= best }
-                    if (!m0.isFinal(x)) continue
-                    w0[x] = if (ends.startExact) ends.startInner + m0.weight(x) else { evaluated++; ctx.pieceWeight(ga, pieceA(c01[x])) }
+                    // prima il peso vero del capo dalla sua ricerca (o da una mirata, se lontano), poi, se serve, il pezzo
+                    if (!r0.isFinal(x)) r0.advanceFor(x) { lb -> lb + my.lowerBound(x) + w2[ky] >= best }
+                    if (!r0.isFinal(x)) continue
+                    w0[x] = if (ends.startExact) ends.startInner + r0.weight(x) else { evaluated++; ctx.pieceWeight(ga, pieceA(c01[x])) }
                 }
                 if (w0[x] + my.lowerBound(x) + w2[ky] >= best) continue
                 // in transito il pezzo di mezzo va da valico a valico senza tappe né direzioni: il peso di ricerca è esatto
@@ -579,8 +587,55 @@ class CrossBorderDirections(
             }
             done[ky] = true
         }
-        log?.invoke("    due valichi insieme, transito (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)} fra ${c01.size}×${c12.size} coppie, ${done.count { it }} uscite esaminate, $searches ricerche, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms; ${ga.id} ${m0.stats} (finestra: $m0Window); ${gMid.id} ${mm.stats}; ${gEnd.id} ${m2.stats}")
+        log?.invoke("    due valichi insieme, transito (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)} fra ${c01.size}×${c12.size} coppie, ${done.count { it }} uscite esaminate, $searches ricerche, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms; ${ga.id} ${r0.stats} (finestra: $m0Window); ${gMid.id} ${mm.stats}; ${gEnd.id} ${r2.stats}")
         return if (bx < 0) none else Triple(c01[bx], c12[by], best)
+    }
+
+    /**
+     * Una ricerca di limite da un capo verso i passaggi di un confine ([base]), più ricerche mirate per
+     * i passaggi lontani dalla sua frontiera. La ricerca verso tutti i passaggi ha un potenziale ALT
+     * debole (il passaggio più vicino): per fissare il peso di uno lontano esplora tutto ciò che sta
+     * più vicino di lui (Canneto → Tarvisio: 254 000 nodi del core, mezza Italia). Una ricerca verso i
+     * soli passaggi del suo gruppo (entro [focusKm] km) ha un potenziale stretto e segue un corridoio.
+     * Stessi pesi, filtri e svolte: i pesi definitivi sono identici; i limiti sono il massimo dei due.
+     */
+    private inner class Reach(private val ctx: Ctx, private val g: CountryGraph, private val root: Snap, private val snaps: List<Snap>,
+                              private val where: List<Transfer>, private val rootIsTarget: Boolean, val base: CoreManyToOne) {
+        private val groupOf = IntArray(snaps.size) { -1 }
+        private val posInGroup = IntArray(snaps.size) { -1 }
+        private val groups = ArrayList<CoreManyToOne>()
+
+        fun isFinal(i: Int): Boolean = base.isFinal(i) || groupOf[i] >= 0 && groups[groupOf[i]].isFinal(posInGroup[i])
+        fun weight(i: Int): Double = if (base.isFinal(i)) base.weight(i) else groups[groupOf[i]].weight(posInGroup[i])
+        fun lowerBound(i: Int): Double {
+            val b = base.lowerBound(i)
+            val gi = groupOf[i]
+            return if (gi < 0) b else maxOf(b, groups[gi].lowerBound(posInGroup[i]))
+        }
+
+        /** Avanti finché [i] ha il peso definitivo o [enough] (sul suo limite inferiore) è vero. */
+        fun advanceFor(i: Int, enough: (Double) -> Boolean) {
+            if (isFinal(i)) return
+            if (groupOf[i] < 0 && base.lowerBound(i) - base.bound <= focusBeyond) { base.advance { base.isFinal(i) || enough(lowerBound(i)) }; return }
+            if (groupOf[i] < 0 && !group(i)) { base.advance { base.isFinal(i) || enough(lowerBound(i)) }; return }
+            val m = groups[groupOf[i]]; val j = posInGroup[i]
+            m.advance { m.isFinal(j) || enough(lowerBound(i)) }
+        }
+
+        /** Il gruppo di [i]: i passaggi non ancora definitivi né in un gruppo entro [focusKm] km da lui. Falso senza ricerca sul core. */
+        private fun group(i: Int): Boolean {
+            val members = where.indices.filter { k ->
+                k == i || !base.isFinal(k) && groupOf[k] < 0 && DistanceCalc.haversine(where[i].lat, where[i].lon, where[k].lat, where[k].lon) <= focusKm * 1000
+            }
+            val m = ctx.router(g).manyToOne(root, members.map { snaps[it] }, rootIsTarget) ?: return false
+            ctx.queries++
+            val gi = groups.size
+            groups += m
+            members.forEachIndexed { p, k -> groupOf[k] = gi; posInGroup[k] = p }
+            return true
+        }
+
+        val stats: String get() = base.stats + if (groups.isEmpty()) "" else " + ${groups.size} mirate (${groups.joinToString(" / ") { it.stats }})"
     }
 
     /** Il valico scelto e il peso del viaggio intero che ci passa (+∞ senza). */
@@ -645,9 +700,11 @@ class CrossBorderDirections(
         // i limiti inferiori
         val m0 = ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false) ?: return null
         val m2 = ctx.router(gEnd).manyToOne(sq, inE, rootIsTarget = true) ?: return null
+        val r0 = Reach(ctx, ga, sp, inA, c01, false, m0)
+        val r2 = Reach(ctx, gEnd, sq, inE, c12, true, m2)
         // dove i pesi di ricerca ai capi sono quelli dei pezzi (vedi Ends)
         val ends = ends(ctx, prefix, suffix, radius, gEnd) ?: return none
-        if (mid == null) return chooseTransit(ctx, ga, gMid, gEnd, c01, c12, inM1, inM2, m0, m2, ::pieceA, ::pieceMid, ::pieceEnd, ends, limit, t0)
+        if (mid == null) return chooseTransit(ctx, ga, gMid, gEnd, c01, c12, inM1, inM2, r0, r2, ::pieceA, ::pieceMid, ::pieceEnd, ends, limit, t0)
         val lb1: (Int, Int) -> Double
         /** Il peso vero del pezzo di mezzo dalle ricerche, quando è esatto (null se no): vedi Ends. */
         var midWeight: ((Int, Int) -> Double?)? = null
@@ -682,11 +739,11 @@ class CrossBorderDirections(
             // la coppia col limite più basso del viaggio intero fra quelle non ancora pesate del tutto
             var kx = -1; var ky = -1; var key = Double.POSITIVE_INFINITY
             for (x in c01.indices) {
-                val a = if (w0[x].isNaN()) m0.lowerBound(x) else w0[x]
+                val a = if (w0[x].isNaN()) r0.lowerBound(x) else w0[x]
                 if (a >= best) continue
                 for (y in c12.indices) {
                     if (!w0[x].isNaN() && !w2[y].isNaN() && !w1[x][y].isNaN()) continue
-                    val k = a + (if (w1[x][y].isNaN()) lb1(x, y) else w1[x][y]) + (if (w2[y].isNaN()) m2.lowerBound(y) else w2[y])
+                    val k = a + (if (w1[x][y].isNaN()) lb1(x, y) else w1[x][y]) + (if (w2[y].isNaN()) r2.lowerBound(y) else w2[y])
                     if (k < key) { key = k; kx = x; ky = y }
                 }
             }
@@ -695,10 +752,10 @@ class CrossBorderDirections(
             val rest1 = if (w1[kx][ky].isNaN()) lb1(kx, ky) else w1[kx][ky]
             when {
                 // prima il limite vero del capo (la sua ricerca va avanti solo fin lì), poi il pezzo
-                !m0.isFinal(kx) && w0[kx].isNaN() -> m0.advance { m0.isFinal(kx) || m0.lowerBound(kx) + rest1 + (if (w2[ky].isNaN()) m2.lowerBound(ky) else w2[ky]) > key + slack(key) }
-                w0[kx].isNaN() -> w0[kx] = if (ends.startExact) ends.startInner + m0.weight(kx) else { evaluated++; ctx.pieceWeight(ga, pieceA(c01[kx])) }
-                !m2.isFinal(ky) && w2[ky].isNaN() -> m2.advance { m2.isFinal(ky) || w0[kx] + rest1 + m2.lowerBound(ky) > key + slack(key) }
-                w2[ky].isNaN() -> w2[ky] = if (ends.endExact) ends.endInner + m2.weight(ky) else { evaluated++; ctx.pieceWeight(gEnd, pieceEnd(c12[ky])) }
+                !r0.isFinal(kx) && w0[kx].isNaN() -> r0.advanceFor(kx) { lb -> lb + rest1 + (if (w2[ky].isNaN()) r2.lowerBound(ky) else w2[ky]) > key + slack(key) }
+                w0[kx].isNaN() -> w0[kx] = if (ends.startExact) ends.startInner + r0.weight(kx) else { evaluated++; ctx.pieceWeight(ga, pieceA(c01[kx])) }
+                !r2.isFinal(ky) && w2[ky].isNaN() -> r2.advanceFor(ky) { lb -> w0[kx] + rest1 + lb > key + slack(key) }
+                w2[ky].isNaN() -> w2[ky] = if (ends.endExact) ends.endInner + r2.weight(ky) else { evaluated++; ctx.pieceWeight(gEnd, pieceEnd(c12[ky])) }
                 else -> {
                     w1[kx][ky] = midWeight?.invoke(kx, ky) ?: run { evaluated++; ctx.pieceWeight(gMid, pieceMid(c01[kx], c12[ky])) }
                     val total = w0[kx] + w1[kx][ky] + w2[ky]
@@ -706,7 +763,7 @@ class CrossBorderDirections(
                 }
             }
         }
-        log?.invoke("    due valichi insieme (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)} fra ${c01.size}×${c12.size} coppie, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms; ${ga.id} ${m0.stats}; ${gMid.id} $midStats; ${gEnd.id} ${m2.stats}")
+        log?.invoke("    due valichi insieme (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)} fra ${c01.size}×${c12.size} coppie, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms; ${ga.id} ${r0.stats}; ${gMid.id} $midStats; ${gEnd.id} ${r2.stats}")
         return if (bx < 0) none else Triple(c01[bx], c12[by], best)
     }
 
@@ -750,6 +807,8 @@ class CrossBorderDirections(
         val t0 = System.currentTimeMillis()
         val mNear = (if (shortIsB) ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true) else ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false)) ?: return null
         val mFar = (if (shortIsB) ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false) else ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true)) ?: return null
+        // il lato lontano con le ricerche mirate per i passaggi lontani dalla sua frontiera (vedi Reach)
+        val rFar = if (shortIsB) Reach(ctx, ga, sp, inA, cands, false, mFar) else Reach(ctx, gb, sq, inB, cands, true, mFar)
         // dove i pesi di ricerca sono quelli dei pezzi (vedi Ends): allora niente pezzo, la ricerca va avanti fino al passaggio
         val ends = ends(ctx, prefix, suffix, radius, gb) ?: return none
         val nearExact = if (shortIsB) ends.endExact else ends.startExact; val nearInner = if (shortIsB) ends.endInner else ends.startInner
@@ -761,30 +820,30 @@ class CrossBorderDirections(
             // il passaggio col limite più basso del viaggio intero, non ancora pesato dal lato lontano
             var i = -1; var key = Double.POSITIVE_INFINITY
             for (j in cands.indices) if (farWeight[j].isNaN()) {
-                val k = mFar.lowerBound(j) + if (nearWeight[j].isNaN()) mNear.lowerBound(j) else nearWeight[j]
+                val k = rFar.lowerBound(j) + if (nearWeight[j].isNaN()) mNear.lowerBound(j) else nearWeight[j]
                 if (k < key) { key = k; i = j }
             }
             if (i < 0 || key >= best) break
             if (nearWeight[i].isNaN()) {
                 // prima il limite vero del lato vicino (la sua ricerca va avanti solo fin lì), poi il pezzo
-                if (!mNear.isFinal(i)) { mNear.advance { mNear.isFinal(i) || mFar.lowerBound(i) + mNear.lowerBound(i) > key }; continue }
+                if (!mNear.isFinal(i)) { mNear.advance { mNear.isFinal(i) || rFar.lowerBound(i) + mNear.lowerBound(i) > key }; continue }
                 nearWeight[i] = if (nearExact) nearInner + mNear.weight(i) else { nearCount++; ctx.pieceWeight(near, nearPiece(cands[i])) }
                 continue
             }
             // poi il limite vero del lato lontano (una ricerca sola per tutti i passaggi, fin dove serve):
             // i pezzi lontani costano (evita pedaggi: secondi) e così ne serve di solito uno
-            if (!mFar.isFinal(i)) { mFar.advance { mFar.isFinal(i) || nearWeight[i] + mFar.lowerBound(i) > key }; continue }
+            if (!rFar.isFinal(i)) { rFar.advanceFor(i) { lb -> nearWeight[i] + lb > key }; continue }
             val t1 = System.currentTimeMillis()
-            farWeight[i] = if (farExact) farInner + mFar.weight(i) else { farCount++; ctx.pieceWeight(far, farPiece(cands[i])) }
+            farWeight[i] = if (farExact) farInner + rFar.weight(i) else { farCount++; ctx.pieceWeight(far, farPiece(cands[i])) }
             farMs += System.currentTimeMillis() - t1
             val total = nearWeight[i] + farWeight[i]
             if (total < best) { best = total; bestI = i }
         }
         log?.invoke("    valico scelto: ${if (bestI < 0) "nessuno" else "%.5f,%.5f peso %.0f".format(cands[bestI].lat, cands[bestI].lon, best)} fra ${cands.size} passaggi; " +
-            "lato vicino ${near.id} ${mNear.stats}, $nearCount pezzi; lato lontano ${far.id} ${mFar.stats}, $farCount pezzi in $farMs ms; in tutto ${System.currentTimeMillis() - t0} ms")
+            "lato vicino ${near.id} ${mNear.stats}, $nearCount pezzi; lato lontano ${far.id} ${rFar.stats}, $farCount pezzi in $farMs ms; in tutto ${System.currentTimeMillis() - t0} ms")
         fun w(x: Double) = if (x.isFinite()) "%.0f".format(x) else "∞"
-        for ((j, t) in cands.withIndex()) if (!nearWeight[j].isNaN() || !farWeight[j].isNaN() || mNear.lowerBound(j) + mFar.lowerBound(j) < best + 600)
-            log?.invoke("      %.5f,%.5f r${t.rank}: ${near.id} ${if (nearWeight[j].isNaN()) "≥" + w(mNear.lowerBound(j)) else w(nearWeight[j])}, ${far.id} ${if (farWeight[j].isNaN()) "≥" + w(mFar.lowerBound(j)) else w(farWeight[j])}".format(t.lat, t.lon))
+        for ((j, t) in cands.withIndex()) if (!nearWeight[j].isNaN() || !farWeight[j].isNaN() || mNear.lowerBound(j) + rFar.lowerBound(j) < best + 600)
+            log?.invoke("      %.5f,%.5f r${t.rank}: ${near.id} ${if (nearWeight[j].isNaN()) "≥" + w(mNear.lowerBound(j)) else w(nearWeight[j])}, ${far.id} ${if (farWeight[j].isNaN()) "≥" + w(rFar.lowerBound(j)) else w(farWeight[j])}".format(t.lat, t.lon))
         return if (bestI < 0) none else Choice(best, cands[bestI])
     }
 

@@ -107,8 +107,10 @@ class CrossBorderReferenceTest {
                 Case("auto, transito", listOf("a", "b"), transit, { pts -> linkedMapOf("coordinates" to pts.map { listOf(it.queryLon, it.queryLat) }, "instructions" to false) }, two, "driving-car"),
             )
             val problems = ArrayList<String>()
-            for (case in cases) {
-                val cbd = CrossBorderDirections(listOf(a, b, c), case.transfers)
+            // due volte: con la regola del motore e con la ricerca mirata su ogni passaggio (Reach): sui grafi
+            // piccoli della prova la mirata non scatterebbe da sola, e i pesi devono restare quelli esatti
+            for ((mode, focus) in listOf("" to 600.0, " (mirate)" to -1.0)) for (case in cases) {
+                val cbd = CrossBorderDirections(listOf(a, b, c), case.transfers).also { it.focusBeyond = focus }
                 val ref = CrossBorderReference(listOf(a, b, c), case.transfers)
                 var equal = 0; var noRoute = 0; var multiBorder = 0; val diffs = ArrayList<String>()
                 repeat(20) { k ->
@@ -132,14 +134,14 @@ class CrossBorderReferenceTest {
                                 "valichi $crossings invece di ${r.crossings.map { it.lat to it.lon }}"
                             // diagnostica: la scelta con il registro, e i pezzi del riferimento
                             println("  --- richiesta: ${Json.stringify(req.echo)}")
-                            val logged = CrossBorderDirections(listOf(a, b, c), case.transfers, { println("  | $it") })
+                            val logged = CrossBorderDirections(listOf(a, b, c), case.transfers, { println("  | $it") }).also { it.focusBeyond = focus }
                             runCatching { logged.handle(req, case.ids) }
                             println("  --- riferimento: valichi ${r.crossings.map { "%.5f,%.5f".format(it.lat, it.lon) }}, ${r.pieceCount} pezzi")
                         }
                     }
                 }
-                println("${case.name}: $equal uguali, $noRoute senza percorso in entrambi, $multiBorder con più confini scelti uno alla volta, ${cbd.twoChoices} scelte di due valichi insieme, ${diffs.size} diversi${if (diffs.isEmpty()) "" else "\n    " + diffs.joinToString("\n    ")}")
-                problems += diffs.map { "${case.name}: $it" }
+                println("${case.name}$mode: $equal uguali, $noRoute senza percorso in entrambi, $multiBorder con più confini scelti uno alla volta, ${cbd.twoChoices} scelte di due valichi insieme, ${diffs.size} diversi${if (diffs.isEmpty()) "" else "\n    " + diffs.joinToString("\n    ")}")
+                problems += diffs.map { "${case.name}$mode: $it" }
             }
             assertTrue(problems.isEmpty(), "differenze dal riferimento:\n" + problems.joinToString("\n"))
         }
