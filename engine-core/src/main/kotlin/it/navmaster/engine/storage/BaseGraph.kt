@@ -147,6 +147,7 @@ class BaseGraph(
             edges.setInt(p + 12, NO_EDGE)
         }
         for (i in 0 until intsForFlags) edges.setInt(p + 16 + 4L * i, 0)
+        flagWrites++
         setDistance(id, distanceMeters)
         edges.setInt(p + eGeo, 0)
         edges.setInt(p + eName, 0)
@@ -173,7 +174,11 @@ class BaseGraph(
     fun setFlags(edge: Int, flags: IntArray) {
         val p = edge.toLong() * edgeEntryBytes + 16
         for (i in 0 until intsForFlags) edges.setInt(p + 4L * i, flags[i])
+        flagWrites++
     }
+
+    /** Scritture dei flag (import): invalidano i flag che gli iteratori ricordano ([EdgeIterator.flags]). */
+    private var flagWrites = 0
 
     fun nameRef(edge: Int): Int = edges.getInt(edge.toLong() * edgeEntryBytes + eName)
     fun setName(edge: Int, name: String) = edges.setInt(edge.toLong() * edgeEntryBytes + eName, names.put(name))
@@ -243,6 +248,13 @@ class BaseGraph(
         var reverse = false; private set
         private var next = NO_EDGE
         private val flagsBuf = IntArray(intsForFlags)
+        /**
+         * L'arco di cui [flagsBuf] contiene i flag (e a quale scrittura del grafo): ogni valore chiesto
+         * ([get]) rileggeva tutti gli interi dei flag, una chiamata nativa ciascuno sul tablet; peso e
+         * filtri del camion ne chiedono una quindicina per arco (5 interi: ~75 letture). Ora una volta per arco.
+         */
+        private var flagsEdge = -1
+        private var flagsAt = -1
 
         fun setBaseNode(node: Int): EdgeIterator {
             baseNode = node; next = edgeRef(node); edge = -1; adjNode = -1
@@ -273,7 +285,10 @@ class BaseGraph(
 
         val edgeKey: Int get() = (edge shl 1) or (if (reverse) 1 else 0)
         val distance: Double get() = this@BaseGraph.distance(edge)
-        val flags: IntArray get() = getFlags(edge, flagsBuf)
+        val flags: IntArray get() {
+            if (flagsEdge != edge || flagsAt != flagWrites) { getFlags(edge, flagsBuf); flagsEdge = edge; flagsAt = flagWrites }
+            return flagsBuf
+        }
         fun setFlags(f: IntArray) = this@BaseGraph.setFlags(edge, f)
         val name: String get() = this@BaseGraph.name(edge)
 

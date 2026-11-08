@@ -14,9 +14,14 @@ class TurnCostProvider(
 ) {
     val uTurnsAllowed get() = uTurnCostSeconds >= 0
 
+    /** L'ultimo nodo chiesto e se ha divieti: una ricerca chiede la svolta per ogni arco che esce dallo stesso nodo (sul tablet ogni lettura è una chiamata nativa). */
+    private var lastVia = -1
+    private var lastHas = false
+
     fun turnWeight(inEdge: Int, viaNode: Int, outEdge: Int): Double {
         if (inEdge == outEdge) return if (uTurnsAllowed) uTurnCostSeconds else Double.POSITIVE_INFINITY
-        if (!storage.hasEntries(viaNode)) return 0.0
+        if (viaNode != lastVia) { lastVia = viaNode; lastHas = storage.hasEntries(viaNode) }
+        if (!lastHas) return 0.0
         return if (storage.encoding.isForbidden(storage.flags(inEdge, viaNode, outEdge), profileName)) Double.POSITIVE_INFINITY else 0.0
     }
 
