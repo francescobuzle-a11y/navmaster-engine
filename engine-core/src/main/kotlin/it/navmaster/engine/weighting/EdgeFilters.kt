@@ -33,8 +33,22 @@ data class VehicleParameters(
     val weight: Double = 0.0,
     val axleLoad: Double = 0.0,
     val hazmat: Boolean = false,
+    /**
+     * Estensione NavMaster: il codice galleria ADR del carico, 0 se non dato, 2 = B … 5 = E. Con un
+     * codice le gallerie si confrontano per categoria (codice C: vietate le gallerie C, D, E); senza,
+     * come ORS, ogni galleria con restrizioni ADR è vietata a chi trasporta merci pericolose.
+     */
+    val adrTunnelCode: Int = 0,
+    /** Estensione NavMaster: merci inquinanti per le acque (strade con `hazmat:water=no` vietate). */
+    val hazmatWater: Boolean = false,
 ) {
-    val hasAttributes get() = length > 0 || height > 0 || width > 0 || weight > 0 || axleLoad > 0 || hazmat
+    init { require(adrTunnelCode == 0 || adrTunnelCode in 2..5) { "codice galleria ADR non valido: $adrTunnelCode" } }
+
+    val hasAttributes get() = length > 0 || height > 0 || width > 0 || weight > 0 || axleLoad > 0 || hazmat || hazmatWater
+    /** Vero se il carico è di merci pericolose (anche solo inquinanti per le acque). */
+    val dangerousGoods get() = hazmat || hazmatWater || adrTunnelCode != 0
+    /** Vero se la richiesta usa le estensioni ADR (codice galleria o acque). */
+    val usesAdrDetails get() = adrTunnelCode != 0 || hazmatWater
     /** Le misure fisiche (senza le merci pericolose): valgono per ogni veicolo, anche l'auto (camper, furgoni). */
     val hasDimensions get() = length > 0 || height > 0 || width > 0 || weight > 0 || axleLoad > 0
 
@@ -66,15 +80,46 @@ class HeavyVehicleEdgeFilter(
     /** Uno dei bit di [HeavyVehicleAttributes] (HGV, BUS, DELIVERY, …). */
     private val vehicleType: Int,
     private val params: VehicleParameters?,
+    /** I dati di guida: nei grafi senza i valori ADR danno la categoria delle gallerie (vedi [hazmatBlocked]). */
+    private val guidance: it.navmaster.engine.storage.GuidanceStore? = null,
 ) : EdgeFilter {
     init { require(vehicleType in HeavyVehicleAttributes.vehicleTypes) { "tipo di veicolo non valido: $vehicleType" } }
 
     override fun accept(edge: BaseGraph.EdgeIterator): Boolean {
         if (edge.get(shared.hgvBlocked) and vehicleType != 0) return false
         if (params == null || !params.hasAttributes) return true
-        if (params.hazmat && edge.get(shared.hazmatForbidden)) return false
+        if (params.dangerousGoods && hazmatBlocked(edge, shared, params, guidance)) return false
         return !params.blockedBy(edge.get(shared.maxHeight), edge.get(shared.maxWidth), edge.get(shared.maxLength), edge.get(shared.maxWeight), edge.get(shared.maxAxleLoad))
     }
+}
+
+/**
+ * Merci pericolose. Con i valori ADR del grafo: `hazmat=no` vieta sempre; `hazmat:water=no` vieta le
+ * merci inquinanti per le acque; una galleria di categoria X vieta i codici ≤ X (B è il più severo:
+ * un carico B non passa nelle gallerie B, C, D, E; un carico E solo nelle E). Senza codice galleria,
+ * come ORS: vietata ogni way con `hazmat=no` o `hazmat:B..E=no`, e in più quelle col solo
+ * `hazmat:adr_tunnel_category` (più prudente di ORS, che non le legge).
+ *
+ * Nei grafi di prima dei valori ADR c'è solo [SharedEncoding.hazmatForbidden]: con un codice galleria
+ * si usa la categoria salvata nei dati di guida per lasciar passare le gallerie meno severe del codice
+ * (una way con insieme `hazmat=no` e `hazmat:X=no`, rara, verrebbe aperta per errore).
+ */
+internal fun hazmatBlocked(edge: BaseGraph.EdgeIterator, shared: SharedEncoding, params: VehicleParameters, guidance: it.navmaster.engine.storage.GuidanceStore?): Boolean {
+    if (shared.withAdr) {
+        if (edge.get(shared.hazmatGeneral!!)) return true
+        if (params.hazmatWater && edge.get(shared.hazmatWater!!)) return true
+        val cat = edge.get(shared.adrTunnel!!)
+        if (params.adrTunnelCode != 0) return cat >= params.adrTunnelCode
+        // senza codice: le merci solo inquinanti per le acque non sono vincolate dalle gallerie
+        if (!params.hazmat) return false
+        return cat != 0 || edge.get(shared.hazmatForbidden)
+    }
+    if (!edge.get(shared.hazmatForbidden)) return false
+    if (params.adrTunnelCode != 0 && guidance != null) {
+        val cat = guidance.adrTunnel(edge.edge)
+        if (cat != 0 && cat < params.adrTunnelCode) return false
+    }
+    return params.hazmat || params.adrTunnelCode != 0
 }
 
 /**
@@ -133,12 +178,13 @@ object EdgeFilterFactory {
     fun create(
         encoding: GraphEncoding, profileName: String, avoidFeatures: Int = 0, vehicleType: Int = HeavyVehicleAttributes.HGV,
         params: VehicleParameters? = null, avoidPolygons: List<org.locationtech.jts.geom.Polygon> = emptyList(),
+        guidance: it.navmaster.engine.storage.GuidanceStore? = null,
     ): EdgeFilter {
         val pe = encoding.profile(profileName)
         val isHgv = pe.profile.name == "heavyvehicle"
         val filters = ArrayList<EdgeFilter>(4)
         if (avoidFeatures != 0) filters += AvoidFeaturesEdgeFilter(encoding.shared, avoidFeatures, pe.profile.category, isHgv)
-        if (isHgv) filters += HeavyVehicleEdgeFilter(encoding.shared, vehicleType, params)
+        if (isHgv) filters += HeavyVehicleEdgeFilter(encoding.shared, vehicleType, params, guidance)
         else if (params != null && params.hasDimensions) filters += DimensionsEdgeFilter(encoding.shared, params)
         if (avoidPolygons.isNotEmpty()) filters += AvoidPolygonsEdgeFilter(avoidPolygons)
         return when (filters.size) {

@@ -250,6 +250,14 @@ class CrossBorderDirections(
      * ogni punto quando è noto, altrimenti il grafo che lo aggancia più vicino.
      */
     fun handle(request: DirectionsRequest, pointGraph: List<String?>): Map<String, Any?> {
+        // "avoid" as a penalty: first as a ban, as DirectionsService.handle does (the choice of the
+        // crossings with the penalty costs three times as much)
+        if (request.avoidPenalty && request.avoidFeatures != 0 && request.coordinates.indices.none { i -> graphs.any { it.service.onAvoidedRoad(request, i) } }) {
+            try { return handle(request.withAvoidPenalty(false), pointGraph) } catch (e: ApiException) {
+                if (e.code != RoutingErrorCodes.ROUTE_NOT_FOUND && e.code != RoutingErrorCodes.POINT_NOT_FOUND) throw e
+                log?.invoke("evita come divieto: nessun percorso (${e.code}), di nuovo come penalità")
+            }
+        }
         val started = System.currentTimeMillis()
         val ctx = Ctx(request)
         val pts = request.coordinates.map { LL(it.first, it.second) }
@@ -265,6 +273,10 @@ class CrossBorderDirections(
         }
         log?.invoke("punti nei grafi: ${of.joinToString { it.id }}")
         if (of.all { it === of[0] }) return of[0].service.handle(request, ResponseFormat.GEOJSON)
+        // alternatives across borders: the via points method (each candidate is a trip like this one)
+        if (request.alternatives != null && pts.size == 2) {
+            return LongAlternatives(graphs.map { it.graph }, log) { r, pg -> handle(r, pg) }.handle(request, of.map { it.id })
+        }
 
         // i pezzi del viaggio: le tappe nello stesso grafo restano insieme, ai confini il passaggio migliore
         val pieces = ArrayList<Piece>()
@@ -982,46 +994,47 @@ class CrossBorderDirections(
         return m
     }
 
-    /**
-     * Le istruzioni al passaggio di confine: via l'arrivo del pezzo prima e la partenza di quello
-     * dopo; la strada prosegue (stesso nome: un'istruzione sola) o "Continua dritto su …".
-     */
-    private fun joinSteps(before: MutableList<Map<String, Any?>>, after: MutableList<Map<String, Any?>>, coords: List<DoubleArray>, offset: Int,
-                          t: InstructionTranslator) {
-        if (before.lastOrNull()?.get("type") == InstructionType.FINISH.code) before.removeAt(before.size - 1)
-        val depart = after.firstOrNull()
-        if (depart == null) return
-        val last = before.lastOrNull()
-        val name = depart["name"] as? String ?: "-"
-        val rest = after.drop(1)
-        if (last != null && depart["type"] == InstructionType.DEPART.code && name != "-" && last["name"] == name) {
-            // la stessa strada oltre il confine: l'istruzione di prima arriva fin dove arrivava la partenza
-            val m = LinkedHashMap(last)
-            m["distance"] = round1((last["distance"] as Number).toDouble() + (depart["distance"] as Number).toDouble())
-            m["duration"] = round1((last["duration"] as Number).toDouble() + (depart["duration"] as Number).toDouble())
-            m["way_points"] = listOf((last["way_points"] as List<*>)[0], (depart["way_points"] as List<*>)[1])
-            before[before.size - 1] = m
-        } else if (depart["type"] == InstructionType.DEPART.code) {
-            val m = LinkedHashMap(depart)
-            m["type"] = InstructionType.CONTINUE.code
-            m["instruction"] = t.continueOn(InstructionType.CONTINUE, if (name == "-") "" else name)
-            // la direzione d'arrivo al confine
-            (depart["maneuver"] as? Map<*, *>)?.let { mv ->
-                val k = offset
-                val before0 = if (k >= 1) DistanceCalc.bearing(coords[k - 1][1], coords[k - 1][0], coords[k][1], coords[k][0]) else null
-                m["maneuver"] = LinkedHashMap<String, Any?>().apply {
-                    putAll(mv.entries.associate { it.key.toString() to it.value })
-                    if (before0 != null) put("bearing_before", Math.round((before0 + 360) % 360).toInt())
-                }
-            }
-            before += m
-        } else before += depart
-        before += rest
-    }
-
-    private fun round1(v: Double) = Math.round(v * 10) / 10.0
 
     companion object {
+        /**
+         * Le istruzioni al passaggio di confine: via l'arrivo del pezzo prima e la partenza di quello
+         * dopo; la strada prosegue (stesso nome: un'istruzione sola) o "Continua dritto su …".
+         */
+        internal fun joinSteps(before: MutableList<Map<String, Any?>>, after: MutableList<Map<String, Any?>>, coords: List<DoubleArray>, offset: Int,
+                              t: InstructionTranslator) {
+            if (before.lastOrNull()?.get("type") == InstructionType.FINISH.code) before.removeAt(before.size - 1)
+            val depart = after.firstOrNull()
+            if (depart == null) return
+            val last = before.lastOrNull()
+            val name = depart["name"] as? String ?: "-"
+            val rest = after.drop(1)
+            if (last != null && depart["type"] == InstructionType.DEPART.code && name != "-" && last["name"] == name) {
+                // la stessa strada oltre il confine: l'istruzione di prima arriva fin dove arrivava la partenza
+                val m = LinkedHashMap(last)
+                m["distance"] = round1((last["distance"] as Number).toDouble() + (depart["distance"] as Number).toDouble())
+                m["duration"] = round1((last["duration"] as Number).toDouble() + (depart["duration"] as Number).toDouble())
+                m["way_points"] = listOf((last["way_points"] as List<*>)[0], (depart["way_points"] as List<*>)[1])
+                before[before.size - 1] = m
+            } else if (depart["type"] == InstructionType.DEPART.code) {
+                val m = LinkedHashMap(depart)
+                m["type"] = InstructionType.CONTINUE.code
+                m["instruction"] = t.continueOn(InstructionType.CONTINUE, if (name == "-") "" else name)
+                // la direzione d'arrivo al confine
+                (depart["maneuver"] as? Map<*, *>)?.let { mv ->
+                    val k = offset
+                    val before0 = if (k >= 1) DistanceCalc.bearing(coords[k - 1][1], coords[k - 1][0], coords[k][1], coords[k][0]) else null
+                    m["maneuver"] = LinkedHashMap<String, Any?>().apply {
+                        putAll(mv.entries.associate { it.key.toString() to it.value })
+                        if (before0 != null) put("bearing_before", Math.round((before0 + 360) % 360).toInt())
+                    }
+                }
+                before += m
+            } else before += depart
+            before += rest
+        }
+
+        internal fun round1(v: Double) = Math.round(v * 10) / 10.0
+
         /** La finestra delle ricerche di limite oltre il passaggio più vicino (vedi [advanceAround]): un decimo più dieci minuti. */
         const val WINDOW_FACTOR = 1.1
         const val WINDOW_SLACK = 600.0

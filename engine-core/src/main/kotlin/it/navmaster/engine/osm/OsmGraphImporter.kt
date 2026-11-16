@@ -8,6 +8,7 @@ import it.navmaster.engine.storage.GuidanceStore
 import it.navmaster.engine.storage.PointStore
 import it.navmaster.engine.profile.Access
 import it.navmaster.engine.profile.WayAttributeParser
+import it.navmaster.engine.profile.Toll
 import it.navmaster.engine.storage.BaseGraph
 import it.navmaster.engine.storage.GraphEncoding
 import it.navmaster.engine.storage.PointList
@@ -26,7 +27,12 @@ data class ImportStats(
     /** Relazioni di divieto lette dal file. */
     val turnRestrictionRelations: Int,
     val millis: Long,
+    /** Archi messi a pedaggio da un casello o da un portale ([ImportOptions.tollNodes]). */
+    val tollNodeEdges: Int = 0,
 )
+
+/** Le strade su cui un casello o un portale fa pedaggio (non i parcheggi né le strade di servizio). */
+private val TOLL_NODE_ROADS = setOf("motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link", "secondary", "secondary_link")
 
 /**
  * Costruisce un [BaseGraph] da un file PBF in due passate, come GraphHopper:
@@ -45,6 +51,13 @@ data class ImportOptions(
     val widthFromCarriageway: Boolean = true,
     /** Scrive il file `guidance` (limiti di velocità, corsie, destinazioni, svincoli, caselli): solo dati, nessun effetto sul calcolo. */
     val guidance: Boolean = true,
+    /**
+     * Estensione NavMaster: l'arco di una strada principale che passa da un casello (`barrier=toll_booth`)
+     * è a pedaggio anche senza `toll=yes` sulla way (in OSM le barriere del sistema aperto e le rampe dei
+     * caselli spesso non l'hanno: «evita pedaggi» ci passava); da un portale (`highway=toll_gantry`), a
+     * pedaggio per i mezzi pesanti se la way non dice già di più.
+     */
+    val tollNodes: Boolean = true,
 )
 
 class OsmGraphImporter(
@@ -58,6 +71,8 @@ class OsmGraphImporter(
     private val profiles = encoding.profiles
     private val junctions = LongObjectHashMap<String>()   // id OSM → svincolo "ref|nome"
     private val specialNodes = LongObjectHashMap<String>() // id OSM → casello / portale / dogana
+    private val tollBooths = com.carrotsearch.hppc.LongHashSet()   // nodi barrier=toll_booth delle strade (ImportOptions.tollNodes)
+    private val tollGantries = com.carrotsearch.hppc.LongHashSet() // nodi highway=toll_gantry
     private class Enforcement(val type: Int, val maxspeed: Int, val device: Long, val from: Long, val to: Long)
     private val enforcements = ArrayList<Enforcement>()
     private val neededNodes = LongObjectHashMap<DoubleArray>() // nodi delle relazioni enforcement → [lat, lon]
@@ -74,6 +89,7 @@ class OsmGraphImporter(
 
     private var acceptedWays = 0L
     private var barrierEdges = 0
+    private var tollNodeEdges = 0
     private val wayAccess = Array(profiles.size) { Access.CAN_SKIP }
 
     fun import(pbf: File): ImportStats {
@@ -100,7 +116,7 @@ class OsmGraphImporter(
             appliedRestrictions = applier.applied
         }
         graph.freeze()
-        return ImportStats(reader.nodeCount, reader.wayCount, acceptedWays, graph.nodeCount, pillarCount, graph.edgeCount, barrierEdges, appliedRestrictions, turnRestrictions.size, System.currentTimeMillis() - start)
+        return ImportStats(reader.nodeCount, reader.wayCount, acceptedWays, graph.nodeCount, pillarCount, graph.edgeCount, barrierEdges, appliedRestrictions, turnRestrictions.size, System.currentTimeMillis() - start, tollNodeEdges)
     }
 
     /** Vero se almeno un profilo può percorrere la way; riempie [wayAccess]. */
@@ -177,6 +193,10 @@ class OsmGraphImporter(
             val use = nodeUse.getOrDefault(id, 0)
             if (use == 0) return
             var isBarrier = false
+            if (tags != null && options.tollNodes) {
+                if (tags["barrier"] == "toll_booth") tollBooths.add(id)
+                if (tags["highway"] == "toll_gantry") tollGantries.add(id)
+            }
             if (tags != null && guidance != null) {
                 GuidanceParser.junction(tags)?.let { junctions.put(id, it) }
                 GuidanceParser.specialNode(tags)?.let { specialNodes.put(id, it) }
@@ -288,6 +308,19 @@ class OsmGraphImporter(
             return copy
         }
 
+        /** Il pedaggio dei caselli e dei portali sui punti dell'arco corrente (vedi [ImportOptions.tollNodes]). */
+        private fun tollFromNodes(way: OsmWay, a: it.navmaster.engine.profile.WayAttributes, n: Int): it.navmaster.engine.profile.WayAttributes {
+            if (!options.tollNodes || a.toll == Toll.ALL || (tollBooths.isEmpty && tollGantries.isEmpty) || segIds.size() != n) return a
+            if (way.tag("highway") !in TOLL_NODE_ROADS) return a
+            var booth = false; var gantry = false
+            for (k in 0 until n) { val id = segIds.get(k); if (tollBooths.contains(id)) booth = true; if (tollGantries.contains(id)) gantry = true }
+            return when {
+                booth -> { tollNodeEdges++; a.copy(toll = Toll.ALL) }
+                gantry && (a.toll == Toll.MISSING || a.toll == Toll.NO) -> { tollNodeEdges++; a.copy(toll = Toll.HGV) }
+                else -> a
+            }
+        }
+
         private fun addEdge(way: OsmWay, from: Int, to: Int) {
             val n = lats.size
             if (from == to) {
@@ -314,7 +347,7 @@ class OsmGraphImporter(
             }
             val isFerry = way.tag("highway") == null && way.hasTag("route", "ferry", "shuttle_train")
             val flags = graph.encodedValues.newFlags()
-            encoding.shared.write(flags, WayAttributeParser.parse(way, isFerry, widthFromCarriageway = options.widthFromCarriageway))
+            encoding.shared.write(flags, tollFromNodes(way, WayAttributeParser.parse(way, isFerry, widthFromCarriageway = options.widthFromCarriageway), n))
             val ferryDuration = if (isFerry) OsmValues.parseDurationSeconds(way.tag("duration")) else -1L
             for (i in profiles.indices) {
                 // i traghetti: la velocità dalla durata e dalla lunghezza del tratto; le strade: la linea d'aria della way (ORS)

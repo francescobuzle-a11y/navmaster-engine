@@ -28,6 +28,7 @@ import it.navmaster.engine.profile.AvoidFeatureFlags
 import it.navmaster.engine.routing.PointNotFoundException
 import it.navmaster.engine.weighting.EdgeFilterFactory
 import it.navmaster.engine.weighting.AvoidFeaturesEdgeFilter
+import it.navmaster.engine.weighting.AvoidPenaltyWeighting
 import it.navmaster.engine.weighting.TurnCostProvider
 import it.navmaster.engine.weighting.VehicleParameters
 import it.navmaster.engine.weighting.WeightingFactory
@@ -67,6 +68,12 @@ data class RouteOptions(
     val maximumSpeedTimeOnly: Boolean = false,
     /** ORS `maximum_visited_nodes` (1 000 000): oltre, la ricerca piena si ferma (non esaurisce la memoria). */
     val maxVisitedNodes: Int = 1_000_000,
+    /**
+     * Estensione NavMaster: > 1 per applicare [avoidFeatures] come penalità (il peso delle strade da
+     * evitare moltiplicato per questo fattore, [it.navmaster.engine.weighting.AvoidPenaltyWeighting])
+     * invece che come divieto; 0 = divieto, come ORS.
+     */
+    val avoidPenalty: Double = 0.0,
 ) {
     /** Richiesta "statica" nel senso di ORS: nessun filtro dipendente dalla richiesta. */
     val isStatic: Boolean get() = avoidFeatures == 0 && (vehicleParameters == null || !vehicleParameters.hasAttributes) &&
@@ -219,10 +226,14 @@ class RoutingGraph private constructor(
     fun router(options: RouteOptions): Router {
         val name = encoderName(options.profile)
         val pe = encoding.profile(name)
-        val weighting = WeightingFactory.create(encoding, pe, options.weighting, if (options.maximumSpeedTimeOnly) Double.POSITIVE_INFINITY else options.maximumSpeed)
-        // the times with the limited speed, also when the search does not use it (see maximumSpeedTimeOnly)
-        val timeWeighting = if (options.maximumSpeedTimeOnly) WeightingFactory.create(encoding, pe, options.weighting, options.maximumSpeed) else weighting
-        val filter: EdgeFilter = EdgeFilterFactory.create(encoding, name, options.avoidFeatures, options.vehicleType, options.vehicleParameters, options.avoidPolygons)
+        val baseWeighting = WeightingFactory.create(encoding, pe, options.weighting, if (options.maximumSpeedTimeOnly) Double.POSITIVE_INFINITY else options.maximumSpeed)
+        // avoid_features as a penalty (NavMaster): the roads to avoid stay in the graph, heavier; not in the filter
+        val penalty = options.avoidPenalty > 1.0 && options.avoidFeatures != 0
+        val weighting = if (penalty) AvoidPenaltyWeighting(baseWeighting, AvoidFeaturesEdgeFilter(encoding.shared, options.avoidFeatures, pe.profile.category, name == "heavyvehicle"), options.avoidPenalty)
+            else baseWeighting
+        // the times with the limited speed, also when the search does not use it (see maximumSpeedTimeOnly); never the penalty
+        val timeWeighting = if (options.maximumSpeedTimeOnly) WeightingFactory.create(encoding, pe, options.weighting, options.maximumSpeed) else baseWeighting
+        val filter: EdgeFilter = EdgeFilterFactory.create(encoding, name, if (penalty) 0 else options.avoidFeatures, options.vehicleType, options.vehicleParameters, options.avoidPolygons, guidance)
         val tcp = if (options.turnCosts) TurnCostProvider(turnCosts, name) else null
         val key = chKey(name, weighting)
         // come `RoutingRequest.setSpeedups` di ORS: CH per le richieste statiche, altrimenti Core se preparato, altrimenti Dijkstra.
@@ -231,10 +242,13 @@ class RoutingGraph private constructor(
         val coreStorage = chStorages["${key}_core"]
         val ch = if (options.allowCH && options.isStatic && (tcp == null || coreStorage == null)) chStorages[key]?.let { CHGraph(graph, it, weighting) } else null
         // le misure dell'auto (camper, furgoni): nel core solo dall'edizione 2 della regola; prima, ricerca piena
-        val coreFits = name == "heavyvehicle" || options.vehicleParameters?.hasDimensions != true || coreVersion >= 2
+        val coreFits = (name == "heavyvehicle" || options.vehicleParameters?.hasDimensions != true || coreVersion >= 2) &&
+            // le gallerie ADR e i divieti per le acque: nel core del camion dall'edizione 3, coi valori ADR nel grafo
+            !(name == "heavyvehicle" && encoding.shared.withAdr && options.vehicleParameters?.dangerousGoods == true && coreVersion < 3)
         val core = if (ch == null && options.allowCH && !needsFullSearch(options) && coreFits) coreStorage?.let { CHGraph(graph, it, weighting) } else null
         // l'insieme di landmark della richiesta: con «evita pedaggi» quello preparato senza i pedaggi, se c'è
-        val lm = if (core != null) landmarksFor("${key}_core", options.avoidFeatures and AvoidFeatureFlags.forCategory(pe.profile.category)) else null
+        // with the penalty the roads to avoid stay usable: only the complete set's bounds are admissible
+        val lm = if (core != null) landmarksFor("${key}_core", if (penalty) 0 else options.avoidFeatures and AvoidFeatureFlags.forCategory(pe.profile.category)) else null
         // avoid_features alone: first the quick search without them; its path is the best one with
         // them too when it uses none of the roads to avoid (the filter only takes roads away), else
         // the full search (ORS keeps those roads in its core; our reduced core does not, the wide one does)
@@ -405,7 +419,8 @@ class RoutingGraph private constructor(
             val props = GraphProperties(File(dir, "profiles"))
             require(props.load()) { "nessun grafo in $dir (manca il file profiles)" }
             val profiles = props.get("profiles")!!.split(',').map { profileByName(it) }
-            val encoding = GraphEncoding(profiles)
+            // i grafi costruiti prima dei valori ADR (novembre 2026) si aprono col loro schema
+            val encoding = GraphEncoding.forExisting(profiles, GraphProperties(File(dir, "properties")).let { p -> if (p.load()) p.get("graph.encoded_values") else null })
             val gdir = GraphDirectory(dir, mmap, readOnly = mmap)
             val graph = BaseGraph(gdir, encoding.registry)
             check(graph.loadExisting()) { "grafo non caricabile da $dir" }

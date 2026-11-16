@@ -22,7 +22,7 @@ import kotlin.system.exitProcess
 private const val USAGE = """
 navmaster-engine
 
-  import <file.osm.pbf> <cartella-grafo> [--profiles=car,hgv] [--no-ch] [--no-width-from-carriageway] [--mmap] [--core=narrow] [--landmark-sets=tollways,highways]
+  import <file.osm.pbf> <cartella-grafo> [--profiles=car,hgv] [--no-ch] [--no-width-from-carriageway] [--no-toll-nodes] [--mmap] [--core=narrow] [--landmark-sets=tollways,highways]
                                          costruisce il grafo (--mmap: file su disco invece che in RAM; --core=narrow: core ridotto, senza autostrade e strade veloci;
                                          --landmark-sets: gli insiemi di landmark in più, con quelle strade escluse, come gli `lmsets` di ORS; predefinito tollways, `none` per nessuno)
   info <cartella-grafo>                                          riepilogo del grafo
@@ -133,13 +133,14 @@ private fun importGraph(args: List<String>) {
     require(positional.size == 2) { "uso: import <file.osm.pbf> <cartella-grafo>" }
     val pbf = File(positional[0]); val dir = File(positional[1])
     val profiles = profilesFromArgs(args)
-    val importOptions = it.navmaster.engine.osm.ImportOptions(widthFromCarriageway = !args.contains("--no-width-from-carriageway"))
+    val importOptions = it.navmaster.engine.osm.ImportOptions(widthFromCarriageway = !args.contains("--no-width-from-carriageway"), tollNodes = !args.contains("--no-toll-nodes"))
     println("${Engine.NAME}: import di $pbf → $dir, profili ${profiles.map { it.name }}" + if (!importOptions.widthFromCarriageway) " (tag width ignorato)" else "")
     val (rg, stats) = RoutingGraph.build(pbf, dir, profiles, mmap = args.contains("--mmap"), importOptions = importOptions)
     rg.use {
         println("nodi OSM %,d, way %,d (accettate %,d)".format(stats.osmNodes, stats.osmWays, stats.acceptedWays))
         println("grafo: %,d nodi, %,d archi (%,d pillar, %,d archi barriera), divieti di svolta %,d applicati su %,d, %.1f s".format(
             stats.towers, stats.edges, stats.pillars, stats.barrierEdges, stats.turnRestrictions, stats.turnRestrictionRelations, stats.millis / 1000.0))
+        if (importOptions.tollNodes) println("archi a pedaggio per un casello o un portale: %,d".format(stats.tollNodeEdges))
         println("bbox: ${it.graph.bounds}")
         val sets = opt(args, "landmark-sets")?.let { v -> if (v == "none") emptyList() else v.split(',').map { CoreLandmarks.parseSetName(it) }.filter { it != 0 } }
             ?: RoutingGraph.DEFAULT_LANDMARK_SETS

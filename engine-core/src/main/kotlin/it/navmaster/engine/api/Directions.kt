@@ -17,6 +17,7 @@ import it.navmaster.engine.routing.RoutePath
 import it.navmaster.engine.storage.BBox
 import it.navmaster.engine.storage.PointList
 import it.navmaster.engine.util.DistanceCalc
+import it.navmaster.engine.weighting.AvoidFeaturesEdgeFilter
 import it.navmaster.engine.weighting.VehicleParameters
 import it.navmaster.engine.weighting.WeightingMethod
 import java.time.Instant
@@ -87,14 +88,31 @@ class DirectionsRequest(
      * cui arrivarci); null dove non è data.
      */
     val bearings: List<Double?>? = null,
+    /**
+     * Estensione NavMaster `{"navmaster": {"avoid_penalty": true}}`: `avoid_features` come penalità
+     * ([AVOID_PENALTY_FACTOR]) invece che come divieto, come gli "evita" di TomTom.
+     */
+    val avoidPenalty: Boolean = false,
 ) {
+    /** La stessa richiesta con o senza gli "evita" come penalità ([avoidPenalty]). */
+    fun withAvoidPenalty(on: Boolean): DirectionsRequest = if (on == avoidPenalty) this else DirectionsRequest(
+        profile, coordinates, preference, units, language, instructions, htmlFormat, geometry, maneuvers, avoidFeatures, vehicleType,
+        vehicleParameters, avoidPolygons, maximumSpeed, continueStraight, navmasterRoads, alternatives, radiuses, id, attributes, extraInfo, echo, exactPoints,
+        bearings, on)
+
     /** La stessa richiesta su altri punti (un tratto di un viaggio tra Paesi), senza alternative. */
     fun withPoints(points: List<Pair<Double, Double>>, pointRadiuses: DoubleArray?, exact: BooleanArray? = null, pointBearings: List<Double?>? = null): DirectionsRequest = DirectionsRequest(
         profile, points, preference, units, language, instructions, htmlFormat, geometry, maneuvers, avoidFeatures, vehicleType,
         vehicleParameters, avoidPolygons, maximumSpeed, continueStraight, navmasterRoads, null, pointRadiuses, id, attributes, extraInfo, echo, exact,
-        pointBearings?.takeIf { b -> b.any { it != null } })
+        pointBearings?.takeIf { b -> b.any { it != null } }, avoidPenalty)
 
     companion object {
+        /**
+         * Il fattore degli "evita" come penalità ([avoidPenalty]): una strada da evitare pesa 30 volte
+         * tanto, quindi si usa solo se ogni altra via costa più di 30 volte quel tratto (in pratica
+         * quando non c'è altra via: partenza in autostrada, isole, valichi solo a pedaggio).
+         */
+        const val AVOID_PENALTY_FACTOR = 30.0
         private val KNOWN = setOf("coordinates", "preference", "units", "language", "instructions", "instructions_format", "geometry", "maneuvers",
             "options", "radiuses", "id", "attributes", "elevation", "extra_info", "continue_straight", "roundabout_exits", "geometry_simplify",
             "suppress_warnings", "skip_segments", "alternative_routes", "bearings", "maximum_speed", "schedule", "custom_model", "navmaster")
@@ -141,6 +159,7 @@ class DirectionsRequest(
                     params = VehicleParameters(
                         length = num(r["length"], "length", 0.0), height = num(r["height"], "height", 0.0), width = num(r["width"], "width", 0.0),
                         weight = num(r["weight"], "weight", 0.0), axleLoad = num(r["axleload"], "axleload", 0.0), hazmat = r["hazmat"] == true,
+                        adrTunnelCode = adrTunnelCode(r["adr_tunnel_code"]), hazmatWater = r["hazmat_water"] == true,
                     )
                 }
             }
@@ -173,6 +192,7 @@ class DirectionsRequest(
                 avoidPolygons = polygons, maximumSpeed = maximumSpeed,
                 continueStraight = body["continue_straight"] as? Boolean ?: false,
                 navmasterRoads = (body["navmaster"] as? Map<*, *>)?.get("roads") == true,
+                avoidPenalty = (body["navmaster"] as? Map<*, *>)?.get("avoid_penalty") == true,
                 alternatives = (body["alternative_routes"] as? Map<*, *>)?.let { a ->
                     val count = (a["target_count"] as? Number)?.toInt() ?: 2
                     if (count !in 2..3) throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'alternative_routes.target_count' has incorrect value of '$count' (2 or 3).")
@@ -209,6 +229,18 @@ class DirectionsRequest(
             }
         }
 
+        /**
+         * Estensione NavMaster `restrictions.adr_tunnel_code`: il codice galleria ADR del carico, "B"…"E"
+         * (anche nella forma dei documenti di trasporto, per esempio "(C/D)" o "B1000C": conta la prima
+         * lettera). 0 se assente o "A"/"none" (nessuna restrizione in galleria).
+         */
+        internal fun adrTunnelCode(v: Any?): Int {
+            val s = v?.toString()?.trim()?.uppercase() ?: return 0
+            if (s.isEmpty() || s == "NONE" || s == "-" || s == "A") return 0
+            val letter = s.firstOrNull { it in 'A'..'E' } ?: throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'adr_tunnel_code' has incorrect value of '$v'.")
+            return if (letter == 'A') 0 else letter - 'B' + 2
+        }
+
         private fun num(v: Any?, name: String, default: Double? = null): Double = when (v) {
             null -> default ?: throw ApiException(400, RoutingErrorCodes.MISSING_PARAMETER, "Parameter '$name' is missing.")
             is Number -> v.toDouble()
@@ -242,12 +274,48 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         avoidPolygons = request.avoidPolygons, maximumSpeed = request.maximumSpeed,
         continueStraight = request.continueStraight,
         hasBearings = request.bearings != null,
+        avoidPenalty = if (request.avoidPenalty) DirectionsRequest.AVOID_PENALTY_FACTOR else 0.0,
     )
 
     /** maximum_speed ≥ 80 km/h su un viaggio oltre [FAST_MAXIMUM_SPEED_BEELINE] in linea d'aria: solo sui tempi. */
     fun fastMaximumSpeed(o: RouteOptions, beeline: Double): Boolean =
         !graphs.coreWide && o.maximumSpeed.isFinite() && o.maximumSpeed >= DirectionsRequest.MAXIMUM_SPEED_LOWER_BOUND && beeline > FAST_MAXIMUM_SPEED_BEELINE &&
             o.avoidPolygons.isEmpty()
+
+    /** Registro delle alternative dei viaggi lunghi ([LongAlternatives]), per la diagnostica dell'app. */
+    @Volatile var alternativesLog: ((String) -> Unit)? = null
+
+    /**
+     * Vero se il punto [i] della richiesta sta su una strada da evitare (il mezzo già in autostrada):
+     * l'aggancio senza gli evitamenti cade su una di quelle strade e quello con il divieto cade
+     * altrove, più lontano di [AVOIDED_ROAD_MARGIN] m (o non trova nulla). Falso se il punto non è
+     * in questo grafo.
+     */
+    fun onAvoidedRoad(request: DirectionsRequest, i: Int): Boolean {
+        if (request.avoidFeatures == 0) return false
+        val (lat, lon) = request.coordinates[i]
+        if (!graphs.graph.bounds.contains(lat, lon)) return false
+        val o = routeOptions(request)
+        val radius = request.radiuses?.getOrNull(i)?.takeIf { it > 0 } ?: limits.maximumSnappingRadius
+        val heading = request.bearings?.getOrNull(i) ?: Double.NaN
+        val free = try { graphs.router(o.copy(avoidFeatures = 0, avoidPenalty = 0.0)).snap(lat, lon, radius, i, heading = heading) } catch (e: Exception) { return false }
+        val name = try { graphs.encoderName(request.profile) } catch (e: IllegalArgumentException) { return false }
+        val pe = graphs.encoding.profile(name)
+        val avoid = AvoidFeaturesEdgeFilter(graphs.encoding.shared, request.avoidFeatures, pe.profile.category, name == "heavyvehicle")
+        val it = graphs.graph.createEdgeIterator().setEdge(free.edge, graphs.graph.nodeA(free.edge))
+        if (avoid.accept(it)) return false
+        val banned = try { graphs.router(o.copy(avoidPenalty = 0.0)).snap(lat, lon, radius, i, heading = heading) } catch (e: Exception) { return true }
+        return banned.distance > free.distance + AVOIDED_ROAD_MARGIN
+    }
+
+    private fun beeline(request: DirectionsRequest): Double {
+        var d = 0.0
+        for (i in 1 until request.coordinates.size) {
+            val (aLat, aLon) = request.coordinates[i - 1]; val (bLat, bLon) = request.coordinates[i]
+            d += DistanceCalc.haversine(aLat, aLon, bLat, bLon)
+        }
+        return d
+    }
 
     /** Il raggio di aggancio massimo del servizio (metri). */
     val maximumSnappingRadius: Double get() = limits.maximumSnappingRadius
@@ -256,6 +324,19 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
     val routingGraph: RoutingGraph get() = graphs
 
     fun handle(request: DirectionsRequest, format: ResponseFormat): Map<String, Any?> {
+        // "avoid" as a penalty: first as a ban (faster: the roads to avoid are left out of the search,
+        // and with a route free of them it is the same route); the penalty only when the vehicle is on
+        // a road to avoid or when the ban finds no route
+        if (request.avoidPenalty && request.avoidFeatures != 0 && request.coordinates.indices.none { onAvoidedRoad(request, it) }) {
+            try { return handle(request.withAvoidPenalty(false), format) } catch (e: ApiException) {
+                if (e.code != RoutingErrorCodes.ROUTE_NOT_FOUND && e.code != RoutingErrorCodes.POINT_NOT_FOUND) throw e
+            }
+        }
+        // alternatives on a trip too long for the plateau method: the via points method (GeoJSON only)
+        if (request.alternatives != null && format == ResponseFormat.GEOJSON && request.coordinates.size == 2 && beeline(request) > limits.maximumDistanceAlternativeRoutes) {
+            encoder(request)
+            return LongAlternatives(listOf(graphs), log = alternativesLog) { r, _ -> handle(r, format) }.handle(request, listOf(null, null))
+        }
         val encoder = encoder(request)
         val routes = routes(request)
         val docs = routes.map { buildRoute(request, it, encoder) }
@@ -460,6 +541,8 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
     }
 
     companion object {
+        /** Quanto più lontano deve cadere l'aggancio col divieto perché il punto sia "su una strada da evitare" (metri). */
+        const val AVOIDED_ROAD_MARGIN = 15.0
         /** Oltre questa distanza in linea d'aria (m) maximum_speed vale sui tempi soltanto. */
         const val FAST_MAXIMUM_SPEED_BEELINE = 60_000.0
         val BUILD_DATE: String = Instant.now().toString()

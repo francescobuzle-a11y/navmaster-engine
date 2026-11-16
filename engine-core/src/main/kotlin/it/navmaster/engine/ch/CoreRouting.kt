@@ -48,14 +48,17 @@ class CoreEdgeSelector(
          * L'edizione della regola del core, salvata nel grafo (`core_version`): un grafo preparato con
          * un'edizione precedente non ha nel core gli archi che una richiesta può escludere, e per quella
          * richiesta non si può usare (vedi RoutingGraph.router). 1: limiti fisici solo nel core del
-         * camion; 2: anche nel core dell'auto.
+         * camion; 2: anche nel core dell'auto; 3: nel core del camion anche le gallerie ADR, `hazmat=no`
+         * e `hazmat:water=no` (i valori ADR dei grafi da novembre 2026).
          */
-        const val CORE_VERSION = 2
+        const val CORE_VERSION = 3
     }
 
     fun isCoreEdge(it: BaseGraph.EdgeIterator): Boolean {
         // divieti per mezzi pesanti e merci pericolose: solo il camion
         if (isHgv && (it.get(sh.hgvBlocked) != 0 || it.get(sh.hazmatForbidden))) return true
+        // gallerie ADR anche col solo `hazmat:adr_tunnel_category`, divieti generali e per le acque
+        if (isHgv && sh.withAdr && (it.get(sh.adrTunnel!!) != 0 || it.get(sh.hazmatGeneral!!) || it.get(sh.hazmatWater!!))) return true
         // limiti fisici (altezza, larghezza, lunghezza, peso, carico per asse): camion, e dall'edizione
         // CORE_VERSION 2 anche l'auto (camper e furgoni con le loro misure, DimensionsEdgeFilter)
         if (it.get(sh.maxHeight).isFinite() || it.get(sh.maxWidth).isFinite() || it.get(sh.maxLength).isFinite() ||

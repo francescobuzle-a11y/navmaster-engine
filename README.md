@@ -29,6 +29,18 @@ comportamento è identico a openrouteservice.
 
 Altri comandi: `engine-cli info graphs/lombardia`, `engine-cli route graphs/lombardia 45.4642,9.19 45.6983,9.6773 --height=4 --weight=40`.
 
+## Estensioni NavMaster dell'API
+
+Chiavi in più rispetto a openrouteservice (un server ORS o un motore più vecchio le ignora):
+
+| Chiave | Effetto |
+|---|---|
+| `options.profile_params.restrictions.adr_tunnel_code` | codice galleria ADR del carico, `"B"`…`"E"` (anche `"(C/D)"`): una galleria di categoria X è vietata ai codici ≤ X; senza codice, come ORS, ogni galleria ADR è vietata con `hazmat` |
+| `options.profile_params.restrictions.hazmat_water` | merci inquinanti per le acque: vietate le strade con `hazmat:water=no` |
+| `navmaster.avoid_penalty` | `avoid_features` come penalità (peso ×30) invece che come divieto: la strada da evitare si usa solo se non c'è altro modo |
+| `navmaster.roads` | i fatti sulle strade del percorso (limiti, corsie, cartelli, pedaggi) |
+| `alternative_routes` oltre `maximum_distance_alternative_routes` e tra Paesi | alternative coi punti di passaggio a lato del viaggio (`LongAlternatives`), invece dell'errore 2004 |
+
 ## Avviare il server
 
 ```bash

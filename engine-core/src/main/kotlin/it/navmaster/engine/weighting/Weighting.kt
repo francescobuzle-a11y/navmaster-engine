@@ -144,3 +144,22 @@ object WeightingFactory {
         return LimitedAccessWeighting(encoding, base)
     }
 }
+
+/**
+ * Estensione NavMaster: `avoid_features` come penalità invece che come divieto (come gli "evita" di
+ * TomTom, che distinguono evitare da vietare). Gli archi da evitare ([avoid] li rifiuta) pesano
+ * [factor] volte tanto: il percorso li usa solo quando non c'è altro modo (partenza già in autostrada,
+ * isole, valichi solo a pedaggio) o quando evitarli costerebbe più di [factor] volte quel tratto. I
+ * tempi restano quelli veri. Il peso può solo crescere: i limiti dei landmark dell'insieme completo
+ * restano ammissibili (non quelli preparati senza le strade evitate, vedi RoutingGraph.router).
+ */
+class AvoidPenaltyWeighting(private val base: Weighting, private val avoid: EdgeFilter, private val factor: Double) : Weighting {
+    init { require(factor >= 1.0) { "fattore di penalità < 1: $factor" } }
+    override val name get() = base.name
+    override fun minWeight(distanceMeters: Double) = base.minWeight(distanceMeters)
+    override fun edgeWeight(edge: BaseGraph.EdgeIterator, reverse: Boolean): Double {
+        val w = base.edgeWeight(edge, reverse)
+        return if (w.isFinite() && !avoid.accept(edge)) w * factor else w
+    }
+    override fun edgeMillis(edge: BaseGraph.EdgeIterator, reverse: Boolean) = base.edgeMillis(edge, reverse)
+}

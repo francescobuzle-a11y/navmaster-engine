@@ -31,8 +31,13 @@ class ProfileEncoding(val profile: VehicleProfile) {
     }
 }
 
-/** Valori codificati condivisi fra tutti i profili (attributi della way). */
-class SharedEncoding {
+/**
+ * Valori codificati condivisi fra tutti i profili (attributi della way).
+ *
+ * @param withAdr i valori delle merci pericolose aggiunti a novembre 2026 ([adrTunnel], [hazmatGeneral],
+ *   [hazmatWater]); `false` per aprire i grafi costruiti prima, che non li hanno (vedi [GraphEncoding.forExisting]).
+ */
+class SharedEncoding(val withAdr: Boolean = true) {
     val roundabout = BooleanEncodedValue("roundabout")
     val roadClass = EnumEncodedValue("road_class", RoadClass.entries.toTypedArray())
     val roadClassLink = BooleanEncodedValue("road_class_link")
@@ -51,11 +56,23 @@ class SharedEncoding {
     val motorway = BooleanEncodedValue("motorway")
     val ford = BooleanEncodedValue("ford")
     val osmWayId = IntEncodedValue("osm_way_id", 31)
+    /** Categoria ADR della galleria: 0 nessuna, 2 = B … 5 = E ([WayAttributes.adrTunnel]); null nei grafi vecchi. */
+    val adrTunnel: IntEncodedValue? = if (withAdr) IntEncodedValue("adr_tunnel", 3) else null
+    /** `hazmat=no`; null nei grafi vecchi (lì vale solo [hazmatForbidden]). */
+    val hazmatGeneral: BooleanEncodedValue? = if (withAdr) BooleanEncodedValue("hazmat_general") else null
+    /** `hazmat:water=no`; null nei grafi vecchi. */
+    val hazmatWater: BooleanEncodedValue? = if (withAdr) BooleanEncodedValue("hazmat_water") else null
 
     internal fun register(b: EncodedValueRegistry.Builder) {
         b.add(roundabout).add(roadClass).add(roadClassLink).add(roadAccess).add(toll)
             .add(maxHeight).add(maxWidth).add(maxLength).add(maxWeight).add(maxAxleLoad)
             .add(hgvBlocked).add(hazmatForbidden).add(wayType).add(waySurface).add(motorway).add(ford).add(osmWayId)
+    }
+
+    /** Registrati dopo i profili: così nei grafi vecchi tutti gli altri bit restano dove erano. */
+    internal fun registerAdr(b: EncodedValueRegistry.Builder) {
+        if (!withAdr) return
+        b.add(adrTunnel!!).add(hazmatGeneral!!).add(hazmatWater!!)
     }
 
     fun write(flags: IntArray, a: WayAttributes) {
@@ -72,6 +89,9 @@ class SharedEncoding {
         motorway.set(flags, a.isMotorway); ford.set(flags, a.isFord)
         require(a.osmWayId <= osmWayId.maxRaw) { "id way OSM troppo grande: ${a.osmWayId}" }
         osmWayId.set(flags, a.osmWayId.toInt())
+        adrTunnel?.set(flags, a.adrTunnel)
+        hazmatGeneral?.set(flags, a.hazmatGeneral)
+        hazmatWater?.set(flags, a.hazmatWater)
     }
 }
 
@@ -79,8 +99,8 @@ class SharedEncoding {
  * Schema completo dei flag di un grafo: attributi condivisi più un blocco per ogni profilo.
  * L'ordine di registrazione è fisso e fa parte del formato su disco.
  */
-class GraphEncoding(profiles: List<VehicleProfile>) {
-    val shared = SharedEncoding()
+class GraphEncoding(profiles: List<VehicleProfile>, withAdr: Boolean = true) {
+    val shared = SharedEncoding(withAdr)
     val profiles: List<ProfileEncoding> = profiles.map { ProfileEncoding(it) }
     val registry: EncodedValueRegistry
 
@@ -90,7 +110,22 @@ class GraphEncoding(profiles: List<VehicleProfile>) {
         val b = EncodedValueRegistry.Builder()
         shared.register(b)
         this.profiles.forEach { it.register(b) }
+        shared.registerAdr(b)
         registry = b.build()
+    }
+
+    companion object {
+        /**
+         * Lo schema di un grafo già costruito, dalla descrizione salvata nelle sue properties
+         * (`graph.encoded_values`): quello attuale o, per i grafi di prima, quello senza i valori ADR.
+         * Se nessuno dei due coincide restituisce l'attuale (il caricamento poi segnala la differenza).
+         */
+        fun forExisting(profiles: List<VehicleProfile>, described: String?): GraphEncoding {
+            val current = GraphEncoding(profiles)
+            if (described == null || described == current.registry.describe()) return current
+            val old = GraphEncoding(profiles, withAdr = false)
+            return if (described == old.registry.describe()) old else current
+        }
     }
 
     fun profile(name: String): ProfileEncoding = profiles.firstOrNull { it.profile.name == name } ?: error("profilo non presente nel grafo: $name")

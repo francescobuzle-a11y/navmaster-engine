@@ -80,4 +80,14 @@ data class WayAttributes(
     val isMotorway: Boolean,
     val isFord: Boolean,
     val isRoundabout: Boolean,
+    /**
+     * Categoria ADR della galleria (accordo ADR 1.9.5): 0 nessuna, 2 = B … 5 = E, la più restrittiva fra
+     * `hazmat:adr_tunnel_category` e `hazmat:B..E=no`. Un carico col codice galleria X non passa nelle
+     * gallerie di categoria ≥ X (codice C: vietate C, D, E).
+     */
+    val adrTunnel: Int = 0,
+    /** `hazmat=no`: vietata a tutte le merci pericolose, qualunque sia il codice galleria. */
+    val hazmatGeneral: Boolean = false,
+    /** `hazmat:water=no`: vietata alle merci inquinanti per le acque (zone di protezione delle falde). */
+    val hazmatWater: Boolean = false,
 )

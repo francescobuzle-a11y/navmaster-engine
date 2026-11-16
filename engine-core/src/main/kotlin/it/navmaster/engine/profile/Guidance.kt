@@ -47,7 +47,6 @@ object GuidanceParser {
     private val onewayYes = setOf("yes", "1", "true")
     private val onewayReverse = setOf("-1", "reverse")
     private val impliedOneway = setOf("motorway", "motorway_link", "trunk_link")
-    private val adrLetters = listOf("B", "C", "D", "E")
     /** Le restrizioni a orario che riguardano un mezzo pesante o le sue misure. */
     private val conditionalKeys = listOf("access:conditional", "vehicle:conditional", "motor_vehicle:conditional", "hgv:conditional", "goods:conditional",
         "bus:conditional", "maxweight:conditional", "maxweight:hgv:conditional", "maxheight:conditional", "maxwidth:conditional", "maxlength:conditional",
@@ -109,12 +108,8 @@ object GuidanceParser {
         return v.coerceIn(0, 255)
     }
 
-    /** Categoria ADR della galleria: la lettera più restrittiva con `hazmat:X=no` (B = 2 … E = 5), 0 se nessuna. */
-    fun adrTunnel(way: OsmWay): Int {
-        way.tag("hazmat:adr_tunnel_category")?.trim()?.uppercase()?.let { c -> adrLetters.indexOf(c).takeIf { it >= 0 }?.let { return it + 2 } }
-        for ((i, l) in adrLetters.withIndex()) if (way.tag("hazmat:$l") == "no") return i + 2
-        return 0
-    }
+    /** Categoria ADR della galleria (B = 2 … E = 5, 0 se nessuna): la stessa regola del routing, [WayAttributeParser.adrTunnel]. */
+    fun adrTunnel(way: OsmWay): Int = WayAttributeParser.adrTunnel(way)
 
     fun conditional(way: OsmWay): String {
         val sb = StringBuilder()

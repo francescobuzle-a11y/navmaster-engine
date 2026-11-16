@@ -46,7 +46,23 @@ object WayAttributeParser {
         isMotorway = way.hasTag("highway", "motorway", "motorway_link"),
         isFord = way.hasTag("ford", "yes"),
         isRoundabout = way.hasTag("junction", "roundabout", "circular"),
+        adrTunnel = adrTunnel(way),
+        hazmatGeneral = way.tag("hazmat") == "no",
+        hazmatWater = way.tag("hazmat:water") == "no",
     )
+
+    private val adrLetters = listOf("B", "C", "D", "E")
+
+    /**
+     * Categoria ADR della galleria: 0 nessuna, 2 = B … 5 = E. Vale la più restrittiva (la lettera più
+     * alta) fra `hazmat:adr_tunnel_category=X` e i tag `hazmat:X=no`; la categoria A non limita nulla.
+     */
+    fun adrTunnel(way: OsmWay): Int {
+        var cat = 0
+        way.tag("hazmat:adr_tunnel_category")?.trim()?.uppercase()?.let { c -> val i = adrLetters.indexOf(c); if (i >= 0) cat = i + 2 }
+        for ((i, l) in adrLetters.withIndex()) if (way.tag("hazmat:$l") == "no" && i + 2 > cat) cat = i + 2
+        return cat
+    }
 
     /**
      * Tipi di veicolo pesante bloccati (ORS `VehicleAccessParser`).
