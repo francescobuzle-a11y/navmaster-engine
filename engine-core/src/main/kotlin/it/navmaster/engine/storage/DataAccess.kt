@@ -196,11 +196,23 @@ class RamDataAccess(name: String, private val file: File?, segmentSize: Int = Da
     override fun close() { segs = emptyArray() }
 }
 
-/** DataAccess memory-mapped: i segmenti sono finestre del file, l'OS fa da cache. */
-class MmapDataAccess(name: String, private val file: File, segmentSize: Int = DataAccess.DEFAULT_SEGMENT_SIZE, private val readOnly: Boolean = false) :
+/**
+ * DataAccess memory-mapped: i segmenti sono finestre del file, l'OS fa da cache.
+ *
+ * Un file esistente si mappa a pezzi di [CHUNK_BYTES] e i segmenti sono ritagli di quei pezzi: una
+ * mappatura ogni 64 MB invece che una per segmento. Sul tablet sei Paesi facevano decine di migliaia
+ * di mappature (i nodi a segmenti di 64 KB) e il processo arrivava al limite del sistema: l'app si
+ * chiudeva in una raccolta della memoria (mprotect: out of memory) o in un'allocazione nativa
+ * (std::bad_alloc) mentre agganciava i valichi. I segmenti aggiunti scrivendo (la costruzione del
+ * grafo) restano mappati uno per uno.
+ */
+class MmapDataAccess(name: String, private val file: File, segmentSize: Int = DataAccess.DEFAULT_SEGMENT_SIZE, private val readOnly: Boolean = false,
+                     internal val chunkBytes: Int = CHUNK_BYTES) :
     DataAccess(name, segmentSize) {
     private var raf: RandomAccessFile? = null
-    private var segs: Array<MappedByteBuffer> = emptyArray()
+    private var segs: Array<ByteBuffer> = emptyArray()
+    /** Le mappature vere, in ordine di file (per [touch] e [flush]); ciascuna coi suoi byte. */
+    private var maps: MutableList<MappedByteBuffer> = ArrayList()
 
     override val capacity: Long get() = segs.size.toLong() * segmentSize
     override fun segments() = segs.size
@@ -211,6 +223,8 @@ class MmapDataAccess(name: String, private val file: File, segmentSize: Int = Da
         RandomAccessFile(file, if (readOnly) "r" else "rw").also { raf = it }
     }
 
+    private val mode get() = if (readOnly) FileChannel.MapMode.READ_ONLY else FileChannel.MapMode.READ_WRITE
+
     override fun addSegments(count: Int) {
         check(!readOnly) { "$name è in sola lettura" }
         val r = openFile()
@@ -220,9 +234,10 @@ class MmapDataAccess(name: String, private val file: File, segmentSize: Int = Da
         segs = Array(newTotal) { i -> if (i < segs.size) segs[i] else map(r, i) }
     }
 
-    private fun map(r: RandomAccessFile, index: Int): MappedByteBuffer {
-        val mode = if (readOnly) FileChannel.MapMode.READ_ONLY else FileChannel.MapMode.READ_WRITE
-        return r.channel.map(mode, HEADER_OFFSET + index.toLong() * segmentSize, segmentSize.toLong()).order(ByteOrder.LITTLE_ENDIAN) as MappedByteBuffer
+    private fun map(r: RandomAccessFile, index: Int): ByteBuffer {
+        val m = r.channel.map(mode, HEADER_OFFSET + index.toLong() * segmentSize, segmentSize.toLong()).order(ByteOrder.LITTLE_ENDIAN) as MappedByteBuffer
+        maps += m
+        return m
     }
 
     fun loadExisting(): Boolean {
@@ -231,14 +246,29 @@ class MmapDataAccess(name: String, private val file: File, segmentSize: Int = Da
         val (cap, segSize) = readFileHeader(r, header) ?: error("file non riconosciuto: $file")
         require(segSize == segmentSize) { "dimensione segmento diversa in $file: $segSize vs $segmentSize" }
         val n = (cap ushr segmentSizePower).toInt()
-        segs = Array(n) { map(r, it) }
+        // whole segments per chunk (both powers of two)
+        val perChunk = maxOf(1, chunkBytes / segmentSize)
+        val chunks = ArrayList<MappedByteBuffer>()
+        var first = 0
+        while (first < n) {
+            val count = minOf(perChunk, n - first)
+            chunks += r.channel.map(mode, HEADER_OFFSET + first.toLong() * segmentSize, count.toLong() * segmentSize) as MappedByteBuffer
+            first += count
+        }
+        maps = chunks.toMutableList()
+        segs = Array(n) { i ->
+            val c = chunks[i / perChunk].duplicate()
+            val off = (i % perChunk) * segmentSize
+            c.limit(off + segmentSize); c.position(off)
+            c.slice().order(ByteOrder.LITTLE_ENDIAN)
+        }
         return true
     }
 
     override fun flush() {
         if (readOnly) return
         val r = openFile()
-        for (s in segs) s.force()
+        for (m in maps) m.force()
         writeFileHeader(r, capacity, segmentSize, header)
         r.channel.force(true)
     }
@@ -247,14 +277,20 @@ class MmapDataAccess(name: String, private val file: File, segmentSize: Int = Da
 
     override fun touch(progress: ((Long) -> Unit)?): Long {
         var done = 0L
-        for (s in segs) { s.load(); done += segmentSize; progress?.invoke(done) }
+        for (m in maps) { m.load(); done += m.capacity(); progress?.invoke(minOf(done, capacity)) }
         return capacity
     }
 
     override fun close() {
         segs = emptyArray()
+        maps = ArrayList()
         raf?.close()
         raf = null
+    }
+
+    companion object {
+        /** La dimensione di una mappatura di un file esistente (multiplo di ogni dimensione di segmento fino a 64 MB). */
+        const val CHUNK_BYTES = 1 shl 26
     }
 }
 

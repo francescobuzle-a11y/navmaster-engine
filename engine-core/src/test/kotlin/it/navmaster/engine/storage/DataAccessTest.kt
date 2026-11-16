@@ -54,6 +54,34 @@ class DataAccessTest {
     )
 
     @Test
+    fun `mmap data access in chunks of several segments`() {
+        // 2 segments per mapping (384 bytes: 3; 128: one per segment; 1 MB: the whole file in one), the last one shorter
+        for (chunk in listOf(256, 384, 128, 1 shl 20)) {
+            exercise(
+                { MmapDataAccess("test", it, 128) },
+                { MmapDataAccess("test", it, 128, readOnly = true, chunkBytes = chunk).takeIf { da -> da.loadExisting() } },
+            )
+        }
+        // every int of a file read back through the chunks, the warm-up over all of it, and growing a file opened in chunks
+        val f = File(tmpDir(), "big")
+        MmapDataAccess("big", f, 128).use { da -> da.ensureCapacity(128L * 11); for (i in 0 until 128 * 11 / 4) da.setInt(i * 4L, i * 31 + 7); da.flush() }
+        MmapDataAccess("big", f, 128, chunkBytes = 512).use { da ->
+            assertTrue(da.loadExisting())
+            for (i in 0 until 128 * 11 / 4) assertEquals(i * 31 + 7, da.getInt(i * 4L))
+            val ints = IntArray(100); da.getInts(4L * 20, ints, 0, 100)
+            for (k in 0 until 100) assertEquals((20 + k) * 31 + 7, ints[k])
+            var last = 0L
+            assertEquals(128L * 11, da.touch { last = it })
+            assertEquals(128L * 11, last)
+            da.ensureCapacity(128L * 13); da.setInt(128L * 12, 5); da.setInt(0, -1); da.flush()
+        }
+        MmapDataAccess("big", f, 128, readOnly = true, chunkBytes = 256).use { da ->
+            assertTrue(da.loadExisting())
+            assertEquals(128L * 13, da.capacity); assertEquals(5, da.getInt(128L * 12)); assertEquals(-1, da.getInt(0)); assertEquals(38, da.getInt(4))
+        }
+    }
+
+    @Test
     fun `ram file can be read with mmap and vice versa`() {
         val dir = tmpDir()
         val f = File(dir, "x")
