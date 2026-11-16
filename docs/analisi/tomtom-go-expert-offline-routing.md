@@ -503,6 +503,14 @@ rilassato dal motore.
     il mezzo è su una strada da evitare (l'aggancio senza evitamenti cade su di essa, quello col
     divieto oltre 15 m) oppure col divieto non c'è percorso. Zagabria → Budapest senza autostrade e
     pedaggi, grafo caldo: 2,0 s col divieto, 6,0 s con la sola penalità, 2,0 s con la soluzione mista;
+  - tra Paesi (prova sulla tablet del 16/11, build 263): un camion senza pedaggi per Bratislava.
+    Dall'Austria l'ultimo tratto in città è a pedaggio. Col divieto in tutti i Paesi il viaggio
+    girava per l'Ungheria (Vienna → Bratislava 705 km); senza l'Ungheria tra le sequenze non trovava
+    nulla e la penalità in tutti i Paesi richiedeva 128 s. Ora prima si controlla, per ogni punto,
+    se col divieto i passaggi di confine entro mezz'ora diventano irraggiungibili o costano più del
+    doppio e un quarto d'ora. La penalità vale solo in quei Paesi, altrove resta il divieto coi suoi
+    landmark. Sul Mac Vienna → Bratislava passa da 705 a 90 km, Lubiana → Bratislava da 918 a
+    425 km, con 0,1–1,2 s di controllo. Se così non c'è percorso, penalità in tutti i Paesi;
   - all'import, l'arco di una strada principale che passa da un casello diventa pedaggio; da un
     portale, pedaggio per i camion (`ImportOptions.tollNodes`; `--no-toll-nodes` nel confronto con
     ORS). Questo vale **dopo la ricostruzione dei grafi** (`grafo-nm.yml`);

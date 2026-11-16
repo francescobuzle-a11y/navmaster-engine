@@ -178,6 +178,8 @@ class CrossBorderDirections(
      * [focusBeyond] negativo: sempre mirato (prove). Non tocca l'esattezza, solo il lavoro.
      */
     internal var focusBeyond = 0.0
+    /** false: "avoid" as a penalty in every country as soon as the ban finds nothing (prove, confronto). */
+    internal var shutInCheck = true
     internal var focusRatio = 1.25
 
     /** Il peso del viaggio scelto all'ultimo confine e i suoi valichi (diagnostica, prove). */
@@ -192,16 +194,26 @@ class CrossBorderDirections(
                         val bearings: MutableList<Double?> = MutableList(points.size) { null })
 
     /** Lo stato di una richiesta: router e agganci per grafo, pesi già calcolati. */
-    private inner class Ctx(val request: DirectionsRequest) {
+    private inner class Ctx(val request: DirectionsRequest, val penalized: Set<String>? = null,
+                            /** Searches without the roads to avoid at all (the yardstick of [shutIn]). */
+                            val plain: Boolean = false) {
         private val routers = HashMap<String, Router>()
         private val snaps = HashMap<String, Snap?>()
         /** The weights found, with the limit they were looked for under (an infinite one below a limit may exist above it). */
         private val weights = HashMap<String, Pair<Double, Double>>()
         var queries = 0
 
+        /**
+         * [r] as asked in [g]: "avoid" as a penalty only in the countries of [penalized] (null: all),
+         * a ban elsewhere. The weights add up across countries as they are: off the roads to avoid
+         * the penalty weighs as the ban.
+         */
+        fun inGraph(g: CountryGraph, r: DirectionsRequest): DirectionsRequest =
+            if (r.avoidPenalty && penalized != null && g.id !in penalized) r.withAvoidPenalty(false) else r
+
         // the choice of the crossings without the bearings (they only touch the ends): the quick search
         fun router(g: CountryGraph): Router = routers.getOrPut(g.id) {
-            val o = g.service.routeOptions(request).copy(hasBearings = false)
+            val o = g.service.routeOptions(inGraph(g, request)).copy(hasBearings = false).let { if (plain) it.copy(avoidFeatures = 0, avoidPenalty = 0.0) else it }
             // a trip across a border is a long one: a limited speed on the times only (the quick search)
             g.graph.router(if (!g.graph.coreWide && o.maximumSpeed.isFinite() && o.maximumSpeed >= DirectionsRequest.MAXIMUM_SPEED_LOWER_BOUND) o.copy(maximumSpeedTimeOnly = true) else o)
         }
@@ -222,7 +234,7 @@ class CrossBorderDirections(
         fun pieceWeight(g: CountryGraph, piece: DirectionsRequest): Double {
             queries++
             val t0 = System.currentTimeMillis()
-            val w = try { g.service.routes(piece).single().sumOf { it.weight } } catch (e: ApiException) { Double.POSITIVE_INFINITY }
+            val w = try { g.service.routes(inGraph(g, piece)).single().sumOf { it.weight } } catch (e: ApiException) { Double.POSITIVE_INFINITY }
             val ms = System.currentTimeMillis() - t0
             if (ms > 300) log?.invoke("    pezzo ${g.id} ${if (w.isFinite()) "%.0f".format(w) else "∞"} in $ms ms")
             return w
@@ -250,16 +262,85 @@ class CrossBorderDirections(
      * ogni punto quando è noto, altrimenti il grafo che lo aggancia più vicino.
      */
     fun handle(request: DirectionsRequest, pointGraph: List<String?>): Map<String, Any?> {
-        // "avoid" as a penalty: first as a ban, as DirectionsService.handle does (the choice of the
-        // crossings with the penalty costs three times as much)
-        if (request.avoidPenalty && request.avoidFeatures != 0 && request.coordinates.indices.none { i -> graphs.any { it.service.onAvoidedRoad(request, i) } }) {
-            try { return handle(request.withAvoidPenalty(false), pointGraph) } catch (e: ApiException) {
-                if (e.code != RoutingErrorCodes.ROUTE_NOT_FOUND && e.code != RoutingErrorCodes.POINT_NOT_FOUND) throw e
-                log?.invoke("evita come divieto: nessun percorso (${e.code}), di nuovo come penalità")
-            }
-        }
+        if (!request.avoidPenalty || request.avoidFeatures == 0) return route(request, pointGraph, null)
+        // "avoid" as a penalty. The countries where the ban hampers a point of the trip (a lorry for
+        // Bratislava: from Austria the last stretch in the city is a toll road; with the ban the trip
+        // came round through Hungary, Vienna → Bratislava 705 km) and those where a point is on a
+        // road to avoid: there the penalty, elsewhere the ban with its landmarks (the penalty in every
+        // country took 128 s on the tablet from Lombardy to Bratislava); with none, the ban everywhere
         val started = System.currentTimeMillis()
-        val ctx = Ctx(request)
+        val onRoad = request.coordinates.indices.flatMap { i -> graphs.filter { it.service.onAvoidedRoad(request, i) }.map { it.id } }.toSet()
+        val shut = onRoad + if (shutInCheck) shutIn(request, pointGraph) else emptySet()
+        log?.invoke("evita come penalità in: ${shut.ifEmpty { setOf("nessun Paese") }.joinToString()} (${System.currentTimeMillis() - started} ms)")
+        try {
+            return if (shut.isEmpty()) route(request.withAvoidPenalty(false), pointGraph, null) else route(request, pointGraph, shut)
+        } catch (e: ApiException) {
+            if (!notFound(e)) throw e
+            log?.invoke("evita: nessun percorso (${e.code}), come penalità in tutti i Paesi")
+        }
+        return route(request, pointGraph, null)
+    }
+
+    private fun notFound(e: ApiException) = e.code == RoutingErrorCodes.ROUTE_NOT_FOUND || e.code == RoutingErrorCodes.POINT_NOT_FOUND
+
+    /**
+     * The countries where the ban hampers a point of the trip: of the crossings within [LOCAL_REACH]
+     * of the point without the roads to avoid (from it; to it for the arrival; both for a stop), one
+     * that the ban makes unreachable or much farther ([LOCAL_DETOUR] times plus [LOCAL_SLACK]). A
+     * crossing on a road to avoid does not count (another one takes its place). Only near the points:
+     * a country blocked in transit is not found here (then the penalty everywhere, see [handle]).
+     */
+    private fun shutIn(request: DirectionsRequest, pointGraph: List<String?>): Set<String> {
+        val ban = Ctx(request.withAvoidPenalty(false))
+        val free = Ctx(request.withAvoidPenalty(false), plain = true)
+        val out = LinkedHashSet<String>()
+        val last = request.coordinates.lastIndex
+        for ((i, c) in request.coordinates.withIndex()) {
+            val t0 = System.currentTimeMillis()
+            val p = LL(c.first, c.second)
+            val radius = request.radiuses?.getOrNull(i)?.takeIf { it > 0 } ?: graphs.first().service.maximumSnappingRadius
+            // the point's country as the trip takes it (a point on a road to avoid: already penalised)
+            val hint = pointGraph.getOrNull(i)?.let { id -> graphs.firstOrNull { it.id == id } }
+            val (g, sb) = (if (hint != null) listOf(hint) else graphs.filter { it.graph.graph.bounds.contains(p.lat, p.lon) })
+                .mapNotNull { g -> ban.snap(g, p, radius)?.let { g to it } }.minByOrNull { it.second.distance } ?: continue
+            if (g.id in out) continue
+            val rb = ban.router(g); val r0 = free.router(g)
+            // only where the searches keep to the ban (the wide core; the reduced one searches without it)
+            if (!rb.searchesExact) continue
+            val s0 = free.snap(g, p, radius) ?: continue
+            // the crossings usable with the ban, in both countries
+            val exits = graphs.filter { it !== g && it.graph.graph.bounds.intersects(g.graph.graph.bounds) }
+                .flatMap { n -> transfers(g, n).map { n to LL(it.lat, it.lon) } }
+                .filter { (n, l) -> ban.snap(g, l, TRANSFER_RADIUS) != null && ban.snap(n, l, TRANSFER_RADIUS) != null }
+                .map { it.second }
+            if (exits.isEmpty()) continue
+            val in0 = exits.map { free.snap(g, it, TRANSFER_RADIUS)!! }
+            val inB = exits.map { ban.snap(g, it, TRANSFER_RADIUS)!! }
+            for (toPoint in when (i) { 0 -> listOf(false); last -> listOf(true); else -> listOf(false, true) }) {
+                val m0 = r0.manyToOne(s0, in0, rootIsTarget = toPoint) ?: break
+                m0.advance { m0.bound > LOCAL_REACH }
+                val near = exits.indices.filter { m0.isFinal(it) && m0.weight(it) <= LOCAL_REACH }
+                if (near.isEmpty()) continue
+                val mb = rb.manyToOne(sb, inB, rootIsTarget = toPoint) ?: break
+                fun limit(k: Int) = m0.weight(k) * LOCAL_DETOUR + LOCAL_SLACK
+                // only until every near crossing has its weight or one is proven beyond its limit
+                mb.advance { near.all { mb.isFinal(it) } || near.any { !mb.isFinal(it) && mb.bound > limit(it) } }
+                val hampered = near.firstOrNull { k -> if (mb.isFinal(k)) mb.weight(k) > limit(k) else mb.bound > limit(k) }
+                if (hampered != null) {
+                    log?.invoke("  evita: il punto $i in ${g.id} col divieto arriva male al passaggio %.5f,%.5f (%.0f invece di %.0f)".format(
+                        exits[hampered].lat, exits[hampered].lon, if (mb.isFinal(hampered)) mb.weight(hampered) else Double.POSITIVE_INFINITY, m0.weight(hampered)))
+                    out += g.id; break
+                }
+            }
+            log?.invoke("  evita: punto $i in ${g.id}, ${System.currentTimeMillis() - t0} ms")
+        }
+        return out
+    }
+
+    /** [handle] with "avoid" as a penalty only in the countries of [penalized] (null: all). */
+    private fun route(request: DirectionsRequest, pointGraph: List<String?>, penalized: Set<String>?): Map<String, Any?> {
+        val started = System.currentTimeMillis()
+        val ctx = Ctx(request, penalized)
         val pts = request.coordinates.map { LL(it.first, it.second) }
         val radius = { i: Int -> request.radiuses?.getOrNull(i)?.takeIf { it > 0 } ?: graphs.first().service.maximumSnappingRadius }
         val of = pts.indices.map { i ->
@@ -272,10 +353,10 @@ class CrossBorderDirections(
                 "Could not find routable point within a radius of ${radius(i).toLong()} meters of specified coordinate $i: %.7f %.7f.".format(pts[i].lon, pts[i].lat))
         }
         log?.invoke("punti nei grafi: ${of.joinToString { it.id }}")
-        if (of.all { it === of[0] }) return of[0].service.handle(request, ResponseFormat.GEOJSON)
+        if (of.all { it === of[0] }) return of[0].service.handle(ctx.inGraph(of[0], request), ResponseFormat.GEOJSON)
         // alternatives across borders: the via points method (each candidate is a trip like this one)
         if (request.alternatives != null && pts.size == 2) {
-            return LongAlternatives(graphs.map { it.graph }, log) { r, pg -> handle(r, pg) }.handle(request, of.map { it.id })
+            return LongAlternatives(graphs.map { it.graph }, log) { r, pg -> route(r, pg, penalized) }.handle(request, of.map { it.id })
         }
 
         // i pezzi del viaggio: le tappe nello stesso grafo restano insieme, ai confini il passaggio migliore
@@ -329,7 +410,7 @@ class CrossBorderDirections(
         val pieceRequests = pieces.map { p -> p.graph to request.withPoints(p.points, p.radiuses.toDoubleArray(), p.exact.toBooleanArray(), p.bearings) }
         lastPieces = pieceRequests
         val docs = pieceRequests.map { (g, r0) ->
-            val r = g.service.handle(r0, ResponseFormat.GEOJSON)
+            val r = g.service.handle(ctx.inGraph(g, r0), ResponseFormat.GEOJSON)
             @Suppress("UNCHECKED_CAST")
             (r["features"] as List<Map<String, Any?>>).first()
         }
@@ -407,7 +488,7 @@ class CrossBorderDirections(
         if (together && compareOneByOne && log != null) {
             // diagnostica: la scelta di un valico alla volta, con ricerche sue, per confronto
             val t0 = System.currentTimeMillis()
-            val c2 = Ctx(ctx.request)
+            val c2 = Ctx(ctx.request, ctx.penalized)
             val other = chain(c2, prefix, suffix, radius, gb, together = false)
             log.invoke("  confronto, un valico alla volta: ${other?.joinToString { "%.5f,%.5f".format(it.first.lat, it.first.lon) } ?: "nessuno"} peso ${"%.0f".format(lastWeight)}, ${c2.queries} ricerche, ${System.currentTimeMillis() - t0} ms")
         }
@@ -1040,6 +1121,13 @@ class CrossBorderDirections(
         const val WINDOW_SLACK = 600.0
         /** Il raggio di aggancio di un passaggio di confine: il punto è un nodo della strada. */
         const val TRANSFER_RADIUS = 3.0
+        /**
+         * "Evita" ([shutIn]): i passaggi entro mezz'ora dal punto (senza le strade da evitare); col divieto
+         * il punto è ostacolato se uno di questi diventa irraggiungibile o costa più del doppio e un quarto d'ora.
+         */
+        const val LOCAL_REACH = 1800.0
+        const val LOCAL_DETOUR = 2.0
+        const val LOCAL_SLACK = 900.0
         /**
          * Quanto sopra il tetto va il limite dimostrato da un percorso mirato senza esito (secondi): molto
          * più degli arrotondamenti delle somme, molto meno di qualsiasi differenza fra due viaggi.
