@@ -70,6 +70,14 @@ class GuidanceStore(private var da: DataAccess, private val names: StringStore) 
     /** 1 = senso unico A→B, -1 = B→A, 0 = doppio senso (dal tag `oneway`, non dall'accesso del profilo). */
     fun oneway(edge: Int): Int = if (!has(edge)) 0 else u8(edge, 7).let { f -> if (f and F_ONEWAY_FWD != 0) 1 else if (f and F_ONEWAY_BWD != 0) -1 else 0 }
     fun ref(edge: Int): String = if (!has(edge)) "" else str(edge, 8)
+    /**
+     * Il puntatore della stringa `ref` dell'arco (0 = nessuno), una lettura sola: per tenere in cache
+     * le stringhe già lette. I puntatori non sono canonici (lo StringStore deduplica solo le stringhe
+     * recenti): mai confrontarli, confrontare le stringhe ([string]).
+     */
+    fun refPointer(edge: Int): Int = if (!has(edge)) 0 else da.getInt(edge.toLong() * ENTRY_BYTES + 8)
+    /** La stringa al puntatore [ptr] del deposito dei nomi ("" per 0). */
+    fun string(ptr: Int): String = names.get(ptr)
     fun turnLanes(edge: Int, reverse: Boolean): String = if (!has(edge)) "" else str(edge, if (reverse) 16 else 12)
     fun destination(edge: Int, reverse: Boolean): String = if (!has(edge)) "" else str(edge, if (reverse) 24 else 20)
     fun destinationRef(edge: Int, reverse: Boolean): String = if (!has(edge)) "" else str(edge, if (reverse) 32 else 28)

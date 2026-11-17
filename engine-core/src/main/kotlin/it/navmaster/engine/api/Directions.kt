@@ -11,9 +11,14 @@ import it.navmaster.engine.instructions.RouteStep
 import it.navmaster.engine.instructions.StepOptions
 import it.navmaster.engine.profile.AvoidFeatureFlags
 import it.navmaster.engine.profile.HeavyVehicleAttributes
+import it.navmaster.engine.index.Snap
+import it.navmaster.engine.routing.CancelToken
+import it.navmaster.engine.routing.PathEdge
 import it.navmaster.engine.routing.PointNotFoundException
 import it.navmaster.engine.routing.RouteNotFoundException
 import it.navmaster.engine.routing.RoutePath
+import it.navmaster.engine.routing.Router
+import it.navmaster.engine.routing.SearchCancelledException
 import it.navmaster.engine.storage.BBox
 import it.navmaster.engine.storage.PointList
 import it.navmaster.engine.util.DistanceCalc
@@ -21,6 +26,9 @@ import it.navmaster.engine.weighting.AvoidFeaturesEdgeFilter
 import it.navmaster.engine.weighting.VehicleParameters
 import it.navmaster.engine.weighting.WeightingMethod
 import java.time.Instant
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReferenceArray
 
 /** Codici d'errore dell'endpoint directions di ORS (`RoutingErrorCodes`). */
 object RoutingErrorCodes {
@@ -93,18 +101,45 @@ class DirectionsRequest(
      * ([AVOID_PENALTY_FACTOR]) invece che come divieto, come gli "evita" di TomTom.
      */
     val avoidPenalty: Boolean = false,
+    /**
+     * Estensione NavMaster `{"navmaster": {"pass_through": [false, true, false]}}`: per punto, vero
+     * dove si passa senza fermarsi (un «passa per di qui»): lì, come con `continue_straight`, il
+     * tratto seguente prosegue nel verso d'arrivo. Le soste (false) lasciano invertire.
+     */
+    val passThrough: BooleanArray? = null,
+    /**
+     * Estensione NavMaster `{"navmaster": {"alternatives": {…}}}`: le varianti del migliore con
+     * qualunque numero di punti ([NavAlternativesEngine]); null se non chieste. Non insieme ad `alternative_routes`.
+     */
+    val navAlternatives: NavAlternativesOptions? = null,
 ) {
+    /** Vero se al punto [i] si prosegue nel verso d'arrivo: `continue_straight`, o `pass_through` di quel punto. */
+    fun passThroughAt(i: Int): Boolean = continueStraight || passThrough?.getOrNull(i) == true
+
     /** La stessa richiesta con o senza gli "evita" come penalità ([avoidPenalty]). */
     fun withAvoidPenalty(on: Boolean): DirectionsRequest = if (on == avoidPenalty) this else DirectionsRequest(
         profile, coordinates, preference, units, language, instructions, htmlFormat, geometry, maneuvers, avoidFeatures, vehicleType,
         vehicleParameters, avoidPolygons, maximumSpeed, continueStraight, navmasterRoads, alternatives, radiuses, id, attributes, extraInfo, echo, exactPoints,
-        bearings, on)
+        bearings, on, passThrough, navAlternatives)
 
-    /** La stessa richiesta su altri punti (un tratto di un viaggio tra Paesi), senza alternative. */
-    fun withPoints(points: List<Pair<Double, Double>>, pointRadiuses: DoubleArray?, exact: BooleanArray? = null, pointBearings: List<Double?>? = null): DirectionsRequest = DirectionsRequest(
+    /** La stessa richiesta senza `navmaster.alternatives`: quella del percorso migliore. */
+    fun withoutNavAlternatives(): DirectionsRequest = withNavAlternatives(null)
+
+    /** La stessa richiesta con le varianti [opt] (anche con le opzioni interne, per le prove). */
+    internal fun withNavAlternatives(opt: NavAlternativesOptions?): DirectionsRequest = if (navAlternatives === opt) this else DirectionsRequest(
+        profile, coordinates, preference, units, language, instructions, htmlFormat, geometry, maneuvers, avoidFeatures, vehicleType,
+        vehicleParameters, avoidPolygons, maximumSpeed, continueStraight, navmasterRoads, alternatives, radiuses, id, attributes, extraInfo, echo, exactPoints,
+        bearings, avoidPenalty, passThrough, opt)
+
+    /**
+     * La stessa richiesta su altri punti (un tratto di un viaggio tra Paesi), senza alternative (né varianti);
+     * [pointPassThrough]: il `pass_through` dei nuovi punti (null: nessuno).
+     */
+    fun withPoints(points: List<Pair<Double, Double>>, pointRadiuses: DoubleArray?, exact: BooleanArray? = null, pointBearings: List<Double?>? = null,
+                   pointPassThrough: BooleanArray? = null): DirectionsRequest = DirectionsRequest(
         profile, points, preference, units, language, instructions, htmlFormat, geometry, maneuvers, avoidFeatures, vehicleType,
         vehicleParameters, avoidPolygons, maximumSpeed, continueStraight, navmasterRoads, null, pointRadiuses, id, attributes, extraInfo, echo, exact,
-        pointBearings?.takeIf { b -> b.any { it != null } }, avoidPenalty)
+        pointBearings?.takeIf { b -> b.any { it != null } }, avoidPenalty, pointPassThrough?.takeIf { p -> p.any { it } })
 
     companion object {
         /**
@@ -183,6 +218,16 @@ class DirectionsRequest(
                     }
                 }
             }?.takeIf { b -> b.any { it != null } }
+            // NavMaster `pass_through`: un valore per punto
+            val passThrough = ((body["navmaster"] as? Map<*, *>)?.get("pass_through"))?.let { v ->
+                val list = v as? List<*> ?: throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'navmaster.pass_through' must be a list with one entry per coordinate.")
+                if (list.size != coordinates.size) throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'navmaster.pass_through' must have one entry per coordinate.")
+                // solo vero/falso: 1, "true" o null non diventano in silenzio una sosta
+                BooleanArray(list.size) { list[it] as? Boolean ?: throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'navmaster.pass_through' must contain only true or false.") }
+            }?.takeIf { p -> p.any { it } }
+            // NavMaster `alternatives`: le varianti del migliore, non insieme alle alternative ORS
+            val navAlternatives = (body["navmaster"] as? Map<*, *>)?.get("alternatives")?.let { NavAlternativesOptions.fromJson(it) }
+            if (navAlternatives != null && body["alternative_routes"] != null) throw ApiException(400, RoutingErrorCodes.INCOMPATIBLE_PARAMETERS, "Parameters 'alternative_routes' and 'navmaster.alternatives' cannot be used together.")
             if (maximumSpeed < MAXIMUM_SPEED_LOWER_BOUND) throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'maximum_speed' must be at least ${MAXIMUM_SPEED_LOWER_BOUND.toInt()} km/h.")
             return DirectionsRequest(
                 profile, coordinates, preference, units, body["language"]?.toString() ?: "en",
@@ -199,7 +244,7 @@ class DirectionsRequest(
                     AlternativeOptions(count, (a["weight_factor"] as? Number)?.toDouble() ?: 1.4, (a["share_factor"] as? Number)?.toDouble() ?: 0.6)
                 },
                 radiuses = radiuses, id = body["id"]?.toString(), attributes = attributes, extraInfo = extraInfo, echo = body,
-                bearings = bearings,
+                bearings = bearings, passThrough = passThrough, navAlternatives = navAlternatives,
             )
         }
 
@@ -272,7 +317,7 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         profile = request.profile, weighting = request.preference, avoidFeatures = request.avoidFeatures,
         vehicleType = request.vehicleType, vehicleParameters = request.vehicleParameters,
         avoidPolygons = request.avoidPolygons, maximumSpeed = request.maximumSpeed,
-        continueStraight = request.continueStraight,
+        continueStraight = request.continueStraight || request.passThrough?.any { it } == true,
         hasBearings = request.bearings != null,
         avoidPenalty = if (request.avoidPenalty) DirectionsRequest.AVOID_PENALTY_FACTOR else 0.0,
     )
@@ -298,13 +343,15 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         val o = routeOptions(request)
         val radius = request.radiuses?.getOrNull(i)?.takeIf { it > 0 } ?: limits.maximumSnappingRadius
         val heading = request.bearings?.getOrNull(i) ?: Double.NaN
-        val free = try { graphs.router(o.copy(avoidFeatures = 0, avoidPenalty = 0.0)).snap(lat, lon, radius, i, heading = heading) } catch (e: Exception) { return false }
+        val freeOptions = o.copy(avoidFeatures = 0, avoidPenalty = 0.0)
+        val free = try { snap(graphs.router(freeOptions), freeOptions, i, lat, lon, radius, true, heading) } catch (e: Exception) { return false }
         val name = try { graphs.encoderName(request.profile) } catch (e: IllegalArgumentException) { return false }
         val pe = graphs.encoding.profile(name)
         val avoid = AvoidFeaturesEdgeFilter(graphs.encoding.shared, request.avoidFeatures, pe.profile.category, name == "heavyvehicle")
         val it = graphs.graph.createEdgeIterator().setEdge(free.edge, graphs.graph.nodeA(free.edge))
         if (avoid.accept(it)) return false
-        val banned = try { graphs.router(o.copy(avoidPenalty = 0.0)).snap(lat, lon, radius, i, heading = heading) } catch (e: Exception) { return true }
+        val bannedOptions = o.copy(avoidPenalty = 0.0)
+        val banned = try { snap(graphs.router(bannedOptions), bannedOptions, i, lat, lon, radius, true, heading) } catch (e: Exception) { return true }
         return banned.distance > free.distance + AVOIDED_ROAD_MARGIN
     }
 
@@ -323,35 +370,53 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
     /** Il grafo del servizio. */
     val routingGraph: RoutingGraph get() = graphs
 
-    fun handle(request: DirectionsRequest, format: ResponseFormat): Map<String, Any?> {
-        // "avoid" as a penalty: first as a ban (faster: the roads to avoid are left out of the search,
-        // and with a route free of them it is the same route); the penalty only when the vehicle is on
-        // a road to avoid or when the ban finds no route
-        if (request.avoidPenalty && request.avoidFeatures != 0 && request.coordinates.indices.none { onAvoidedRoad(request, it) }) {
-            try { return handle(request.withAvoidPenalty(false), format) } catch (e: ApiException) {
-                if (e.code != RoutingErrorCodes.ROUTE_NOT_FOUND && e.code != RoutingErrorCodes.POINT_NOT_FOUND) throw e
+    /**
+     * La risposta ORS a [request]. [rc]: l'annullamento (una ricerca annullata lancia
+     * [SearchCancelledException][it.navmaster.engine.routing.SearchCancelledException], non
+     * [ApiException]), i posti di ricerca e le misure ([RequestStats]).
+     */
+    fun handle(request: DirectionsRequest, format: ResponseFormat, rc: RequestContext = RequestContext.NONE): Map<String, Any?> {
+        val started = System.nanoTime()
+        try {
+            // "avoid" as a penalty: first as a ban (faster: the roads to avoid are left out of the search,
+            // and with a route free of them it is the same route); the penalty only when the vehicle is on
+            // a road to avoid or when the ban finds no route
+            if (request.avoidPenalty && request.avoidFeatures != 0 && request.coordinates.indices.none { onAvoidedRoad(request, it) }) {
+                try { return handle(request.withAvoidPenalty(false), format, rc) } catch (e: ApiException) {
+                    if (e.code != RoutingErrorCodes.ROUTE_NOT_FOUND && e.code != RoutingErrorCodes.POINT_NOT_FOUND) throw e
+                    rc.stats.setAside("divieto scartato")
+                }
             }
-        }
-        // alternatives on a trip too long for the plateau method: the via points method (GeoJSON only)
-        if (request.alternatives != null && format == ResponseFormat.GEOJSON && request.coordinates.size == 2 && beeline(request) > limits.maximumDistanceAlternativeRoutes) {
-            encoder(request)
-            return LongAlternatives(listOf(graphs), log = alternativesLog) { r, _ -> handle(r, format) }.handle(request, listOf(null, null))
-        }
-        val encoder = encoder(request)
-        val routes = routes(request)
-        val docs = routes.map { buildRoute(request, it, encoder) }
-        val all = BBox.empty()
-        for (d in docs) { all.include(d.bbox[1], d.bbox[0]); all.include(d.bbox[3], d.bbox[2]) }
-        val bboxArr = doubleArrayOf(r6(all.minLon), r6(all.minLat), r6(all.maxLon), r6(all.maxLat))
-        val metadata = metadata(request)
-        return when (format) {
-            ResponseFormat.JSON -> linkedMapOf("bbox" to bboxArr, "routes" to docs.map { it.json }, "metadata" to metadata)
-            ResponseFormat.GEOJSON -> linkedMapOf("type" to "FeatureCollection", "bbox" to bboxArr, "features" to docs.map { it.feature }, "metadata" to metadata)
+            // NavMaster variants (any number of points), with the "avoid" mode of the best route
+            request.navAlternatives?.let { opt ->
+                if (format != ResponseFormat.GEOJSON) throw ApiException(400, RoutingErrorCodes.INCOMPATIBLE_PARAMETERS, "Parameter 'navmaster.alternatives' needs the GeoJSON format.")
+                return variantsResponse(request, opt, rc)
+            }
+            // alternatives on a trip too long for the plateau method: the via points method (GeoJSON only)
+            if (request.alternatives != null && format == ResponseFormat.GEOJSON && request.coordinates.size == 2 && beeline(request) > limits.maximumDistanceAlternativeRoutes) {
+                encoder(request)
+                return LongAlternatives(listOf(graphs), log = alternativesLog, cancel = rc.cancel) { r, _ -> handle(r, format, rc) }.handle(request, listOf(null, null))
+            }
+            val encoder = encoder(request)
+            val routes = routes(request, rc)
+            val docs = routes.map { buildRoute(request, it, encoder, rc.stats) }
+            val all = BBox.empty()
+            for (d in docs) { all.include(d.bbox[1], d.bbox[0]); all.include(d.bbox[3], d.bbox[2]) }
+            val bboxArr = doubleArrayOf(r6(all.minLon), r6(all.minLat), r6(all.maxLon), r6(all.maxLat))
+            val metadata = metadata(request)
+            return when (format) {
+                ResponseFormat.JSON -> linkedMapOf("bbox" to bboxArr, "routes" to docs.map { it.json }, "metadata" to metadata)
+                ResponseFormat.GEOJSON -> linkedMapOf("type" to "FeatureCollection", "bbox" to bboxArr, "features" to docs.map { it.feature }, "metadata" to metadata)
+            }
+        } finally {
+            // la chiamata più esterna finisce per ultima: le sue misure restano
+            rc.stats.profile = request.profile; rc.stats.points = request.coordinates.size
+            rc.stats.totalMs = (System.nanoTime() - started) / 1_000_000
         }
     }
 
     /** L'encoder del profilo della richiesta (errore ORS se sconosciuto o assente da questo server). */
-    private fun encoder(request: DirectionsRequest): String {
+    internal fun encoder(request: DirectionsRequest): String {
         val encoder = try { graphs.encoderName(request.profile) } catch (e: IllegalArgumentException) {
             throw ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, "Parameter 'profile' has incorrect value of '${request.profile}'.")
         }
@@ -361,9 +426,39 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
 
     /**
      * I percorsi di una richiesta, quelli che [handle] mette nella risposta: convalida, aggancio dei
-     * punti, un tratto fra ogni coppia di punti (o le alternative). Errori come ORS ([ApiException]).
+     * punti, un tratto fra ogni coppia di punti ([solve]) o le alternative ORS. Errori come ORS ([ApiException]).
+     * [rc]: le ricerche con un posto di [RequestContext.slots], annullabili; le misure in [RequestContext.stats].
      */
-    fun routes(request: DirectionsRequest): List<List<RoutePath>> {
+    fun routes(request: DirectionsRequest, rc: RequestContext = RequestContext.NONE): List<List<RoutePath>> {
+        val alt = request.alternatives ?: return listOf(solve(request, rc).legs)
+        val (routeOptions, beeline) = checked(request)
+        if (beeline > limits.maximumDistanceAlternativeRoutes) throw ApiException(400, RoutingErrorCodes.REQUEST_EXCEEDS_SERVER_LIMIT, "The approximated route distance must not be greater than ${limits.maximumDistanceAlternativeRoutes.toLong()} meters for alternative routes.")
+
+        val st = rc.stats
+        if (st.points == 0) { st.profile = request.profile; st.points = request.coordinates.size }
+        return rc.searching {
+            // a long trip with a limited speed: the speed on the times only (see RouteOptions.maximumSpeedTimeOnly)
+            val opts = if (fastMaximumSpeed(routeOptions, beeline)) routeOptions.copy(maximumSpeedTimeOnly = true) else routeOptions
+            val router = graphs.router(opts)
+            router.cancel = rc.cancel
+            val snaps = snapAll(request, opts, router, rc, null)
+            val tSearch = System.nanoTime()
+            val routes = ArrayList<List<RoutePath>>()
+            // come ORS: alternative solo fra due punti, in modalità flessibile
+            if (snaps.size != 2) throw ApiException(400, RoutingErrorCodes.INCOMPATIBLE_PARAMETERS, "Alternative routes algorithm does not support more than two way points.")
+            try { for (p in router.alternatives(snaps[0], snaps[1], alt.targetCount, alt.weightFactor, alt.shareFactor)) routes += listOf(p) } catch (e: RouteNotFoundException) {
+                throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points 0 (%.7f %.7f) and 1 (%.7f %.7f).".format(
+                    request.coordinates[0].second, request.coordinates[0].first, request.coordinates[1].second, request.coordinates[1].first))
+            }
+            st.legs += LegStats(0, LegStats.Source.CALC, ms(tSearch), router.lastAlgorithm + " alternative ${routes.size}", router.lastSearch,
+                routes.sumOf { r -> r.sumOf { it.edges.size } }, routes.firstOrNull()?.sumOf { it.distance } ?: 0.0, Thread.currentThread().name)
+            st.searchWallMs += ms(tSearch)
+            routes
+        }
+    }
+
+    /** Le opzioni di [request] e la sua linea d'aria, dopo i controlli del profilo e dei limiti del servizio. */
+    private fun checked(request: DirectionsRequest): Pair<RouteOptions, Double> {
         val routeOptions = routeOptions(request)
         encoder(request)
         if (request.coordinates.size > limits.maximumWaypoints) throw ApiException(400, RoutingErrorCodes.REQUEST_EXCEEDS_SERVER_LIMIT, "The specified number of waypoints must not be greater than ${limits.maximumWaypoints}.")
@@ -374,47 +469,344 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         }
         val maxDist = if (routeOptions.isStatic) limits.maximumDistance else limits.maximumDistanceDynamicWeights
         if (beeline > maxDist) throw ApiException(400, RoutingErrorCodes.REQUEST_EXCEEDS_SERVER_LIMIT, "The approximated route distance must not be greater than ${maxDist.toLong()} meters.")
-        if (request.alternatives != null && beeline > limits.maximumDistanceAlternativeRoutes) throw ApiException(400, RoutingErrorCodes.REQUEST_EXCEEDS_SERVER_LIMIT, "The approximated route distance must not be greater than ${limits.maximumDistanceAlternativeRoutes.toLong()} meters for alternative routes.")
-
-        // a long trip with a limited speed: the speed on the times only (see RouteOptions.maximumSpeedTimeOnly)
-        val router = graphs.router(if (fastMaximumSpeed(routeOptions, beeline)) routeOptions.copy(maximumSpeedTimeOnly = true) else routeOptions)
-        val snaps = request.coordinates.mapIndexed { i, (lat, lon) ->
-            val radius = request.radiuses?.get(i)?.takeIf { it > 0 } ?: limits.maximumSnappingRadius
-            try { router.snap(lat, lon, radius, i, checkNetwork = request.exactPoints?.getOrNull(i) != true, heading = request.bearings?.getOrNull(i) ?: Double.NaN) } catch (e: PointNotFoundException) {
-                throw ApiException(404, RoutingErrorCodes.POINT_NOT_FOUND, "Could not find routable point within a radius of ${radius.toLong()} meters of specified coordinate ${e.pointIndex}: %.7f %.7f.".format(lon, lat))
-            }
-        }
-        val alt = request.alternatives
-        val routes = ArrayList<List<RoutePath>>()
-        if (alt != null) {
-            // come ORS: alternative solo fra due punti, in modalità flessibile
-            if (snaps.size != 2) throw ApiException(400, RoutingErrorCodes.INCOMPATIBLE_PARAMETERS, "Alternative routes algorithm does not support more than two way points.")
-            try { for (p in router.alternatives(snaps[0], snaps[1], alt.targetCount, alt.weightFactor, alt.shareFactor)) routes += listOf(p) } catch (e: RouteNotFoundException) {
-                throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points 0 (%.7f %.7f) and 1 (%.7f %.7f).".format(
-                    request.coordinates[0].second, request.coordinates[0].first, request.coordinates[1].second, request.coordinates[1].first))
-            }
-        } else {
-            val legs = ArrayList<RoutePath>()
-            for (i in 1 until snaps.size) {
-                // continue_straight: il tratto prosegue nel verso con cui il precedente è arrivato al via-point
-                val arrival = if (request.continueStraight) legs.lastOrNull()?.edges?.lastOrNull() else null
-                // ORS `bearings`: la direzione di partenza dal punto i−1 e d'arrivo al punto i
-                val fromHeading = request.bearings?.getOrNull(i - 1) ?: Double.NaN
-                val toHeading = if (i == snaps.size - 1) request.bearings?.getOrNull(i) ?: Double.NaN else Double.NaN
-                try { legs += router.route(snaps[i - 1], snaps[i], arrival, fromHeading, toHeading) } catch (e: RouteNotFoundException) {
-                    throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points ${i - 1} (%.7f %.7f) and $i (%.7f %.7f).".format(
-                        request.coordinates[i - 1].second, request.coordinates[i - 1].first, request.coordinates[i].second, request.coordinates[i].first))
-                }
-            }
-            routes += legs
-        }
-        return routes
+        return routeOptions to beeline
     }
+
+    /**
+     * Una richiesta risolta: le opzioni del router ([options], come le ha usate la ricerca), i punti
+     * agganciati e un tratto fra ogni coppia di punti; la risposta si costruisce a parte ([feature], [handle]).
+     */
+    class Solved(val request: DirectionsRequest, val options: RouteOptions, val snaps: List<Snap>, val legs: List<RoutePath>)
+
+    /** I tratti già calcolati ([solve]) e gli agganci: vivono quanto il servizio. */
+    private val legCache = LegCache()
+    private val snapCache = SnapCache()
+    /** Le reti autostradali delle varianti (fonte M), per opzioni del router e regione. */
+    internal val netCache = it.navmaster.engine.routing.MotorwayNetCache()
+
+    /** Svuota le cache dei tratti, degli agganci e delle reti autostradali (poca memoria: `onTrimMemory` dell'app). */
+    fun clearCaches() { legCache.clear(); snapCache.clear(); netCache.clear() }
+
+    /** Diagnostica e prove: lo stato della cache dei tratti. */
+    internal val legCacheInfo: String get() = legCache.info
+    internal val legCacheSize: Int get() = legCache.size
+
+    /**
+     * Aggancia i punti e cerca i tratti di [request] (senza alternative ORS), con le cache: un
+     * tratto già calcolato con le stesse opzioni, gli stessi punti agganciati e lo stesso verso
+     * d'arrivo (dove conta, [Router.arrivalKey]) non si ricalcola. Con un aiutante libero
+     * ([SearchSlots.tryHelper] e [RequestContext.executor]) agganci e tratti vanno su due thread: un
+     * tratto che dipende dal precedente (`pass_through` a metà arco) mentre l'altro thread cerca quello
+     * si cerca senza il verso d'arrivo e poi si controlla ([LegStats.Source.SPEC_OK] o [LegStats.Source.RECALC]).
+     * Errori come ORS ([ApiException]): del punto, o del tratto, d'indice minimo.
+     */
+    fun solve(request: DirectionsRequest, rc: RequestContext = RequestContext.NONE): Solved {
+        val (routeOptions, beeline) = checked(request)
+        val st = rc.stats
+        if (st.points == 0) { st.profile = request.profile; st.points = request.coordinates.size }
+        return rc.searching {
+            // anche una richiesta tutta in cache si ferma se annullata
+            rc.cancel.check()
+            // a long trip with a limited speed: the speed on the times only (see RouteOptions.maximumSpeedTimeOnly)
+            val opts = if (fastMaximumSpeed(routeOptions, beeline)) routeOptions.copy(maximumSpeedTimeOnly = true) else routeOptions
+            val router = graphs.router(opts)
+            router.cancel = rc.cancel
+            val help = Help(rc, opts)
+            val snaps = snapAll(request, opts, router, rc, help)
+            Solved(request, opts, snaps, legsOf(request, opts, router, snaps, rc, help))
+        }
+    }
+
+    /**
+     * [solve] con il modo «evita» di [handle]: gli «evita» come penalità prima come divieto, se
+     * nessun punto sta su una strada da evitare e il divieto trova il percorso. [Solved.request] è la
+     * richiesta usata (quella da dare a [feature]). I pezzi di un viaggio tra Paesi.
+     */
+    internal fun solveAsHandled(request: DirectionsRequest, rc: RequestContext = RequestContext.NONE): Solved {
+        if (request.avoidPenalty && request.avoidFeatures != 0 && request.coordinates.indices.none { onAvoidedRoad(request, it) }) {
+            try { return solve(request.withAvoidPenalty(false), rc) } catch (e: ApiException) {
+                if (e.code != RoutingErrorCodes.ROUTE_NOT_FOUND && e.code != RoutingErrorCodes.POINT_NOT_FOUND) throw e
+                rc.stats.setAside("divieto scartato")
+            }
+        }
+        return solve(request, rc)
+    }
+
+    /**
+     * L'aggancio di un punto ([Router.snap]) dalla cache degli agganci, se c'è: stesse opzioni del
+     * router ([RoutingGraph.routerKey]), stessa coordinata, raggio, controllo delle reti isolate e
+     * direzione. [i]: l'indice del punto, per il messaggio di [PointNotFoundException] (mai in cache).
+     */
+    fun snap(router: Router, options: RouteOptions, i: Int, lat: Double, lon: Double, radius: Double, checkNetwork: Boolean, heading: Double, useCache: Boolean = true): Snap =
+        if (!useCache) router.snap(lat, lon, radius, i, checkNetwork, heading)
+        else snapCache.get(SnapCacheKey(graphs.routerKey(options), lat.toBits(), lon.toBits(), radius, checkNetwork, heading.toBits())) { router.snap(lat, lon, radius, i, checkNetwork, heading) }
+
+    /** Il risultato di una voce di [inParallel] finita con un errore (da lanciare nell'ordine delle voci). */
+    private class Failure(val e: RuntimeException)
+
+    /**
+     * Il thread aiutante di una richiesta: il posto da aiutante ([SearchSlots.tryHelper]) si chiede a
+     * ogni [inParallel] che ne ha bisogno e si lascia appena l'aiutante ha finito (un posto fermo non
+     * fa aspettare una richiesta MAIN); il router dell'aiutante, creato e usato solo sul thread
+     * dell'aiutante (un [inParallel] alla volta), resta per il successivo.
+     */
+    private inner class Help(private val rc: RequestContext, private val options: RouteOptions) {
+        private var router: Router? = null
+
+        /** Un posto da aiutante, se c'è l'executor e un posto libero (senza attesa); va chiuso. */
+        fun slot(): SearchSlots.Helper? = if (rc.executor != null) rc.slots?.tryHelper(rc.priority, rc.cancel) else null
+
+        /** Il router dell'aiutante (sul suo thread soltanto), col token del posto [token]. */
+        fun router(token: CancelToken): Router = (router ?: graphs.router(options).also { router = it }).also { it.cancel = token }
+    }
+
+    /**
+     * Le voci [order] (indici in [out]), nell'ordine dato, su questo thread e, con il posto da
+     * aiutante [slot], anche sull'aiutante: ogni thread prende la prima voce non ancora presa la cui
+     * voce [after] (d'indice minore, -1 se nessuna) è finita o, se non ce n'è, in corso sull'altro
+     * thread; mai una voce prima della sua [after] ancora da prendere (un thread solo le fa in ordine
+     * di dipendenza). [work] la fa col router del thread. In [out] il risultato di ogni voce, o il suo
+     * errore ([Failure]); l'annullamento invece esce. Un aiutante annullato (prelazionato) si ferma e
+     * lascia le sue voci a questo thread. Ritorna (o esce) sempre con l'aiutante fermo e [slot] chiuso.
+     */
+    private fun inParallel(order: List<Int>, out: AtomicReferenceArray<Any?>, router: Router, help: Help?, slot: SearchSlots.Helper?, rc: RequestContext,
+                           after: (Int) -> Int = { -1 }, work: (Router, Int) -> Any) {
+        // lo stato delle voci: fatta (o fuori da [order]), da prendere, in corso
+        val state = IntArray(out.length())
+        for (i in order) state[i] = ITEM_FREE
+        fun take(): Int = synchronized(state) {
+            var behind = -1
+            for (i in order) {
+                if (state[i] != ITEM_FREE) continue
+                val a = after(i)
+                val s = if (a < 0) ITEM_DONE else state[a]
+                if (s == ITEM_DONE) { state[i] = ITEM_RUNNING; return i }
+                if (s == ITEM_RUNNING && behind < 0) behind = i
+            }
+            if (behind >= 0) state[behind] = ITEM_RUNNING
+            behind
+        }
+        fun one(r: Router, i: Int) {
+            try {
+                out.set(i, try { work(r, i) } catch (e: SearchCancelledException) { throw e } catch (e: RuntimeException) { Failure(e) })
+                synchronized(state) { state[i] = ITEM_DONE }
+            } catch (e: SearchCancelledException) { synchronized(state) { state[i] = ITEM_FREE }; throw e }
+        }
+        // [stop]: l'aiutante, prelazionato fra una voce e l'altra (anche prima di partire), non ne prende altre
+        fun loop(r: Router, stop: CancelToken? = null) { while (true) { stop?.check(); val i = take(); if (i < 0) return; one(r, i) } }
+        val executor = rc.executor
+        // l'aiutante parte solo se nessuno l'ha fermato prima (in coda dietro altro lavoro: allora non serve più)
+        val claimed = AtomicBoolean(false)
+        val done = CountDownLatch(1)
+        var helperError: Throwable? = null
+        var submitted = false
+        try {
+            if (slot != null && executor != null) submitted = try {
+                executor.execute {
+                    if (claimed.compareAndSet(false, true)) try {
+                        slot.run { loop(help!!.router(slot.token), slot.token) }
+                    } catch (e: SearchCancelledException) {
+                        // prelazionato o annullato: le voci restano a questo thread (che vede da sé un annullamento)
+                    } catch (e: Throwable) { helperError = e } finally { slot.close(); done.countDown() }
+                }
+                true
+            } catch (e: java.util.concurrent.RejectedExecutionException) { false }
+            // senza aiutante il posto non serve
+            if (!submitted) slot?.close()
+            try {
+                loop(router)
+            } catch (e: Throwable) {
+                slot?.token?.cancel()
+                throw e
+            } finally {
+                if (submitted && !claimed.compareAndSet(false, true)) awaitQuietly(done)
+            }
+        } finally { slot?.close() }
+        helperError?.let { throw it }
+        // le voci lasciate da un aiutante fermato, in ordine d'indice (dopo la loro [after])
+        for (i in order.sorted()) if (out.get(i) == null) { rc.cancel.check(); one(router, i) }
+    }
+
+    private fun awaitQuietly(l: CountDownLatch) {
+        var interrupted = false
+        while (true) { try { l.await(); break } catch (e: InterruptedException) { interrupted = true } }
+        if (interrupted) Thread.currentThread().interrupt()
+    }
+
+    /** I punti agganciati di [request] con [router] (dalla cache dove ci sono), il primo non trovato come errore ORS. */
+    private fun snapAll(request: DirectionsRequest, opts: RouteOptions, router: Router, rc: RequestContext, help: Help?): List<Snap> {
+        val st = rc.stats
+        val tSnap = System.nanoTime()
+        val n = request.coordinates.size
+        val key = if (rc.useCache) graphs.routerKey(opts) else null
+        fun radius(i: Int) = request.radiuses?.get(i)?.takeIf { it > 0 } ?: limits.maximumSnappingRadius
+        fun cacheKey(k: RouteOptions, i: Int) = SnapCacheKey(k, request.coordinates[i].first.toBits(), request.coordinates[i].second.toBits(), radius(i),
+            request.exactPoints?.getOrNull(i) != true, (request.bearings?.getOrNull(i) ?: Double.NaN).toBits())
+        val out = AtomicReferenceArray<Any?>(n)
+        val todo = ArrayList<Int>()
+        for (i in 0 until n) { val s = key?.let { snapCache.peek(cacheKey(it, i)) }; if (s != null) out.set(i, s) else todo += i }
+        inParallel(todo, out, router, help, if (todo.size >= 2) help?.slot() else null, rc) { r, i ->
+            val (lat, lon) = request.coordinates[i]
+            try {
+                val s = r.snap(lat, lon, radius(i), i, checkNetwork = request.exactPoints?.getOrNull(i) != true, heading = request.bearings?.getOrNull(i) ?: Double.NaN)
+                if (key != null) snapCache.get(cacheKey(key, i)) { s } else s
+            } catch (e: PointNotFoundException) {
+                throw ApiException(404, RoutingErrorCodes.POINT_NOT_FOUND, "Could not find routable point within a radius of ${radius(i).toLong()} meters of specified coordinate ${e.pointIndex}: %.7f %.7f.".format(lon, lat))
+            }
+        }
+        st.snapMs += ms(tSnap); st.snapsNew += todo.size; st.snapsCached += n - todo.size
+        return List(n) { i -> when (val v = out.get(i)) { is Failure -> throw v.e; else -> v as Snap } }
+    }
+
+    /**
+     * Un tratto di [legsOf]: il percorso, il verso d'arrivo con cui è stato cercato ([arrival]:
+     * `Router.arrivalKey`, -1 senza vincolo), da dove viene, le sue misure.
+     */
+    private class Leg(val path: RoutePath, val arrival: Int, val stats: LegStats)
+
+    /**
+     * I tratti fra i punti [snaps] (vedi [solve]): prima dalla cache, in ordine; poi i mancanti, in
+     * ordine con un thread solo, dal più lungo con due (un dipendente che la cache conosce dopo il
+     * suo precedente, di nuovo dalla cache se può); infine, in ordine, la verifica dei tratti
+     * dipendenti cercati con un verso d'arrivo diverso da quello del tratto precedente finale (senza,
+     * o da un precedente poi ricalcolato).
+     */
+    private fun legsOf(request: DirectionsRequest, opts: RouteOptions, router: Router, snaps: List<Snap>, rc: RequestContext, help: Help): List<RoutePath> {
+        val st = rc.stats
+        val tSearch = System.nanoTime()
+        val m = snaps.size - 1
+        val key = if (rc.useCache) graphs.routerKey(opts) else null
+        val sk = if (key != null) snaps.map { SnapKey.of(it) } else emptyList()
+        // ORS `bearings`: la direzione di partenza dal punto i e d'arrivo all'ultimo
+        fun fromHeading(i: Int) = request.bearings?.getOrNull(i) ?: Double.NaN
+        fun toHeading(i: Int) = if (i == m - 1) request.bearings?.getOrNull(i + 1) ?: Double.NaN else Double.NaN
+        fun legKey(i: Int, arrival: Int) = LegKey(key!!, sk[i], sk[i + 1], arrival, fromHeading(i).toBits(), toHeading(i).toBits())
+        // continue_straight / pass_through a metà arco percorribile nei due versi: il tratto i prosegue nel verso d'arrivo del tratto i−1
+        val dependent = BooleanArray(m) { i -> i > 0 && request.passThroughAt(i) && !router.directionFree(snaps[i]) }
+        val legs = AtomicReferenceArray<Any?>(m)
+        fun pathAt(i: Int): RoutePath? = (legs.get(i) as? Leg)?.path
+        fun cached(i: Int, arrival: Int, source: LegStats.Source = LegStats.Source.CACHE): Leg? =
+            legCache.get(legKey(i, arrival))?.let { p -> Leg(p, arrival, LegStats(i, source, 0, "cache", "", p.edges.size, p.distance, "")) }
+        /** Il tratto [i] cercato con [r] (col verso d'arrivo [arrival], se c'è), messo in cache. */
+        fun search(r: Router, i: Int, arrival: PathEdge?, source: LegStats.Source): Leg {
+            rc.cancel.check()
+            val t0 = System.nanoTime()
+            val leg = try { r.route(snaps[i], snaps[i + 1], arrival, fromHeading(i), toHeading(i)) } catch (e: RouteNotFoundException) {
+                throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points $i (%.7f %.7f) and ${i + 1} (%.7f %.7f).".format(
+                    request.coordinates[i].second, request.coordinates[i].first, request.coordinates[i + 1].second, request.coordinates[i + 1].first))
+            }
+            // le fasi della ricerca si leggono subito: la prossima le sostituisce
+            val stats = LegStats(i, source, ms(t0), r.lastAlgorithm, r.lastSearch, leg.edges.size, leg.distance, Thread.currentThread().name)
+            // in cache col verso d'arrivo che conta (senza: come un tratto che non dipende dall'arrivo)
+            val bit = r.arrivalKey(snaps[i], arrival)
+            if (key != null) legCache.put(legKey(i, bit), leg)
+            return Leg(leg, bit, stats)
+        }
+        /** L'arco d'arrivo del tratto [i]: l'ultimo del precedente, dove si prosegue nel verso d'arrivo. */
+        fun arrival(i: Int): PathEdge? = if (i > 0 && request.passThroughAt(i)) pathAt(i - 1)?.edges?.lastOrNull() else null
+
+        // 1. dalla cache, in ordine: un tratto che dipende dal precedente quando quello è noto
+        if (key != null) for (i in 0 until m) {
+            val a = if (!dependent[i]) -1 else { val prev = pathAt(i - 1) ?: continue; router.arrivalKey(snaps[i], prev.edges.lastOrNull()) }
+            cached(i, a)?.let { legs.set(i, it) }
+        }
+        // 2. i mancanti. Un tratto dipendente col precedente mancante, se la cache ne ha una versione
+        // (o se aspetta già il suo precedente), si prende dopo, in ordine: col precedente noto è di
+        // solito un colpo in cache (una via aggiunta cambia 2 tratti, non tutti quelli dopo)
+        val missing = (0 until m).filter { legs.get(it) == null }
+        fun inCache(i: Int) = key != null && (-1..1).any { legCache.contains(legKey(i, it)) }
+        val later = BooleanArray(m)
+        for (i in missing) if (dependent[i] && legs.get(i - 1) == null && (later[i - 1] || inCache(i))) later[i] = true
+        /** Il tratto dipendente [i] dalla cache, col verso d'arrivo del precedente già noto. */
+        fun hit(r: Router, i: Int): Leg? = if (key != null && dependent[i] && pathAt(i - 1) != null) cached(i, r.arrivalKey(snaps[i], arrival(i))) else null
+        val now = missing.filter { !later[it] }
+        val slot = if (now.size >= 2) help.slot() else null
+        if (slot == null) {
+            // un thread solo: in ordine, ognuno col verso d'arrivo del precedente (come sempre)
+            for (i in now) legs.set(i, hit(router, i) ?: search(router, i, arrival(i), LegStats.Source.CALC))
+        } else {
+            // due thread: prima i più lunghi, un tratto dipendente mai prima del precedente ancora da prendere;
+            // col precedente in corso sull'altro thread si cerca senza il verso d'arrivo (da verificare)
+            val order = now.sortedByDescending { i -> DistanceCalc.haversine(snaps[i].snappedLat, snaps[i].snappedLon, snaps[i + 1].snappedLat, snaps[i + 1].snappedLon) }
+            inParallel(order, legs, router, help, slot, rc, after = { i -> if (dependent[i]) i - 1 else -1 }) { r, i ->
+                val prev = if (i > 0) pathAt(i - 1) else null
+                hit(r, i) ?: search(r, i, if (dependent[i] && prev == null) null else arrival(i), LegStats.Source.CALC)
+            }
+        }
+        // i rimandati, in ordine (dopo un errore del precedente non servono: il passo 3 si ferma prima)
+        for (i in missing) if (later[i] && legs.get(i - 1) is Leg) { rc.cancel.check(); legs.set(i, hit(router, i) ?: search(router, i, arrival(i), LegStats.Source.CALC)) }
+        // 3. in ordine: l'errore del tratto d'indice minimo; i tratti dipendenti cercati con un altro verso d'arrivo, verificati
+        val out = ArrayList<RoutePath>(m)
+        for (i in 0 until m) {
+            val l = when (val v = legs.get(i)) { is Failure -> throw v.e; else -> v as Leg }
+            val a = if (dependent[i]) arrival(i) else null
+            val bit = if (dependent[i]) router.arrivalKey(snaps[i], a) else -1
+            // cercato senza il verso d'arrivo, o con quello di un precedente poi ricalcolato
+            if (l.arrival != bit) {
+                val first = l.path.edges.firstOrNull()
+                // senza vincolo vale se l'arrivo non lo lega, o se parte già nel verso d'arrivo (il migliore anche col vincolo)
+                val fixed = if (l.arrival == -1 && (first == null || (first.edge == snaps[i].edge && first.reverse == (bit == 1)))) {
+                    if (key != null) legCache.put(legKey(i, bit), l.path)
+                    Leg(l.path, bit, LegStats(i, LegStats.Source.SPEC_OK, l.stats.ms, l.stats.algorithm, l.stats.search, l.stats.edges, l.stats.meters, l.stats.thread))
+                } else (if (key != null) cached(i, bit) else null) ?: search(router, i, a, LegStats.Source.RECALC)
+                legs.set(i, fixed)
+            }
+            out += (legs.get(i) as Leg).path
+        }
+        for (i in 0 until m) st.legs += (legs.get(i) as Leg).stats
+        st.searchWallMs += ms(tSearch)
+        return out
+    }
+
+    /**
+     * La feature GeoJSON di un percorso ([legs] di [request]), come in [handle]; con [variant] anche
+     * `properties.navmaster.variant`. [encoder]: il nome interno del profilo.
+     */
+    internal fun feature(request: DirectionsRequest, legs: List<RoutePath>, encoder: String, variant: Map<String, Any?>?, stats: RequestStats = RequestStats()): Map<String, Any?> {
+        val f = buildRoute(request, legs, encoder, stats).feature
+        if (variant != null) {
+            @Suppress("UNCHECKED_CAST")
+            val props = f["properties"] as MutableMap<String, Any?>
+            @Suppress("UNCHECKED_CAST")
+            val nm = props["navmaster"] as? MutableMap<String, Any?> ?: linkedMapOf<String, Any?>().also { props["navmaster"] = it }
+            nm["variant"] = variant
+        }
+        return f
+    }
+
+    /**
+     * La risposta GeoJSON di `navmaster.alternatives`: le feature del migliore (se non escluso) e
+     * delle varianti tenute ([NavAlternativesEngine]), ognuna con `properties.navmaster.variant` e
+     * un way_point per punto; in `metadata.navmaster.alternatives` quante chieste e trovate, i ms,
+     * la nota e il riepilogo dei candidati. Le feature si costruiscono su due thread se c'è l'aiutante.
+     */
+    private fun variantsResponse(request: DirectionsRequest, opt: NavAlternativesOptions, rc: RequestContext): Map<String, Any?> {
+        val encoder = encoder(request)
+        val res = NavAlternativesEngine(this, rc).run(request, opt)
+        val jobs = ArrayList<Pair<List<RoutePath>, Map<String, Any?>>>()
+        if (!opt.excludeBest) jobs += res.best.legs to res.bestJson()
+        for (a in res.variants) jobs += a.legs to res.json(a)
+        val out = arrayOfNulls<Map<String, Any?>>(jobs.size)
+        fun build(parity: Int, stats: RequestStats) { for (i in jobs.indices) if (i % 2 == parity) out[i] = feature(request, jobs[i].first, encoder, jobs[i].second, stats) }
+        onTwoThreads(rc, rc.cancel, if (jobs.size >= 2) helperSlot(rc, rc.cancel) else null, { build(0, rc.stats) }, if (jobs.size >= 2) { _ -> build(1, RequestStats()) } else null)
+        val features = out.map { it!! }
+        val all = BBox.empty()
+        for (f in features) { val b = f["bbox"] as DoubleArray; all.include(b[1], b[0]); all.include(b[3], b[2]) }
+        val metadata = LinkedHashMap(metadata(request))
+        metadata["navmaster"] = linkedMapOf("alternatives" to linkedMapOf(
+            "asked" to opt.count, "found" to 1 + res.variants.size, "variants" to res.variants.size, "ms" to res.ms, "note" to res.note, "candidates" to res.summary))
+        val bboxArr = if (features.isEmpty()) doubleArrayOf() else doubleArrayOf(r6(all.minLon), r6(all.minLat), r6(all.maxLon), r6(all.maxLat))
+        return linkedMapOf("type" to "FeatureCollection", "bbox" to bboxArr, "features" to features, "metadata" to metadata)
+    }
+
+    private fun ms(t0: Long) = (System.nanoTime() - t0) / 1_000_000
 
     /** Un percorso nelle due forme (oggetto `routes[i]` del JSON, `features[i]` del GeoJSON) e il suo bbox. */
     private class RouteDoc(val json: Map<String, Any?>, val feature: Map<String, Any?>, val bbox: DoubleArray)
 
-    private fun buildRoute(request: DirectionsRequest, legs: List<RoutePath>, encoder: String): RouteDoc {
+    private fun buildRoute(request: DirectionsRequest, legs: List<RoutePath>, encoder: String, stats: RequestStats): RouteDoc {
+        val started = System.nanoTime()
+        var instructionsNanos = 0L
         val pe = graphs.encoding.profile(encoder)
         val instructionsBuilder = InstructionsBuilder(graphs.graph, graphs.encoding, pe)
         val stepBuilder = OrsStepBuilder(StepOptions(request.language, request.units, request.maneuvers, request.htmlFormat))
@@ -423,7 +815,9 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         val segments = ArrayList<Map<String, Any?>>()
         val bbox = BBox.empty()
         var totalDistance = 0.0; var totalDuration = 0.0
+        val tInstructions = System.nanoTime()
         val allInstructions = legs.map { instructionsBuilder.build(it) }
+        instructionsNanos += System.nanoTime() - tInstructions
         for ((li, leg) in legs.withIndex()) {
             val pts = leg.points()
             val startIndex = if (li == 0) 0 else geometry.size - 1
@@ -436,9 +830,11 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
             val seg = LinkedHashMap<String, Any?>()
             seg["distance"] = distance; seg["duration"] = duration
             if (request.instructions) {
+                val tSteps = System.nanoTime()
                 val next = allInstructions.getOrNull(li + 1)?.firstOrNull()?.points
                 val steps = stepBuilder.build(allInstructions[li], startIndex, request.coordinates.last(), next)
                 seg["steps"] = steps.map { stepJson(it, request) }
+                instructionsNanos += System.nanoTime() - tSteps
             }
             if ("detourfactor" in request.attributes) {
                 val bee = DistanceCalc.haversine(pts.lat(0), pts.lon(0), pts.lat(pts.size - 1), pts.lon(pts.size - 1))
@@ -453,8 +849,12 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         val extras = if (request.extraInfo.isNotEmpty()) ExtraInfoBuilder(graphs.graph, graphs.encoding, pe).build(request.extraInfo, legs, request.units.perMeter, request.units.decimals) else null
         val navmaster = if (request.navmasterRoads) {
             val rf = RoadFactsBuilder(graphs.graph, graphs.encoding, pe, graphs.guidance)
+            val tRoads = System.nanoTime()
             val nm = linkedMapOf<String, Any?>("roads" to rf.build(legs))
+            stats.roadsMs += ms(tRoads)
+            val tPoints = System.nanoTime()
             graphs.points?.let { nm["points"] = rf.pointsAlong(legs, it) }
+            stats.pointsMs += ms(tPoints)
             nm
         } else null
 
@@ -479,6 +879,8 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
             "properties" to properties,
             "geometry" to linkedMapOf("coordinates" to coords, "type" to "LineString"),
         )
+        stats.instructionsMs += instructionsNanos / 1_000_000
+        stats.buildMs += ms(started)
         return RouteDoc(route, feature, bboxArr)
     }
 
@@ -545,6 +947,10 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         const val AVOIDED_ROAD_MARGIN = 15.0
         /** Oltre questa distanza in linea d'aria (m) maximum_speed vale sui tempi soltanto. */
         const val FAST_MAXIMUM_SPEED_BEELINE = 60_000.0
+        /** Lo stato di una voce di [inParallel]: fatta (o fuori dalle voci), da prendere, in corso. */
+        private const val ITEM_DONE = 0
+        private const val ITEM_FREE = 1
+        private const val ITEM_RUNNING = 2
         val BUILD_DATE: String = Instant.now().toString()
         fun r6(v: Double) = Math.round(v * 1e6) / 1e6
         fun roundForUnits(v: Double, units: DistanceUnit): Double { val f = Math.pow(10.0, units.decimals.toDouble()); return Math.round(v * f) / f }

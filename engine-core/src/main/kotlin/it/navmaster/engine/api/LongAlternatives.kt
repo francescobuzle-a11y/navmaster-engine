@@ -3,6 +3,7 @@ package it.navmaster.engine.api
 import it.navmaster.engine.RoutingGraph
 import it.navmaster.engine.instructions.InstructionTranslator
 import it.navmaster.engine.profile.RoadClass
+import it.navmaster.engine.routing.CancelToken
 import it.navmaster.engine.storage.BBox
 import it.navmaster.engine.util.DistanceCalc
 import it.navmaster.engine.weighting.EdgeFilter
@@ -32,6 +33,8 @@ class LongAlternatives(
     private val log: ((String) -> Unit)? = null,
     /** Oltre questo tempo (ms) non si comincia un altro candidato. */
     private val budgetMs: Long = 35_000,
+    /** Verificato prima di ogni candidato (le ricerche del candidato lo verificano da sé, con il router della richiesta). */
+    private val cancel: CancelToken = CancelToken.NEVER,
     private val route: (DirectionsRequest, List<String?>) -> Map<String, Any?>,
 ) {
     @Suppress("UNCHECKED_CAST")
@@ -39,7 +42,7 @@ class LongAlternatives(
         val alt = request.alternatives ?: return route(request, pointGraph)
         require(request.coordinates.size == 2) { "alternative solo fra due punti" }
         val started = System.currentTimeMillis()
-        val base = request.withPoints(request.coordinates, request.radiuses, request.exactPoints, request.bearings)
+        val base = request.withPoints(request.coordinates, request.radiuses, request.exactPoints, request.bearings, request.passThrough)
         val first = route(base, pointGraph)
         val f0 = (first["features"] as List<Map<String, Any?>>).first()
         val (sLat, sLon) = request.coordinates[0]; val (eLat, eLon) = request.coordinates[1]
@@ -53,6 +56,7 @@ class LongAlternatives(
         val mid = along(coordinates(f0), 0.5)
         val vias = ArrayList<Pair<Double, Double>>()
         for (fraction in OFFSETS) {
+            cancel.check()
             if (kept.size >= alt.targetCount || System.currentTimeMillis() - started > budgetMs) break
             val target = offset(mid, sLat, sLon, eLat, eLon, fraction * crow)
             // the main road nearest to the target, not too far from it, and not one already tried

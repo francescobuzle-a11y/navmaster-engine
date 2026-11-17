@@ -163,3 +163,74 @@ class AvoidPenaltyWeighting(private val base: Weighting, private val avoid: Edge
     }
     override fun edgeMillis(edge: BaseGraph.EdgeIterator, reverse: Boolean) = base.edgeMillis(edge, reverse)
 }
+
+/**
+ * Estensione NavMaster (varianti, fonte P): i fattori (≥ 1, finiti) per arco di un insieme di
+ * penalità. Non sta in `RouteOptions` (che è chiave delle cache): si passa a parte a
+ * `RoutingGraph.router(options, penalties)`. Va penalizzato solo un arco esposto al core
+ * (`Router.isCoreExposed`): dentro uno shortcut il peso salvato non vedrebbe il fattore.
+ */
+class EdgePenalties(expected: Int = 4096) {
+    private val f = com.carrotsearch.hppc.IntDoubleHashMap(expected)
+    private var fp = 0L
+
+    /** Moltiplica per [factor] il fattore di [edge] (in entrambi i versi). */
+    fun multiply(edge: Int, factor: Double) {
+        require(factor >= 1.0 && factor.isFinite()) { "fattore di penalità non valido: $factor" }
+        if (factor == 1.0) return
+        val old = f.getOrDefault(edge, 1.0)
+        if (old != 1.0) fp = fp xor mix(edge, old)
+        val v = old * factor
+        f.put(edge, v)
+        fp = fp xor mix(edge, v)
+    }
+
+    fun factor(edge: Int): Double = f.getOrDefault(edge, 1.0)
+    operator fun contains(edge: Int): Boolean = f.containsKey(edge)
+
+    /** Vero se ogni arco di [other] è qui con un fattore almeno uguale ([other] ⊆ questo). */
+    fun covers(other: EdgePenalties): Boolean {
+        if (other.size > size) return false
+        for (c in other.f) if (f.getOrDefault(c.key, 1.0) < c.value) return false
+        return true
+    }
+
+    /** Vero se almeno uno di [edges] è penalizzato. */
+    fun touches(edges: IntArray): Boolean { for (e in edges) if (f.containsKey(e)) return true; return false }
+
+    /** L'unione, coi fattori moltiplicati sugli archi comuni. */
+    fun times(other: EdgePenalties): EdgePenalties {
+        val out = EdgePenalties(size + other.size)
+        for (c in f) out.multiply(c.key, c.value)
+        for (c in other.f) out.multiply(c.key, c.value)
+        return out
+    }
+
+    /** Gli archi penalizzati (diagnostica e prove). */
+    fun edges(): IntArray = f.keys().toArray().also { it.sort() }
+
+    val size: Int get() = f.size()
+    /** Impronta indipendente dall'ordine di inserimento (stessi archi e fattori → stessa impronta). */
+    val fingerprint: Long get() = fp
+
+    private fun mix(edge: Int, factor: Double): Long {
+        var h = edge.toLong() * -0x61c8864680b583ebL xor java.lang.Double.doubleToLongBits(factor)
+        h = (h xor (h ushr 33)) * -0xae502812aa7333L
+        return h xor (h ushr 33)
+    }
+}
+
+/**
+ * Il peso di [base] con i fattori di [p] sugli archi penalizzati (varianti a penalità): stesso
+ * nome (la chiave CH/core del router resta quella del peso base), stessi tempi; il peso può solo
+ * crescere, quindi landmark e potature restano ammissibili.
+ */
+class EdgePenaltyWeighting(private val base: Weighting, private val p: EdgePenalties) : Weighting {
+    override val name get() = base.name
+    override fun minWeight(distanceMeters: Double) = base.minWeight(distanceMeters)
+    override fun edgeWeight(edge: BaseGraph.EdgeIterator, reverse: Boolean): Double {
+        val w = base.edgeWeight(edge, reverse)
+        return if (w.isFinite()) w * p.factor(edge.edge) else w
+    }
+    override fun edgeMillis(edge: BaseGraph.EdgeIterator, reverse: Boolean) = base.edgeMillis(edge, reverse)
+}

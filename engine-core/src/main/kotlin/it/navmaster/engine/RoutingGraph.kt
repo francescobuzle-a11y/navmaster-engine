@@ -29,6 +29,8 @@ import it.navmaster.engine.routing.PointNotFoundException
 import it.navmaster.engine.weighting.EdgeFilterFactory
 import it.navmaster.engine.weighting.AvoidFeaturesEdgeFilter
 import it.navmaster.engine.weighting.AvoidPenaltyWeighting
+import it.navmaster.engine.weighting.EdgePenalties
+import it.navmaster.engine.weighting.EdgePenaltyWeighting
 import it.navmaster.engine.weighting.TurnCostProvider
 import it.navmaster.engine.weighting.VehicleParameters
 import it.navmaster.engine.weighting.WeightingFactory
@@ -223,14 +225,33 @@ class RoutingGraph private constructor(
     fun needsFullSearch(options: RouteOptions): Boolean =
         options.avoidPolygons.isNotEmpty() || (!coreWide && (options.avoidFeatures != 0 || (options.maximumSpeed.isFinite() && !options.maximumSpeedTimeOnly)))
 
-    fun router(options: RouteOptions): Router {
+    /**
+     * La chiave delle cache (agganci, tratti) per [o]: opzioni che danno lo stesso [router]. Con i
+     * costi di svolta e il core preparato la CH non si usa mai, quindi `continue_straight` e
+     * `bearings` (che contano solo per la scelta della CH, [RouteOptions.isStatic]) non cambiano il router.
+     */
+    fun routerKey(o: RouteOptions): RouteOptions {
+        if (!o.turnCosts || (!o.continueStraight && !o.hasBearings)) return o
+        val name = encoderName(o.profile)
+        val key = chKey(name, WeightingFactory.create(encoding, encoding.profile(name), o.weighting))
+        return if (chStorages.containsKey("${key}_core")) o.copy(continueStraight = false, hasBearings = false) else o
+    }
+
+    /**
+     * Il router di [options]. [penalties] (varianti a penalità): i fattori per arco sopra il peso
+     * della richiesta ([EdgePenaltyWeighting], stesso nome: stessa chiave CH/core); con le penalità
+     * niente CH (i suoi shortcut non le vedono), e sono esatte solo sugli archi esposti al core
+     * ([Router.isCoreExposed]).
+     */
+    fun router(options: RouteOptions, penalties: EdgePenalties? = null): Router {
         val name = encoderName(options.profile)
         val pe = encoding.profile(name)
         val baseWeighting = WeightingFactory.create(encoding, pe, options.weighting, if (options.maximumSpeedTimeOnly) Double.POSITIVE_INFINITY else options.maximumSpeed)
         // avoid_features as a penalty (NavMaster): the roads to avoid stay in the graph, heavier; not in the filter
         val penalty = options.avoidPenalty > 1.0 && options.avoidFeatures != 0
-        val weighting = if (penalty) AvoidPenaltyWeighting(baseWeighting, AvoidFeaturesEdgeFilter(encoding.shared, options.avoidFeatures, pe.profile.category, name == "heavyvehicle"), options.avoidPenalty)
+        val w0 = if (penalty) AvoidPenaltyWeighting(baseWeighting, AvoidFeaturesEdgeFilter(encoding.shared, options.avoidFeatures, pe.profile.category, name == "heavyvehicle"), options.avoidPenalty)
             else baseWeighting
+        val weighting = penalties?.let { EdgePenaltyWeighting(w0, it) } ?: w0
         // the times with the limited speed, also when the search does not use it (see maximumSpeedTimeOnly); never the penalty
         val timeWeighting = if (options.maximumSpeedTimeOnly) WeightingFactory.create(encoding, pe, options.weighting, options.maximumSpeed) else baseWeighting
         val filter: EdgeFilter = EdgeFilterFactory.create(encoding, name, if (penalty) 0 else options.avoidFeatures, options.vehicleType, options.vehicleParameters, options.avoidPolygons, guidance)
@@ -240,7 +261,7 @@ class RoutingGraph private constructor(
         // La nostra CH è node-based e ignora i divieti di svolta (ORS per i profili con costi di svolta prepara una CH
         // edge-based): con i costi di svolta una richiesta statica usa il core, che li rispetta, quando c'è
         val coreStorage = chStorages["${key}_core"]
-        val ch = if (options.allowCH && options.isStatic && (tcp == null || coreStorage == null)) chStorages[key]?.let { CHGraph(graph, it, weighting) } else null
+        val ch = if (penalties == null && options.allowCH && options.isStatic && (tcp == null || coreStorage == null)) chStorages[key]?.let { CHGraph(graph, it, weighting) } else null
         // le misure dell'auto (camper, furgoni): nel core solo dall'edizione 2 della regola; prima, ricerca piena
         val coreFits = (name == "heavyvehicle" || options.vehicleParameters?.hasDimensions != true || coreVersion >= 2) &&
             // le gallerie ADR e i divieti per le acque: nel core del camion dall'edizione 3, coi valori ADR nel grafo
@@ -253,10 +274,10 @@ class RoutingGraph private constructor(
         // them too when it uses none of the roads to avoid (the filter only takes roads away), else
         // the full search (ORS keeps those roads in its core; our reduced core does not, the wide one does)
         val quick = if (ch == null && core == null && options.avoidFeatures != 0 && options.avoidPolygons.isEmpty() && options.allowCH &&
-            (options.maximumSpeed.isInfinite() || options.maximumSpeedTimeOnly)) router(options.copy(avoidFeatures = 0)) else null
+            (options.maximumSpeed.isInfinite() || options.maximumSpeedTimeOnly)) router(options.copy(avoidFeatures = 0), penalties) else null
         val avoid = if (quick != null) AvoidFeaturesEdgeFilter(encoding.shared, options.avoidFeatures, pe.profile.category, name == "heavyvehicle") else null
         return Router(graph, index, weighting, filter, tcp, ch, core, lm, maxVisitedNodes = options.maxVisitedNodes, timeWeighting = timeWeighting,
-            quick = quick, quickAccepts = avoid)
+            quick = quick, quickAccepts = avoid, penalized = penalties != null)
     }
 
     /**

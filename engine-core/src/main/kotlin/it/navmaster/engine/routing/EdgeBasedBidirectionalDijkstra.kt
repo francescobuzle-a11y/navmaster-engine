@@ -20,6 +20,8 @@ class EdgeBasedBidirectionalDijkstra(
     private val maxVisitedNodes: Int = Int.MAX_VALUE,
     /** > 1: la ricerca continua oltre il percorso migliore fino a questo multiplo del suo peso (percorsi alternativi). */
     private val explorationFactor: Double = 1.0,
+    /** Verificato ogni 256 passi (vedi [CancelToken]). */
+    private val cancel: CancelToken = CancelToken.NEVER,
 ) {
     val fwd = SearchState(1024)   // chiave: edgeKey percorso in avanti; parentNode = chiave precedente (o nodo sorgente se parentEdge < 0)
     val bwd = SearchState(1024)   // chiave: edgeKey nel verso del viaggio; parentNode = chiave successiva (o nodo destinazione se parentEdge < 0)
@@ -58,6 +60,7 @@ class EdgeBasedBidirectionalDijkstra(
     private fun turn(inEdge: Int, node: Int, outEdge: Int): Double = if (inEdge < 0 || outEdge < 0) 0.0 else turnCosts.turnWeight(inEdge, node, outEdge)
 
     fun run(): Boolean {
+        cancel.check()
         // un nodo che è sorgente e destinazione: dal tratto agganciato della partenza a quello dell'arrivo
         for (c in sourceWeights) if (targetWeights.containsKey(c.key)) {
             val t = turn(sourceEdges.getOrDefault(c.key, -1), c.key, targetEdges.getOrDefault(c.key, -1))
@@ -93,9 +96,11 @@ class EdgeBasedBidirectionalDijkstra(
                 if (bwd.relax(key, c.value + w + t, c.key, -1)) checkMeeting(key, bwdIt)
             }
         }
+        var steps = 0
         while (!fwd.heap.isEmpty || !bwd.heap.isEmpty) {
             if (visitedNodes >= maxVisitedNodes) return false
             if (finished()) break
+            if ((++steps and 255) == 0) cancel.check()
             val fk = if (fwd.heap.isEmpty) Double.POSITIVE_INFINITY else fwd.heap.peekKey()
             val bk = if (bwd.heap.isEmpty) Double.POSITIVE_INFINITY else bwd.heap.peekKey()
             if (fk <= bk) settleForward() else settleBackward()

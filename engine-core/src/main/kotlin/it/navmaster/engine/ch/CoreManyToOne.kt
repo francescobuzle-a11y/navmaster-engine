@@ -4,6 +4,7 @@ import com.carrotsearch.hppc.IntDoubleHashMap
 import com.carrotsearch.hppc.IntHashSet
 import com.carrotsearch.hppc.IntIntHashMap
 import com.carrotsearch.hppc.IntObjectHashMap
+import it.navmaster.engine.routing.CancelToken
 import it.navmaster.engine.routing.NodeHeap
 import it.navmaster.engine.weighting.EdgeFilter
 import it.navmaster.engine.weighting.TurnCostProvider
@@ -27,6 +28,8 @@ class CoreManyToOne(
     landmarks: CoreLandmarks?,
     private val rootIsTarget: Boolean,
     val otherCount: Int,
+    /** Verificato ogni 256 nodi in [prepare] e [advance]: [SearchCancelledException][it.navmaster.engine.routing.SearchCancelledException] ferma la ricerca. */
+    private val cancel: CancelToken = CancelToken.NEVER,
 ) {
     private val base = ch.base
     private val storage = ch.storage
@@ -99,6 +102,7 @@ class CoreManyToOne(
     fun prepare() {
         check(!prepared) { "già preparata" }
         prepared = true
+        cancel.check()
         val t0 = System.nanoTime()
         phase1(root1, rootReverse, rootEnds)
         for ((i, s) in others1.withIndex()) phase1(s, otherReverse, otherEnds[i])
@@ -222,8 +226,11 @@ class CoreManyToOne(
     fun advance(stop: () -> Boolean) {
         check(prepared) { "manca prepare()" }
         val t0 = System.nanoTime()
+        cancel.check()
+        var steps = 0
         try {
             while (true) {
+                if ((++steps and 255) == 0) cancel.check()
                 val k = frontier()
                 for (i in 0 until otherCount) if (!final[i] && tentative[i] <= k) final[i] = true
                 if (k.isInfinite()) { exhausted = true; return }
@@ -254,7 +261,9 @@ class CoreManyToOne(
 
     /** Come la fase 1 di [CoreDijkstra]: dal capo di un arco agganciato la prima mossa svolta dal tratto agganciato. */
     private fun phase1(s: State, reverse: Boolean, ends: SnapEnds) {
+        var steps = 0
         while (!s.heap.isEmpty) {
+            if ((++steps and 255) == 0) cancel.check()
             val node = s.heap.pop()
             if (!s.settled.add(node)) continue
             visitedNodes++

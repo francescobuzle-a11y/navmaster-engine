@@ -25,6 +25,9 @@ class TurnCostProvider(
         return if (storage.encoding.isForbidden(storage.flags(inEdge, viaNode, outEdge), profileName)) Double.POSITIVE_INFINITY else 0.0
     }
 
+    /** Vero se nel nodo c'è almeno un divieto di svolta (una lettura): altrove ogni svolta fra archi diversi è libera. */
+    fun restrictedAt(node: Int): Boolean = storage.hasEntries(node)
+
     fun turnMillis(inEdge: Int, viaNode: Int, outEdge: Int): Long {
         val w = turnWeight(inEdge, viaNode, outEdge)
         return if (w.isInfinite()) Long.MAX_VALUE else (w * 1000).toLong()

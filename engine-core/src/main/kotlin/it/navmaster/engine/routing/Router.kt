@@ -62,13 +62,44 @@ class Router(
     /** The quick search to try first (see RoutingGraph.router: avoid_features), and what its path must pass. */
     private val quick: Router? = null,
     private val quickAccepts: EdgeFilter? = null,
+    /** Il peso ha le penalità di una variante (`RoutingGraph.router(options, penalties)`): i suoi tratti non vanno in cache. */
+    val penalized: Boolean = false,
 ) {
     /** Quale algoritmo verrà usato: utile per diagnostica e test. */
     /** The phases of the last core search (diagnostics). */
     var lastStats = ""; private set
 
-    /** The same, of the quick search when there is one. */
-    fun quickStats(): String = quick?.let { "rapida ${it.algorithm}: ${it.lastStats}" } ?: lastStats
+    /**
+     * L'annullamento delle ricerche di questo router (e della sua ricerca rapida): ognuna lancia
+     * [SearchCancelledException] alla prima verifica dopo l'annullamento. Un router serve una richiesta sola.
+     */
+    var cancel: CancelToken = CancelToken.NEVER
+        set(v) { field = v; quick?.cancel = v }
+
+    /**
+     * La ricerca che ha deciso l'ultimo [route] (diagnostica): `rapida <algoritmo>` quando il percorso
+     * della ricerca rapida è stato preso, altrimenti [algorithm]. [lastSearch]: le sue fasi, con quelle
+     * della rapida scartata (il suo percorso usava una strada da evitare) quando c'è stata.
+     */
+    var lastAlgorithm = ""; private set
+    var lastSearch = ""; private set
+
+    /** Vero se il router prova prima una ricerca rapida senza `avoid_features` (core ridotto). */
+    val hasQuick: Boolean get() = quick != null && quickAccepts != null
+
+    /**
+     * Vero se il peso di [edge] entra nelle ricerche di questo router così com'è al momento della
+     * richiesta, quindi una penalità su di esso è esatta: con la ricerca piena sempre; col core solo
+     * gli archi con entrambi i nodi nel core (mai dentro uno shortcut); con la CH mai. Con la
+     * ricerca rapida vale la sua regola (la piena è esatta ovunque). Due letture di livello per arco.
+     */
+    fun isCoreExposed(edge: Int): Boolean {
+        if (quick != null && quickAccepts != null) return quick.isCoreExposed(edge)
+        if (ch != null) return false
+        val c = core ?: return true
+        val n = graph.nodeCount
+        return c.storage.level(graph.nodeA(edge)) >= n && c.storage.level(graph.nodeB(edge)) >= n
+    }
 
     val algorithm: String get() = when {
         ch != null -> "ch"
@@ -181,6 +212,8 @@ class Router(
     }
 
     companion object {
+        /** La geometria (vuota, condivisa: nessuno la modifica) degli archi interni di un percorso leggero. */
+        private val NO_GEOMETRY = PointList(0)
         /** ORS `min_network_size`. */
         const val MIN_NETWORK_SIZE = 200
         /** GraphHopper `heading_penalty` (ORS `DEFAULT_HEADING_PENALTY`): 300 s. */
@@ -202,14 +235,21 @@ class Router(
      * [maxWeight]: only a path lighter than this (none found otherwise): a search that cannot beat
      * a known path stops there instead of exploring all it can reach. [exact] false: the quick
      * search's path is taken even when it uses a road to avoid (an estimate, for choosing).
+     * [light]: gli archi interni senza geometria né nome (un candidato da valutare; [materialize]
+     * li completa). [relaxRetry] false: con `continue_straight` senza percorso nel verso d'arrivo
+     * nessun secondo tentativo col verso opposto penalizzato (i candidati delle varianti).
      */
     fun route(from: Snap, to: Snap, arrival: PathEdge? = null, fromHeading: Double = Double.NaN, toHeading: Double = Double.NaN,
-              maxWeight: Double = Double.POSITIVE_INFINITY, exact: Boolean = true, relaxDirection: Boolean = false): RoutePath {
+              maxWeight: Double = Double.POSITIVE_INFINITY, exact: Boolean = true, relaxDirection: Boolean = false,
+              light: Boolean = false, relaxRetry: Boolean = true): RoutePath {
+        var discarded: String? = null
         if (quick != null && quickAccepts != null) {
-            val p = try { quick.route(from, to, arrival, fromHeading, toHeading, maxWeight, relaxDirection = relaxDirection) } catch (e: RouteNotFoundException) { null }
+            val p = try { quick.route(from, to, arrival, fromHeading, toHeading, maxWeight, relaxDirection = relaxDirection, light = light, relaxRetry = relaxRetry) } catch (e: RouteNotFoundException) { null }
+            lastAlgorithm = "rapida ${quick.algorithm}"; lastSearch = quick.lastSearch
             if (p != null && (!exact || p.edges.all { e -> it.setEdge(e.edge, e.baseNode); quickAccepts.accept(it) })) return p
             // no path even without the filter (or none under the limit): none with it either
             if (p == null) throw RouteNotFoundException("Nessun percorso trovato fra i punti richiesti")
+            discarded = "rapida ${quick.algorithm} scartata: ${quick.lastSearch}"
         }
         var fromParts = splitEdge(from, asTarget = false).map { penalised(it, from, fromHeading, asTarget = false) }
         val toParts = splitEdge(to, asTarget = true).map { penalised(it, to, toHeading, asTarget = true) }
@@ -240,13 +280,14 @@ class Router(
         }
 
         val sp = search(fromParts, toParts, maxWeight)
+        lastAlgorithm = algorithm; lastSearch = if (discarded != null) "$lastStats; $discarded" else lastStats
         if (sp != null) {
             val startPart = fromParts.first { it.node == sp.startNode }
             val endPart = toParts.first { it.node == sp.endNode }
-            val candidate = assemble(sp, startPart, endPart)
+            val candidate = assemble(sp, startPart, endPart, light)
             if (best == null || candidate.weight < best.weight) best = candidate
         }
-        if (best == null && keepDirection && !relaxDirection) return route(from, to, arrival, fromHeading, toHeading, maxWeight, exact, relaxDirection = true)
+        if (best == null && keepDirection && !relaxDirection && relaxRetry) return route(from, to, arrival, fromHeading, toHeading, maxWeight, exact, relaxDirection = true, light = light)
         return best ?: throw RouteNotFoundException("Nessun percorso trovato fra i punti richiesti")
     }
 
@@ -271,7 +312,7 @@ class Router(
     fun manyToOne(roots: List<Pair<Snap, Double>>, others: List<Snap>, rootIsTarget: Boolean): CoreManyToOne? {
         if (quick != null && quickAccepts != null) return quick.manyToOne(roots, others, rootIsTarget)
         val c = core ?: return null
-        val m = CoreManyToOne(c, weighting, filter, turnCosts, landmarks, rootIsTarget, others.size)
+        val m = CoreManyToOne(c, weighting, filter, turnCosts, landmarks, rootIsTarget, others.size, cancel)
         val live = roots.filter { it.second.isFinite() }
         for ((root, offset) in live) for (p in splitEdge(root, asTarget = rootIsTarget)) m.addRoot(p.node, p.weight + offset, p.snapEdge)
         for ((i, s) in others.withIndex()) {
@@ -292,13 +333,15 @@ class Router(
      * inversioni, come il tratto virtuale di GraphHopper (`QueryGraphWeighting.calcTurnWeight`).
      */
     private fun search(sources: List<EdgePart>, targets: List<EdgePart>, maxWeight: Double): SearchPath? = if (ch != null) {
-        val algo = DijkstraBidirectionCH(ch, weighting)
+        val algo = DijkstraBidirectionCH(ch, weighting, cancel = cancel)
         if (maxWeight.isFinite()) algo.bestWeight = maxWeight
         for (p in sources) algo.addSource(p.node, p.weight)
         for (p in targets) algo.addTarget(p.node, p.weight)
-        if (algo.run()) algo.extractPath() else null
+        val found = algo.run()
+        lastStats = "${algo.visitedNodes} nodi"
+        if (found) algo.extractPath() else null
     } else if (core != null) {
-        val algo = CoreDijkstra(core, weighting, filter, turnCosts, landmarks)
+        val algo = CoreDijkstra(core, weighting, filter, turnCosts, landmarks, cancel)
         if (maxWeight.isFinite()) algo.bestWeight = maxWeight
         for (p in sources) algo.addSource(p.node, p.weight, p.snapEdge)
         for (p in targets) algo.addTarget(p.node, p.weight, p.snapEdge)
@@ -306,17 +349,21 @@ class Router(
         lastStats = algo.stats
         if (found) algo.extractPath() else null
     } else if (turnCosts != null) {
-        val algo = EdgeBasedBidirectionalDijkstra(graph, weighting, turnCosts, filter, maxVisitedNodes)
+        val algo = EdgeBasedBidirectionalDijkstra(graph, weighting, turnCosts, filter, maxVisitedNodes, cancel = cancel)
         if (maxWeight.isFinite()) algo.bestWeight = maxWeight
         for (p in sources) algo.addSource(p.node, p.weight, p.snapEdge)
         for (p in targets) algo.addTarget(p.node, p.weight, p.snapEdge)
-        if (algo.run()) algo.extractPath() else null
+        val found = algo.run()
+        lastStats = "${algo.visitedNodes} nodi"
+        if (found) algo.extractPath() else null
     } else {
-        val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes)
+        val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes, cancel = cancel)
         if (maxWeight.isFinite()) algo.bestWeight = maxWeight
         for (p in sources) algo.addSource(p.node, p.weight)
         for (p in targets) algo.addTarget(p.node, p.weight)
-        if (algo.run()) algo.extractPath() else null
+        val found = algo.run()
+        lastStats = "${algo.visitedNodes} nodi"
+        if (found) algo.extractPath() else null
     }
 
     /**
@@ -334,12 +381,12 @@ class Router(
         // le alternative dalla ricerca piena (edge-based con i divieti di svolta, altrimenti node-based):
         // valgono solo se non ricalcano il percorso migliore
         val candidates = if (turnCosts != null) {
-            val algo = EdgeBasedBidirectionalDijkstra(graph, weighting, turnCosts, filter, maxVisitedNodes, explorationFactor = weightFactor)
+            val algo = EdgeBasedBidirectionalDijkstra(graph, weighting, turnCosts, filter, maxVisitedNodes, explorationFactor = weightFactor, cancel = cancel)
             for (p in fromParts) algo.addSource(p.node, p.weight, p.snapEdge)
             for (p in toParts) algo.addTarget(p.node, p.weight, p.snapEdge)
             EdgeBasedAlternatives(algo, targetCount + 2, weightFactor, shareFactor).run()
         } else {
-            val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes, explorationFactor = weightFactor)
+            val algo = BidirectionalDijkstra(graph, weighting, filter, maxVisitedNodes, explorationFactor = weightFactor, cancel = cancel)
             for (p in fromParts) algo.addSource(p.node, p.weight)
             for (p in toParts) algo.addTarget(p.node, p.weight)
             AlternativeRoutes(algo, targetCount + 2, weightFactor, shareFactor).run()
@@ -407,6 +454,26 @@ class Router(
      * la svolta col primo o l'ultimo arco del percorso; -1 per un aggancio esatto su una torre.
      */
     private class EdgePart(val node: Int, val weight: Double, val distance: Double, val millis: Long, val geometry: PointList, val edge: Int, val reverse: Boolean, val snapEdge: Int)
+
+    /**
+     * Vero se da [s] si riparte in un verso solo, qualunque sia l'arrivo: [s] è una torre, oppure
+     * l'arco agganciato si percorre in un verso soltanto. Allora `continue_straight` (o
+     * `pass_through`) in [s] non lega il tratto che parte da lì a quello che ci arriva.
+     */
+    fun directionFree(s: Snap): Boolean {
+        if (s.position == SnapPosition.TOWER) return true
+        it.setEdge(s.edge, graph.nodeA(s.edge))
+        return weighting.edgeWeight(it, false).isFinite() != weighting.edgeWeight(it, true).isFinite()
+    }
+
+    /**
+     * Quanto di [arrival] (l'ultimo arco del tratto che arriva in [from]) conta per [route] da
+     * [from]: -1 se nulla (nessun arrivo, una torre, un altro arco, un verso solo: [directionFree]),
+     * altrimenti il verso d'arrivo (1 = B→A). Il tratto da [from] dipende dall'arrivo solo per questo valore.
+     */
+    fun arrivalKey(from: Snap, arrival: PathEdge?): Int =
+        if (arrival == null || from.position == SnapPosition.TOWER || arrival.edge != from.edge || directionFree(from)) -1
+        else if (arrival.reverse) 1 else 0
 
     /**
      * Le due estremità raggiungibili da un punto agganciato. Per uno snap su torre c'è un solo
@@ -487,7 +554,63 @@ class Router(
         return i + if (segLen > 0) (part / segLen).coerceIn(0.0, 1.0) else 0.0
     }
 
-    private fun assemble(sp: SearchPath, start: EdgePart, end: EdgePart): RoutePath {
+    /**
+     * Il percorso [p] con la geometria e il nome degli archi interni che un percorso leggero
+     * (`route(light = true)`) non ha letto; pesi, tempi e distanze restano quelli. Lo stesso
+     * oggetto se non manca nulla.
+     */
+    fun materialize(p: RoutePath): RoutePath {
+        if (p.edges.none { it.geometry.size == 0 }) return p
+        val edges = ArrayList<PathEdge>(p.edges.size)
+        for (e in p.edges) edges += if (e.geometry.size != 0) e else {
+            it.setEdge(e.edge, e.baseNode)
+            PathEdge(e.edge, e.reverse, e.baseNode, e.adjNode, it.fetchWayGeometry(FetchMode.ALL), e.distance, e.millis, e.weight, it.name)
+        }
+        return RoutePath(edges, p.distance, p.millis, p.weight)
+    }
+
+    /**
+     * Quello che la rete autostradale delle varianti ([MotorwayNet.build]) legge con le regole di
+     * questo router: grafo, peso, tempi, filtro, svolte; [shared] per la classe degli archi.
+     */
+    internal fun access(shared: it.navmaster.engine.storage.SharedEncoding): DetourAccess = DetourAccess(graph, weighting, timeWeighting, filter, turnCosts, shared)
+
+    /**
+     * Un pezzo di tratto sostituito: gli archi dopo la posizione [fromPos] fino a [toPos] compresa
+     * (posizioni come in [BestTrace]: il nodo `edges[p].adjNode`) lasciano il posto agli archi
+     * [edges], ognuno percorso dal suo nodo [baseNodes].
+     */
+    class Cut(val fromPos: Int, val toPos: Int, val edges: IntArray, val baseNodes: IntArray)
+
+    /**
+     * [leg] con i pezzi [cuts] (disgiunti) cuciti al posto dei suoi: `edges[0..fromPos]` + gli archi
+     * della deviazione (peso, tempi e, se non [light], geometria e nome letti qui) + `edges[toPos+1..]`;
+     * somme ricalcolate. Nessuna ricerca: le svolte di raccordo le ha già controllate chi ha trovato la deviazione.
+     */
+    fun splice(leg: RoutePath, cuts: List<Cut>, light: Boolean = false): RoutePath {
+        if (cuts.isEmpty()) return leg
+        val sorted = cuts.sortedBy { it.fromPos }
+        val edges = ArrayList<PathEdge>(leg.edges.size + sorted.sumOf { it.edges.size })
+        var next = 0
+        for (c in sorted) {
+            require(c.fromPos >= next && c.toPos > c.fromPos && c.toPos <= leg.edges.size - 2) { "pezzo fuori dal tratto o sovrapposto: ${c.fromPos}..${c.toPos}" }
+            for (i in next..c.fromPos) edges += leg.edges[i]
+            for (k in c.edges.indices) {
+                it.setEdge(c.edges[k], c.baseNodes[k])
+                val w = weighting.edgeWeight(it, false); val ms = timeWeighting.edgeMillis(it, false)
+                edges += if (light) PathEdge(it.edge, it.reverse, it.baseNode, it.adjNode, NO_GEOMETRY, it.distance, ms, w, "")
+                    else PathEdge(it.edge, it.reverse, it.baseNode, it.adjNode, it.fetchWayGeometry(FetchMode.ALL), it.distance, ms, w, it.name)
+            }
+            next = c.toPos + 1
+        }
+        for (i in next until leg.edges.size) edges += leg.edges[i]
+        var distance = 0.0; var millis = 0L; var weight = 0.0
+        for (e in edges) { distance += e.distance; millis += e.millis; weight += e.weight }
+        return RoutePath(edges, distance, millis, weight)
+    }
+
+    /** [light]: gli archi interni senza geometria (PointList vuota) né nome (vedi [materialize]). */
+    private fun assemble(sp: SearchPath, start: EdgePart, end: EdgePart, light: Boolean = false): RoutePath {
         val edges = ArrayList<PathEdge>(sp.edges.size + 2)
         var distance = 0.0; var millis = 0L; var weight = 0.0
         if (start.geometry.size > 1) {
@@ -499,7 +622,8 @@ class Router(
             val e = sp.edges[i]; val base = sp.nodes[i]
             it.setEdge(e, base)
             val w = weighting.edgeWeight(it, false); val ms = timeWeighting.edgeMillis(it, false)
-            edges += PathEdge(e, it.reverse, base, it.adjNode, it.fetchWayGeometry(FetchMode.ALL), it.distance, ms, w, it.name)
+            edges += if (light) PathEdge(e, it.reverse, base, it.adjNode, NO_GEOMETRY, it.distance, ms, w, "")
+                else PathEdge(e, it.reverse, base, it.adjNode, it.fetchWayGeometry(FetchMode.ALL), it.distance, ms, w, it.name)
             distance += it.distance; millis += ms; weight += w
         }
         if (end.geometry.size > 1) {

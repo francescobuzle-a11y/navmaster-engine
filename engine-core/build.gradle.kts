@@ -38,3 +38,13 @@ tasks.register<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("andr
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "META-INF/versions/**", "module-info.class",
         "META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/DEPENDENCIES", "META-INF/maven/**", "META-INF/proguard/**", "META-INF/*.kotlin_module", "**/*.proto")
 }
+
+// I grafi costruiti dalle prove (Heidelberg, una sessantina di copie per giro, ~0,6 GB) in
+// build/tmp/test-graphs, svuotata prima e dopo ogni giro: deleteOnExit non cancella le cartelle
+// piene, e nella cartella temporanea di sistema si accumulavano (11 GB trovati sul Mac).
+tasks.test {
+    val graphs = layout.buildDirectory.dir("tmp/test-graphs").get().asFile
+    systemProperty("java.io.tmpdir", graphs.absolutePath)
+    doFirst { graphs.deleteRecursively(); graphs.mkdirs() }
+    doLast { graphs.deleteRecursively() }
+}

@@ -6,6 +6,7 @@ import com.carrotsearch.hppc.IntIntHashMap
 import it.navmaster.engine.profile.HeavyVehicleAttributes
 import it.navmaster.engine.profile.Toll
 import it.navmaster.engine.profile.WayType
+import it.navmaster.engine.routing.CancelToken
 import it.navmaster.engine.routing.NodeHeap
 import it.navmaster.engine.routing.SearchPath
 import it.navmaster.engine.storage.BaseGraph
@@ -132,6 +133,8 @@ class CoreDijkstra(
     private val turnCosts: TurnCostProvider?,
     /** Se presenti, la fase 2 è un A* bidirezionale con potenziali ALT ("core-ALT"). */
     landmarks: CoreLandmarks? = null,
+    /** Verificato ogni 256 nodi: [SearchCancelledException][it.navmaster.engine.routing.SearchCancelledException] ferma la ricerca. */
+    private val cancel: CancelToken = CancelToken.NEVER,
 ) {
     private val base = ch.base
     private val storage = ch.storage
@@ -190,8 +193,11 @@ class CoreDijkstra(
 
     fun run(): Boolean {
         val t0 = System.nanoTime()
+        cancel.check()
+        var steps = 0
         // fase 1: entrambe le direzioni fino a esaurimento (le ricerche CH verso l'alto sono piccole)
         while (!fwd.heap.isEmpty || !bwd.heap.isEmpty) {
+            if ((++steps and 255) == 0) cancel.check()
             if (!fwd.heap.isEmpty) settlePhase1(fwd, fwdIt, false, fwdEnds)
             if (!bwd.heap.isEmpty) settlePhase1(bwd, bwdIt, true, bwdEnds)
         }
@@ -209,6 +215,7 @@ class CoreDijkstra(
             val bk = if (cBwd.heap.isEmpty) Double.POSITIVE_INFINITY else cBwd.heap.peekKey()
             // con p_b = −p_f le chiavi di un incontro sommano al peso reale: la condizione resta esatta
             if (fk + bk >= bestWeight) break
+            if ((++steps and 255) == 0) cancel.check()
             if (fk <= bk) settleCore(cFwd, false) else settleCore(cBwd, true)
         }
         stats = "fase1 $v1 nodi ${(t1 - t0) / 1_000_000} ms, core ${visitedNodes - v1} nodi ${(System.nanoTime() - t1) / 1_000_000} ms" + (if (potentials != null) " ALT" + (if (landmarkSet != "allow_all") " $landmarkSet" else "") else "")

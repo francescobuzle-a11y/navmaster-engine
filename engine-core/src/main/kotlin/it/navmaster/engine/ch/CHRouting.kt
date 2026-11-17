@@ -3,6 +3,7 @@ package it.navmaster.engine.ch
 import com.carrotsearch.hppc.IntDoubleHashMap
 import com.carrotsearch.hppc.IntHashSet
 import com.carrotsearch.hppc.IntIntHashMap
+import it.navmaster.engine.routing.CancelToken
 import it.navmaster.engine.routing.NodeHeap
 import it.navmaster.engine.routing.SearchPath
 import it.navmaster.engine.storage.BaseGraph
@@ -102,7 +103,9 @@ class CHGraph(val base: BaseGraph, val storage: CHStorage, internal val weightin
  * Dijkstra bidirezionale su CH con stall-on-demand (GraphHopper `DijkstraBidirectionCH`).
  * Entrambe le ricerche salgono di livello; la condizione di arresto è `minF + minB ≥ best`.
  */
-class DijkstraBidirectionCH(private val ch: CHGraph, private val weighting: Weighting, private val stallOnDemand: Boolean = true) {
+class DijkstraBidirectionCH(private val ch: CHGraph, private val weighting: Weighting, private val stallOnDemand: Boolean = true,
+                            /** Verificato ogni 256 nodi (vedi [CancelToken]). */
+                            private val cancel: CancelToken = CancelToken.NEVER) {
     private class State {
         val weight = IntDoubleHashMap(1024)
         val parentNode = IntIntHashMap(1024)
@@ -127,10 +130,13 @@ class DijkstraBidirectionCH(private val ch: CHGraph, private val weighting: Weig
     fun addTarget(node: Int, w: Double) { if (bwd.relax(node, w, -1, -1)) checkMeeting(node) }
 
     fun run(): Boolean {
+        cancel.check()
+        var steps = 0
         while (!fwd.heap.isEmpty || !bwd.heap.isEmpty) {
             val fk = if (fwd.heap.isEmpty) Double.POSITIVE_INFINITY else fwd.heap.peekKey()
             val bk = if (bwd.heap.isEmpty) Double.POSITIVE_INFINITY else bwd.heap.peekKey()
             if (fk >= bestWeight && bk >= bestWeight) break
+            if ((++steps and 255) == 0) cancel.check()
             if (fk <= bk) settle(fwd, fwdIt, false) else settle(bwd, bwdIt, true)
         }
         return meetingNode >= 0

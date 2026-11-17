@@ -78,6 +78,8 @@ class BidirectionalDijkstra(
     private val maxVisitedNodes: Int = Int.MAX_VALUE,
     /** > 1: la ricerca continua oltre il percorso migliore fino a questo multiplo del suo peso (percorsi alternativi). */
     private val explorationFactor: Double = 1.0,
+    /** Verificato ogni 256 passi (vedi [CancelToken]). */
+    private val cancel: CancelToken = CancelToken.NEVER,
 ) {
     val fwd = SearchState(1024)
     val bwd = SearchState(1024)
@@ -94,10 +96,13 @@ class BidirectionalDijkstra(
     /** Esegue la ricerca; true se è stato trovato un percorso. */
     fun run(): Boolean {
         // un nodo che è insieme sorgente e destinazione (o già raggiunto da entrambi) conta subito
+        cancel.check()
         for (c in fwd.weight) checkMeeting(c.key)
+        var steps = 0
         while (!fwd.heap.isEmpty || !bwd.heap.isEmpty) {
             if (visitedNodes >= maxVisitedNodes) return false
             if (finished()) break
+            if ((++steps and 255) == 0) cancel.check()
             // espandi la direzione con il minimo più piccolo
             val fwdKey = if (fwd.heap.isEmpty) Double.POSITIVE_INFINITY else fwd.heap.peekKey()
             val bwdKey = if (bwd.heap.isEmpty) Double.POSITIVE_INFINITY else bwd.heap.peekKey()

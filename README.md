@@ -39,6 +39,8 @@ Chiavi in più rispetto a openrouteservice (un server ORS o un motore più vecch
 | `options.profile_params.restrictions.hazmat_water` | merci inquinanti per le acque: vietate le strade con `hazmat:water=no` |
 | `navmaster.avoid_penalty` | `avoid_features` come penalità (peso ×30) invece che come divieto: la strada da evitare si usa solo se non c'è altro modo |
 | `navmaster.roads` | i fatti sulle strade del percorso (limiti, corsie, cartelli, pedaggi) |
+| `navmaster.pass_through` | per punto, `true` dove si passa senza fermarsi (un «passa per di qui»): lì si prosegue nel verso d'arrivo come con `continue_straight`, alle soste (`false`) si può invertire; lunghezza = numero di punti (altrimenti 2003) |
+| `navmaster.alternatives` | varianti del migliore con qualunque numero di punti e tra Paesi (non insieme ad `alternative_routes`: 2011): `{"count": 2..6, "tier1_factor", "max_factor", "tier1_km_factor", "max_km_factor", "allow_fewer_km", "budget_ms", "exclude_best"}`. Fonti: deviazioni autostradali cucite nel migliore, penalità esatte sul core, altri valichi; ogni feature ha `properties.navmaster.variant` (rank, livello, fonte, etichetta «via A21», firma, differenze), in `metadata.navmaster.alternatives` quante trovate e la nota |
 | `alternative_routes` oltre `maximum_distance_alternative_routes` e tra Paesi | alternative coi punti di passaggio a lato del viaggio (`LongAlternatives`), invece dell'errore 2004 |
 
 ## Avviare il server
