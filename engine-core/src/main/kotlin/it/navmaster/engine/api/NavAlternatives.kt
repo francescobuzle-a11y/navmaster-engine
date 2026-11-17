@@ -10,6 +10,7 @@ import it.navmaster.engine.routing.CancelToken
 import it.navmaster.engine.routing.CorridorAnalyzer
 import it.navmaster.engine.routing.Detour
 import it.navmaster.engine.routing.DetourSearch
+import it.navmaster.engine.routing.DetourTrace
 import it.navmaster.engine.routing.Ellipse
 import it.navmaster.engine.routing.MotorwayNet
 import it.navmaster.engine.routing.Region
@@ -49,6 +50,14 @@ class NavAlternativesOptions(
     /** Le soglie di distanza delle regole moltiplicate per questo (solo le prove su Heidelberg, dove tutto è corto). */
     internal val minDetourScale: Double = 1.0,
 ) {
+    /** La traccia delle varianti (solo le prove diagnostiche, [withTrace]; null: spenta, nessun conto in più). */
+    internal var trace: VariantTrace? = null
+        private set
+
+    /** Le stesse opzioni con la traccia [t]. */
+    internal fun withTrace(t: VariantTrace?): NavAlternativesOptions =
+        NavAlternativesOptions(count, tier1Factor, maxFactor, budgetMs, excludeBest, tier1KmFactor, maxKmFactor, allowFewerKm, fill, sources, minDetourScale).also { it.trace = t }
+
     companion object {
         /** Da `navmaster.alternatives` del corpo; errori ORS 2003. */
         fun fromJson(v: Any?): NavAlternativesOptions {
@@ -74,6 +83,20 @@ class NavAlternativesOptions(
         private val KNOWN = setOf("count", "tier1_factor", "max_factor", "tier1_km_factor", "max_km_factor", "allow_fewer_km", "fill", "budget_ms", "exclude_best")
         private fun bad(msg: String) = ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, msg)
     }
+}
+
+/**
+ * La traccia delle varianti (solo le prove diagnostiche, mai dal JSON): righe `varianti: traccia …`
+ * in più nel registro, sulle stesse scelte (la risposta non cambia). Con la traccia: la rete M
+ * (semi, parte del migliore coperta, versi lasciati fuori), per tratto i conti della ricerca delle
+ * deviazioni e le deviazioni anche oltre `perLeg` (al più [maxDetoursPerLeg], giudicate ma non
+ * offerte), il giudizio di ogni candidato coi valori delle regole, la fonte P provata «in ombra»
+ * ([shadowPenalty]: senza offerte) se il pool era già pieno, e le sonde [probes] (percorsi forzati
+ * della prova) giudicate e sorvegliate nella ricerca M.
+ */
+internal class VariantTrace(val probes: List<Probe> = emptyList(), val maxDetoursPerLeg: Int = 40, val shadowPenalty: Boolean = true) {
+    /** Un percorso forzato della prova (per esempio per un punto della A21), coi tratti del router. */
+    class Probe(val name: String, val legs: List<RoutePath>)
 }
 
 /**
@@ -362,6 +385,60 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
         return Verdict(0, reason, dMax, newRefs, "", score)
     }
 
+    /**
+     * Il perché del verdetto di [v] rispetto a [kept] ([names]: i loro nomi nel registro) coi valori
+     * di ogni condizione di [evaluate]: solo la traccia delle varianti.
+     */
+    fun explain(v: Draft, kept: List<Draft>, names: List<String>): String {
+        if (best.millis <= 0 || best.meters <= 0) return "migliore vuoto"
+        val r = (v.millis + trip.extraMillis).toDouble() / tripMillis
+        val rk = (v.meters + trip.extraMeters) / tripMeters
+        val f = facts(v)
+        val d1 = VariantRules.dMin1(tripMeters) * scale
+        val runsB = runsFromBest(v)
+        val sb = StringBuilder("r %.3f rk %.3f, d1 %.1f km".format(r, rk, d1 / 1000))
+        if (runsB.isEmpty()) return sb.append(", nessun tratto fuori dal migliore").toString()
+        val majorB = runsB.maxByOrNull { it.meters }!!
+        val (ka, kb) = bestKmAt(majorB)
+        sb.append("; dal migliore ${runsB.size} tratti, il maggiore %.1f km %.1f min (migliore %.1f min) fra i km %.1f e %.1f del migliore, ".format(
+            majorB.meters / 1000, majorB.ms / 60000.0, bestMsBetween(majorB) / 60000.0, ka, kb)).append(refsIn(v, majorB).joinToString(" ").ifEmpty { "senza ref" })
+        var dMax = Double.POSITIVE_INFINITY; var majorMs = Long.MAX_VALUE; var dMaxOf = ""
+        var sameSignature = false
+        val per = ArrayList<String>()
+        for ((i, k) in kept.withIndex()) {
+            val runs = VariantRules.runsOff(v, facts(k).edgeSet)
+            val major = runs.maxByOrNull { it.meters }
+            val mm = major?.meters ?: 0.0
+            if (mm < dMax) { dMax = mm; dMaxOf = names.getOrElse(i) { "#$i" } }
+            majorMs = minOf(majorMs, major?.ms ?: 0L)
+            val same = facts(k).signature.map { it.first } == f.signature.map { it.first }
+            if (same) sameSignature = true
+            val common = 1.0 - runs.sumOf { it.meters } / maxOf(1.0, v.meters)
+            per += names.getOrElse(i) { "#$i" } + ": dev. max %.1f km %.1f min, in comune %.0f %%".format(mm / 1000, (major?.ms ?: 0L) / 60000.0, common * 100) + (if (same) ", stessa firma" else "")
+        }
+        sb.append("; contro i tenuti [").append(per.joinToString("; ")).append("]; dMax %.1f km (da ".format(dMax / 1000)).append(dMaxOf).append("), corsa min %.1f min".format(majorMs / 60000.0))
+        fun worst(a: Double, bMs: Long): String {
+            val w = runsB.maxByOrNull { it.ms - (a * bestMsBetween(it) + bMs * scale) }!!
+            val lim = a * bestMsBetween(w) + bMs * scale
+            val (wa, wb) = bestKmAt(w)
+            return (if (w.ms <= lim) "sì" else "no") + " (peggiore %.1f km %.0f s contro %.0f s, km %.1f–%.1f)".format(w.meters / 1000, w.ms / 1000.0, lim / 1000, wa, wb)
+        }
+        val tier1Time = (r <= opt.tier1Factor && rk <= opt.tier1KmFactor) || (opt.allowFewerKm && rk < 1.0 && r <= opt.maxFactor)
+        fun yn(b: Boolean) = if (b) "sì" else "no"
+        sb.append("; L1: tempo/km ${yn(tier1Time)} (≤ %.2f/%.2f)".format(opt.tier1Factor, opt.tier1KmFactor)).append(", dMax ≥ d1 ${yn(dMax >= d1)}, corsa ≥ 300 s ${yn(majorMs >= VariantRules.T1_RUN_MS * scale)}, sana 1,6·+600 s ")
+            .append(worst(VariantRules.T1_A, VariantRules.T1_B_MS))
+        val mwOk = bestMwShare < VariantRules.MW_BEST_SHARE || majorB.mwShare >= VariantRules.MW_RUN_SHARE || !sameSignature
+        sb.append("; autostrade ${yn(mwOk)} (migliore %.0f %% MW, tratto maggiore %.0f %% MW, stessa firma ${yn(sameSignature)})".format(bestMwShare * 100, majorB.mwShare * 100))
+        val withinMax = r <= opt.maxFactor && (rk <= opt.maxKmFactor || (opt.allowFewerKm && rk < 1.0))
+        sb.append("; L2: entro ${yn(withinMax)} (≤ %.2f/%.2f)".format(opt.maxFactor, opt.maxKmFactor)).append(", dMax ≥ 0,6·d1 ${yn(dMax >= VariantRules.T2_D * d1)}, corsa ≥ 180 s ${yn(majorMs >= VariantRules.T2_RUN_MS * scale)}, sana 1,8·+900 s ")
+            .append(worst(VariantRules.T2_A, VariantRules.T2_B_MS))
+        val nr = newRefs(v, kept)
+        val score = 0.6 * r + 0.4 * rk - 0.04 * minOf(2, nr.size) - (if (v.parts >= 2) 0.02 else 0.0)
+        sb.append("; strade nuove ").append(nr.ifEmpty { listOf("nessuna") }.joinToString(" ")).append(", parti ${v.parts}, punteggio %.3f; firma ".format(score))
+            .append(f.signature.joinToString(" ") { it.first + " %.0f".format(it.second) })
+        return sb.toString()
+    }
+
     /** Le strade (ref) con almeno 5 km in [v] e meno di 1 km in ogni tenuto, nell'ordine di [v]. */
     fun newRefs(v: Draft, kept: List<Draft>): List<String> {
         val f = facts(v)
@@ -455,21 +532,39 @@ internal class VariantPool(val judge: VariantJudge, private val opt: NavAlternat
      * ogni valutazione: fermata (lancia [SearchCancelledException]), restano i tenuti fino a lì.
      */
     fun admit(maxTier: Int, stop: CancelToken = CancelToken.NEVER) {
+        val tl = traceLog
         while (!full) {
             val k = kept
             var pick: Draft? = null; var pickV: Verdict? = null
+            // con la traccia: i candidati in gara in questo giro (solo raccolti, la scelta è la stessa)
+            val race = if (tl != null) ArrayList<Pair<Draft, Verdict>>() else null
             for (d in rejected) {
                 stop.check()
                 val v = judge.evaluate(d, k, relaxed = maxTier >= 3)
                 d.verdict = v
                 if (v.tier !in 1..maxTier) continue
+                race?.add(d to v)
                 val pv = pickV
                 if (pv == null || v.tier < pv.tier || (v.tier == pv.tier && (d.source.ordinal < pick!!.source.ordinal ||
                         (d.source == pick.source && v.score < pv.score)))) { pick = d; pickV = v }
             }
+            if (tl != null && race != null && race.isNotEmpty()) {
+                val order = race.sortedWith(compareBy<Pair<Draft, Verdict>>({ it.second.tier }, { it.first.source.ordinal }, { it.second.score }))
+                tl("varianti: traccia scelta ${accepted.size + 1} (livelli ≤ $maxTier, sui tenuti di ora): " + order.take(TRACE_RACE).joinToString("; ") { (d, v) ->
+                    (if (d === pick) "PRESA " else "") + d.tag.ifEmpty { d.source.json } + " liv. ${v.tier} punteggio %.3f".format(v.score) + (if (v.newRefs.isEmpty()) "" else " nuove " + v.newRefs.joinToString(" "))
+                } + (if (order.size > TRACE_RACE) "; altri ${order.size - TRACE_RACE}" else ""))
+            }
             if (pick == null) return
             accepted += pick to pickV!!
         }
+    }
+
+    /** La traccia delle varianti: i giri della scelta golosa ([admit]); null: spenta. */
+    internal var traceLog: ((String) -> Unit)? = null
+
+    private companion object {
+        /** I candidati scritti al più per giro della scelta nella traccia. */
+        const val TRACE_RACE = 12
     }
 
     /**
@@ -601,6 +696,8 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         const val MIN_SOURCE_BUDGET_MS = 3_000L
         /** Il riempimento (livelli 2 e 3) e il conto degli scarti dopo la scadenza delle fonti, al più. */
         const val FILL_GRACE_MS = 2_000L
+        /** Il tempo della fonte P «in ombra» della traccia ([VariantTrace.shadowPenalty]). */
+        const val SHADOW_P_MS = 20_000L
 
         /**
          * Il tempo delle fonti: `budget_ms` meno il tempo già speso a preparare (il migliore, la rete
@@ -662,6 +759,11 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
     }
 
     private val log: (String) -> Unit = { line -> (rc.log ?: service.alternativesLog)?.invoke(line) }
+    /**
+     * Con la traccia: i candidati M giudicati ma non offerti (oltre `perLeg` o oltre il tetto degli
+     * insiemi), cuciti solo alla fine ([traceEnd]) per non togliere tempo alle fonti.
+     */
+    private val traceDrafts = ArrayList<() -> Draft>()
 
     /** Le fonti nell'ordine in cui si provano: M (deviazioni autostradali in RAM), poi P (penalità). */
     private fun providers(): List<VariantProvider> = listOf(MotorwayProvider(), PenaltyProvider())
@@ -675,7 +777,7 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         val router = graphs.router(solved.options)
         val best = Draft(solved.legs, VariantSource.BEST)
         val judge = VariantJudge(best, info, corridors, opt, graphs.graph, router, request, solved.snaps, trip)
-        return VariantContext(service, rc, request, solved, opt, info, corridors, BestTrace(solved.legs), VariantPool(judge, opt), router, log, trip)
+        return VariantContext(service, rc, request, solved, opt, info, corridors, BestTrace(solved.legs), VariantPool(judge, opt).also { if (opt.trace != null) it.traceLog = log }, router, log, trip)
     }
 
     fun run(request: DirectionsRequest, opt: NavAlternativesOptions): Result = rc.searching {
@@ -696,8 +798,12 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         val used = ArrayList<VariantProvider>()
         // 3. le fonti, finché servono varianti di livello 1
         try {
-            for (p in ps) {
-                if (pool.full) break
+            for ((pi, p) in ps.withIndex()) {
+                if (pool.full) {
+                    if (opt.trace != null) for (q in ps.drop(pi)) if (q.source in opt.sources)
+                        log("varianti: traccia: ${q.source.json} non provata, pool pieno (${pool.accepted.count { it.second.tier == 1 }} di livello 1 su ${pool.want})")
+                    break
+                }
                 if (p.source !in opt.sources || !p.supported(ctx)) continue
                 used += p
                 p.run(ctx, budget)
@@ -727,7 +833,81 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         val ms = (System.nanoTime() - t0) / 1_000_000
         log("varianti: ${variants.size}/${pool.want} in $ms ms ($summary)" + (note?.let { "; $it" } ?: ""))
         rc.stats.variants = "${variants.size}/${pool.want} in $ms ms ($summary)"
+        opt.trace?.let { traceEnd(ctx, it, used) }
         Result(solved, variants, note, summary, judge, best, ms)
+    }
+
+    private fun verdictText(v: Verdict): String =
+        if (v.tier > 0) "livello ${v.tier}" + (if (v.reason.isNotEmpty()) " (${v.reason})" else "") + ", punteggio %.3f".format(v.score) else "scartata (${v.reason})"
+
+    /**
+     * La fine della traccia ([VariantTrace]), dopo la scelta: ogni candidato (offerto o no) giudicato
+     * sulle tenute e sul solo migliore coi valori delle regole, la fonte P in ombra se non è stata
+     * provata, le sonde. Nessun effetto sulla risposta.
+     */
+    private fun traceEnd(ctx: VariantContext, tr: VariantTrace, used: List<VariantProvider>) {
+        val pool = ctx.pool; val judge = pool.judge; val best = judge.best
+        val kept = pool.kept
+        val names = listOf("migliore") + pool.accepted.mapIndexed { i, a -> "T${i + 1} ${a.second.label}" }
+        for ((i, a) in pool.accepted.withIndex())
+            log("varianti: traccia tenuta T${i + 1}: " + a.first.tag.ifEmpty { a.first.source.json } + " (livello ${a.second.tier}, ${a.second.label}, punteggio %.3f)".format(a.second.score))
+        fun line(d: Draft, what: String) {
+            val acc = pool.accepted.indexOfFirst { it.first === d }
+            val esito = if (acc >= 0) "tenuta T${acc + 1}" else verdictText(judge.evaluate(d, kept, relaxed = true))
+            val alone = verdictText(judge.evaluate(d, listOf(best), relaxed = false))
+            // una tenuta si spiega sulle altre tenute (con sé stessa la deviazione sarebbe nulla)
+            val others = kept.indices.filter { kept[it] !== d }
+            log("varianti: traccia esito " + d.tag.ifEmpty { d.source.json } + what + ": " + esito + "; col solo migliore " + alone + "; " +
+                judge.explain(d, others.map { kept[it] }, others.map { names[it] }))
+        }
+        for (d in pool.drafts) line(d, "")
+        for (make in traceDrafts) line(make(), " (non offerta)")
+        if (tr.shadowPenalty && VariantSource.PENALTY in ctx.opt.sources && used.none { it.source == VariantSource.PENALTY }) shadowPenalty(ctx, names)
+        for (p in tr.probes) {
+            if (p.legs.isEmpty()) continue
+            val v = Draft(p.legs, VariantSource.PENALTY, tag = "sonda ${p.name}")
+            val vk = judge.evaluate(v, kept, relaxed = true); val vb = judge.evaluate(v, listOf(best), relaxed = false)
+            log("varianti: traccia sonda " + p.name + ": %.0f min, %.1f km".format(v.millis / 60000.0, v.meters / 1000) + "; con le tenute " + verdictText(vk) +
+                "; col solo migliore " + verdictText(vb) + "; " + judge.explain(v, kept, names))
+        }
+    }
+
+    /**
+     * La fonte P «in ombra» (traccia, pool già pieno dopo M): i suoi candidati come li avrebbe
+     * provati dopo M, giudicati sulle tenute ma mai offerti; al più [SHADOW_P_MS].
+     */
+    private fun shadowPenalty(ctx: VariantContext, names: List<String>) {
+        val pc = PenaltyCandidates(service, ctx.solved, rc, log, ctx)
+        if (!pc.supported()) { log("varianti: traccia P in ombra: non vale per questa richiesta"); return }
+        log("varianti: traccia P in ombra (il pool era pieno: candidati giudicati sulle tenute, non offerti)")
+        val pool = ctx.pool; val judge = pool.judge
+        val token = rc.cancel.child(System.nanoTime() + SHADOW_P_MS * 1_000_000)
+        val rejected = ArrayList(pool.rejected)
+        val hashes = HashSet<Long>().also { h -> for (d in pool.kept) h += d.hash; for (d in pool.drafts) h += d.hash }
+        var n = 0
+        try {
+            while (n < pc.maxCandidates) {
+                val c = pc.next(pool.kept, rejected) ?: break
+                n++
+                val r = pc.run(c, token)
+                pc.record(r)
+                val d = r.draft
+                val esito = when {
+                    d == null -> ""
+                    !hashes.add(d.hash) -> " → doppione"
+                    !judge.valid(d) -> " → non valido"
+                    else -> {
+                        rejected += d
+                        val v = judge.evaluate(d, pool.kept, relaxed = true); d.verdict = v
+                        " → " + verdictText(v) + "; col solo migliore " + verdictText(judge.evaluate(d, listOf(judge.best), relaxed = false)) + "; " + judge.explain(d, pool.kept, names)
+                    }
+                }
+                log("varianti: traccia P in ombra: " + r.line.removePrefix("varianti: ") + esito)
+            }
+        } catch (e: SearchCancelledException) {
+            if (e.reason != SearchCancelledException.Reason.DEADLINE || rc.cancel.isCancelled) throw e
+            log("varianti: traccia P in ombra: tempo finito dopo $n candidati")
+        }
     }
 
     /**
@@ -772,7 +952,8 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             })
             val access = ctx.router.access(graphs.encoding.shared)
             var built = false
-            val buildNet = { built = true; MotorwayNet.build(access, seedArr, need, cancel = rc.cancel) }
+            val counts = if (ctx.opt.trace != null) IntArray(4) else null
+            val buildNet = { built = true; MotorwayNet.build(access, seedArr, need, cancel = rc.cancel, counts = counts) }
             val n = if (!rc.useCache) buildNet()
                 else service.netCache.get(graphs.routerKey(solved.options), need, fits = { c -> seedArr.all { c.netNode(it) >= 0 } }, cancel = rc.cancel, build = buildNet)
             // una rete della cache per una regione più grande: solo i nodi che una nuova avrebbe
@@ -781,6 +962,40 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             truncated = n.truncated
             val tNet = (System.nanoTime() - t0) / 1_000_000
             log("varianti: M rete ${n.arcCount} archi, ${n.nodeCount} nodi " + (if (built) "costruita in $tNet ms" else "dalla cache") + (if (n.truncated) " (troncata)" else ""))
+            if (ctx.opt.trace != null) traceNet(ctx, n, seedArr, need, if (built) counts else null)
+        }
+
+        /** Traccia: i semi, la parte del migliore coperta dalla rete, i versi lasciati fuori, il migliore per classe di strada. */
+        private fun traceNet(ctx: VariantContext, n: MotorwayNet, seeds: IntArray, need: Region, counts: IntArray?) {
+            val trace = ctx.trace
+            var inNet = 0; var first = -1; var last = -1
+            for (k in trace.node.indices) if (n.netNode(trace.node[k]) >= 0) { inNet++; if (first < 0) first = k; last = k }
+            fun km(k: Int) = if (k < 0) "-" else "%.1f".format(trace.preM[k] / 1000)
+            log("varianti: traccia M rete: ${seeds.size} semi, ${trace.node.size} posizioni del migliore, $inNet nella rete (dalla posizione $first al km ${km(first)} alla $last al km ${km(last)}), " +
+                "troncata ${if (n.truncated) "sì" else "no"}, maschera ${allowed?.count { !it }?.let { "$it nodi esclusi" } ?: "nessuna"}, regione " +
+                need.ellipses.joinToString { "somma %.0f km".format(it.sumM / 1000) } +
+                (counts?.let { c -> "; versi lasciati fuori: filtro del veicolo ${c[0]}, fuori regione ${c[1]}, peso infinito nei due versi ${c[2]}, in avanti ${c[3]}" } ?: "; versi lasciati fuori: rete dalla cache, non contati"))
+            // il migliore per corse della stessa classe (MW autostrada, TR superstrada, altro), con le strade
+            val runs = ArrayList<Pair<Double, String>>()
+            var at = 0.0
+            for (leg in ctx.solved.legs) {
+                var cls = ""; var from = at; var m = 0.0
+                val refs = LinkedHashMap<String, Double>()
+                fun close() {
+                    if (cls.isEmpty() || m <= 0) return
+                    runs += m to cls + " km %.1f–%.1f (%.1f km".format(from / 1000, (from + m) / 1000, m / 1000) + (if (refs.isEmpty()) "" else ", " + refs.entries.sortedByDescending { it.value }.take(3).joinToString(" ") { it.key }) + ")"
+                }
+                for (e in leg.edges) {
+                    val c = when { ctx.info.isMotorway(e.edge) -> "MW"; ctx.info.isMotorwayOrTrunk(e.edge) -> "TR"; else -> "altro" }
+                    if (c != cls) { close(); cls = c; from = at; m = 0.0; refs.clear() }
+                    m += e.distance; at += e.distance
+                    ctx.info.ref(e.edge)?.let { refs.merge(it, e.distance, Double::plus) }
+                }
+                close()
+            }
+            // le corse sotto 1 km (rampe, rotonde) solo contate
+            val shown = runs.filter { it.first >= 1000.0 }.map { it.second }
+            log("varianti: traccia migliore per classe: " + shown.joinToString(" → ") + (if (shown.size < runs.size) " (+${runs.size - shown.size} corse sotto 1 km)" else ""))
         }
 
         override fun run(ctx: VariantContext, budget: CancelToken) {
@@ -795,12 +1010,18 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             val scale = ctx.opt.minDetourScale
             val minM = scale * maxOf(VariantRules.T3_D_MIN, VariantRules.T3_D * VariantRules.dMin1(ctx.pool.best.meters + ctx.trip.extraMeters))
             val all = ArrayList<Detour>()
+            val diag = ctx.opt.trace?.let { tr ->
+                DetourTrace(log, { e -> ctx.info.ref(e) }, tr.probes.map { p ->
+                    val es = p.legs.flatMap { it.edges }
+                    DetourTrace.Watch(p.name, IntArray(es.size) { es[it].edge }, IntArray(es.size) { es[it].adjNode }, DoubleArray(es.size) { es[it].distance })
+                }, maxOf(tr.maxDetoursPerLeg, 12))
+            }
             for (j in solved.legs.indices) {
                 budget.check()
                 val lw = trace.legW[j]
                 if (lw <= 0) continue
                 val factor = minOf(MAX_LEG_FACTOR, 1 + PenaltyCandidates.CAP_SLACK * (ctx.opt.maxFactor - 1) * w0 / lw)
-                all += search.detours(j, factor, cancel = budget, minDetourM = minM)
+                all += search.detours(j, factor, cancel = budget, minDetourM = minM, diag = diag)
             }
             // un tetto per richiesta: le prime per punteggio su tutto il viaggio (le combinazioni vengono
             // dalle prime 8). Prima l'ordine era quello di Detour.score, riferito al proprio tratto:
@@ -828,7 +1049,50 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             val before = ctx.pool.accepted.size
             ctx.pool.offerAll(drafts)
             log("varianti: M ${singles} deviazioni, ${combos} combinazioni, ${(System.nanoTime() - t0) / 1_000_000} ms")
+            if (diag != null) traceDetours(ctx, net, search, all, sets, drafts, diag, tripKey)
             for ((d, v) in ctx.pool.accepted.drop(before)) log("varianti: ${d.tag} → tenuta (livello ${v.tier}, ${v.label})")
+        }
+
+        /**
+         * Traccia: ogni deviazione (le tenute dalla ricerca, poi quelle oltre `perLeg`) con uscita e
+         * rientro sul migliore, Δ, metri, plateau, punteggi, strade; le coppie fra le prime 8 non
+         * combinabili; i candidati non offerti cuciti per il giudizio finale ([traceEnd]).
+         */
+        private fun traceDetours(ctx: VariantContext, net: MotorwayNet, search: DetourSearch, all: List<Detour>, sets: List<List<Detour>>,
+                                 drafts: List<Draft>, diag: DetourTrace, tripKey: (Detour) -> Double) {
+            val trace = ctx.trace
+            val offered = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Detour, Boolean>()).also { o -> for (p in sets) if (p.size == 1) o += p[0] }
+            val tripW = trace.legW.sum()
+            fun refs(d: Detour): String {
+                val m = LinkedHashMap<String, Double>()
+                for (a in d.arcs) ctx.info.ref(net.arcEdge[a])?.let { m.merge(it, net.arcM[a].toDouble(), Double::plus) }
+                return m.entries.filter { it.value >= 500 }.joinToString(" ") { it.key + " %.0f".format(it.value / 1000) }.ifEmpty { "senza ref" }
+            }
+            fun line(i: Int, d: Detour, what: String) {
+                val s = trace.legStart[d.leg]
+                val share = d.plateauW / maxOf(1e-9, d.dW + (trace.pre[s + d.toPos] - trace.pre[s + d.fromPos]))
+                log("varianti: traccia M deviazione $i$what: t${d.leg} ${d.fromPos}→${d.toPos} (km %.1f→%.1f del migliore), Δ %+d s %+.1f km, deviazione %.1f km (migliore %.1f km), plateau %.2f, punteggio %.3f, sul viaggio %.3f, rango catena %s; ".format(
+                    trace.preM[s + d.fromPos] / 1000, trace.preM[s + d.toPos] / 1000, d.dMs / 1000, d.dM / 1000, d.detourM / 1000, (d.detourM - d.dM) / 1000,
+                    share, d.score, search.tripScore(d, tripW), diag.rank[d]?.toString() ?: "?") + refs(d))
+            }
+            for ((i, d) in all.withIndex()) line(i, d, if (d in offered) " (offerta)" else " (oltre il tetto degli insiemi)")
+            for ((i, d) in diag.extra.withIndex()) line(all.size + i, d, " (oltre perLeg)")
+            // le coppie fra le prime 8 per punteggio sul viaggio: non disgiunte, e fra queste quelle che si toccano nello stesso nodo
+            val top = all.sortedBy(tripKey).take(DetourSearch.COMBO_TOP)
+            var notDisjoint = 0; var touching = 0
+            for (i in top.indices) for (j in i + 1 until top.size) if (!top[i].disjoint(top[j])) {
+                notDisjoint++
+                if (top[i].leg == top[j].leg && (top[i].toPos == top[j].fromPos || top[j].toPos == top[i].fromPos)) touching++
+            }
+            log("varianti: traccia M combinazioni: fra le prime ${top.size} coppie non disgiunte $notDisjoint, di cui che si toccano nello stesso nodo $touching")
+            val notInPool = drafts.count { d -> ctx.pool.drafts.none { it === d } }
+            if (notInPool > 0) log("varianti: traccia M: $notInPool insiemi offerti scartati come doppioni o non validi")
+            // i non offerti, cuciti alla fine per il giudizio finale (mai offerti)
+            val solved = ctx.solved
+            for (d in all.filter { it !in offered } + diag.extra) traceDrafts += {
+                val legs = solved.legs.mapIndexed { j, leg -> if (d.leg == j) ctx.router.splice(leg, listOf(net.cut(d)), light = true) else leg }
+                Draft(legs, VariantSource.MOTORWAY, listOf(d), 1, "M t${d.leg} ${d.fromPos}→${d.toPos} ${"%+d".format(d.dMs / 1000)} s ${Math.round(d.detourM / 100) / 10.0} km", turnsChecked = true)
+            }
         }
 
         override fun summary(): String = "M $singles ($combos combo)"

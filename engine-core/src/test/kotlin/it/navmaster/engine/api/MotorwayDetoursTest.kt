@@ -5,6 +5,7 @@ import it.navmaster.engine.routing.BestTrace
 import it.navmaster.engine.routing.CancelToken
 import it.navmaster.engine.routing.Detour
 import it.navmaster.engine.routing.DetourSearch
+import it.navmaster.engine.routing.DetourTrace
 import it.navmaster.engine.routing.EdgeInfo
 import it.navmaster.engine.routing.Ellipse
 import it.navmaster.engine.routing.MotorwayNet
@@ -144,6 +145,26 @@ class DetourSearchTest {
         val ds = DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 1, minDetourM = 100.0)
         assertEquals(listOf(listOf(100, 101, 102)), ds.map { edges(n, it) })
         assertTrue(DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 1).single().arcs.all { n.arcEdge[it] >= 5000 })
+    }
+
+    @Test
+    fun `the trace changes no detour and keeps the ones beyond perLeg aside`() {
+        val n = net()
+        val plain = DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 1)
+        val lines = ArrayList<String>()
+        val a21 = DetourTrace.Watch("A21", intArrayOf(100, 101, 102), intArrayOf(10, 11, 3), doubleArrayOf(800.0, 800.0, 800.0))
+        val diag = DetourTrace({ lines += it }, { null }, listOf(a21))
+        val traced = DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 1, diag = diag)
+        // le stesse deviazioni (perLeg = 1: l'A21), le altre due da parte nella traccia
+        assertEquals(plain.map { edges(n, it) }, traced.map { edges(n, it) })
+        assertEquals(plain.map { it.dW }, traced.map { it.dW })
+        assertEquals(listOf(listOf(200, 201, 202), listOf(100, 101, 300, 201, 202)), diag.extra.map { edges(n, it) })
+        assertEquals(listOf(0, 1, 2), (traced + diag.extra).map { diag.rank[it] })
+        assertTrue(lines.any { "tetto: 1 tenute (perLeg)" in it }, lines.joinToString("\n"))
+        // la sonda sull'A21: tutta nella rete, con le due etichette, la sua catena tenuta
+        val probe = Regex("2[.,]4 km fuori dal migliore, 0[.,]0 km fuori dalla rete, 2[.,]4 km con le due etichette")
+        assertTrue(lines.any { it.startsWith("varianti: traccia sonda A21") && probe.containsMatchIn(it) }, lines.joinToString("\n"))
+        assertTrue(lines.any { "catena con testa" in it && "tenuta" in it }, lines.joinToString("\n"))
     }
 
     @Test

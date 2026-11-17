@@ -772,7 +772,7 @@ class CrossBorderDirections(
             val f = finals[j]
             val trip = TripContext(totalMs - f.millis, totalM - f.meters, totalW - f.weight, finals.take(j).sumOf { it.meters })
             val opt = NavAlternativesOptions(want - tier1() + 1, nav.tier1Factor, nav.maxFactor, left, true, nav.tier1KmFactor, nav.maxKmFactor,
-                nav.allowFewerKm, nav.fill, pieceSources, nav.minDetourScale)
+                nav.allowFewerKm, nav.fill, pieceSources, nav.minDetourScale).withTrace(nav.trace)
             val prc = RequestContext(rc.cancel, rc.priority, rc.executor, rc.slots, rc.log ?: log, rc.stats.child("varianti ${f.graph.id}"), rc.useCache)
             val res = NavAlternativesEngine(f.graph.service, prc, trip).run(f.solved.request, opt)
             summaries += "${f.graph.id}: ${res.summary}"

@@ -116,9 +116,13 @@ class MotorwayNet internal constructor(
          * visita in ampiezza sugli archi `motorway`/`trunk` (rampe comprese) che il filtro accetta;
          * un verso con peso finito diventa un arco diretto, registrato solo dalla sua coda; si visita
          * anche il nodo raggiunto solo all'indietro (l'inizio di una rampa d'entrata). Per nodo una
-         * lettura dei divieti di svolta. Oltre [maxArcs] la visita si ferma ([truncated]).
+         * lettura dei divieti di svolta. Oltre [maxArcs] la visita si ferma ([truncated]). [counts]
+         * (solo la traccia delle varianti): i versi `motorway`/`trunk` lasciati fuori, per motivo:
+         * [0] filtro del veicolo, [1] fuori regione, [2] peso infinito nei due versi, [3] peso
+         * infinito in avanti (un verso visto da ogni capo: un arco può contare due volte).
          */
-        fun build(a: DetourAccess, seeds: IntArray, region: Region, maxArcs: Int = 250_000, cancel: CancelToken = CancelToken.NEVER): MotorwayNet {
+        fun build(a: DetourAccess, seeds: IntArray, region: Region, maxArcs: Int = 250_000, cancel: CancelToken = CancelToken.NEVER,
+                  counts: IntArray? = null): MotorwayNet {
             val g = a.graph; val sh = a.shared; val w = a.weighting
             val index = IntIntHashMap(4096)
             val nodes = IntArrayList(); val restricted = IntArrayList(); val lats = DoubleArrayList(); val lons = DoubleArrayList()
@@ -143,16 +147,16 @@ class MotorwayNet internal constructor(
                     if (adj == n) continue
                     val rc = it.get(sh.roadClass)
                     if (rc != RoadClass.MOTORWAY && rc != RoadClass.TRUNK) continue
-                    if (!a.filter.accept(it)) continue
+                    if (!a.filter.accept(it)) { if (counts != null) counts[0]++; continue }
                     var head = index.getOrDefault(adj, -1)
                     var lat = 0.0; var lon = 0.0
-                    if (head < 0) { lat = g.lat(adj); lon = g.lon(adj); if (!region.contains(lat, lon)) continue }
+                    if (head < 0) { lat = g.lat(adj); lon = g.lon(adj); if (!region.contains(lat, lon)) { if (counts != null) counts[1]++; continue } }
                     val fw = w.edgeWeight(it, false)
                     if (head < 0) {
-                        if (fw.isInfinite() && w.edgeWeight(it, true).isInfinite()) continue
+                        if (fw.isInfinite() && w.edgeWeight(it, true).isInfinite()) { if (counts != null) counts[2]++; continue }
                         head = visit(adj, lat, lon)
                     }
-                    if (fw.isInfinite()) continue
+                    if (fw.isInfinite()) { if (counts != null) counts[3]++; continue }
                     tails.add(tail); heads.add(head); edges.add(it.edge); revs.add(if (it.reverse) 1 else 0)
                     ws.add(fw); mss.add(minOf(Int.MAX_VALUE.toLong(), a.timeWeighting.edgeMillis(it, false)).toInt()); ms.add(it.distance.toFloat())
                     if (tails.size() >= maxArcs) truncated = true

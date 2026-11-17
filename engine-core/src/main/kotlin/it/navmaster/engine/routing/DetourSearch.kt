@@ -62,6 +62,19 @@ class Detour(val leg: Int, val fromPos: Int, val toPos: Int, val arcs: IntArray,
     fun disjoint(o: Detour): Boolean = leg != o.leg || toPos < o.fromPos || o.toPos < fromPos
 }
 
+/**
+ * La traccia di [DetourSearch.detours] (solo le prove diagnostiche delle varianti): le righe vanno a
+ * [log]; [ref]: la strada di un arco del grafo (letta solo qui, fuori dai cicli caldi); [watch]: i
+ * percorsi da sorvegliare (le sonde: archi in ordine col nodo d'arrivo e i metri); le deviazioni
+ * oltre `perLeg` fino a [maxKept] per tratto finiscono in [extra] (mai restituite), col rango della
+ * loro catena in [rank] (anche le tenute).
+ */
+class DetourTrace(val log: (String) -> Unit, val ref: (Int) -> String?, val watch: List<Watch> = emptyList(), val maxKept: Int = 40) {
+    class Watch(val name: String, val edges: IntArray, val adjNodes: IntArray, val meters: DoubleArray)
+    val extra = ArrayList<Detour>()
+    val rank = java.util.IdentityHashMap<Detour, Int>()
+}
+
 /** Una svolta vietata per le deviazioni: i divieti del profilo ([TurnCostProvider]), nelle prove un divieto finto. */
 fun interface TurnCheck { fun forbidden(inEdge: Int, node: Int, outEdge: Int): Boolean }
 
@@ -102,12 +115,14 @@ class DetourSearch internal constructor(private val net: MotorwayNet, private va
      * metà della quota di plateau): solo percorsi via con peso ≤ [maxFactor] volte il tratto, quota
      * di plateau ≥ [minPlateauShare] (ottimalità locale), almeno [minDetourM] metri fuori dal
      * migliore, nessun nodo ripetuto; due con la stessa uscita e lo stesso rientro e l'80 % dei km
-     * in comune contano per una.
+     * in comune contano per una. [diag]: la traccia delle varianti (solo le prove; null: nessun
+     * conto in più): righe di registro e le deviazioni oltre [perLeg] in [DetourTrace.extra], mai
+     * restituite (le prime [perLeg] sono le stesse senza traccia).
      */
     fun detours(leg: Int, maxFactor: Double, minPlateauShare: Double = 0.25, perLeg: Int = 12, cancel: CancelToken = CancelToken.NEVER,
-                minDetourM: Double = 0.0): List<Detour> {
+                minDetourM: Double = 0.0, diag: DetourTrace? = null): List<Detour> {
         val s = trace.legStart[leg]; val e = trace.legStart[leg + 1]
-        if (e - s < 2 || nA == 0) return emptyList()
+        if (e - s < 2 || nA == 0) { diag?.log?.invoke("varianti: traccia M tratto $leg: ${e - s} posizioni, rete di $nA archi: nessuna ricerca"); return emptyList() }
         val legW = trace.legW[leg]
         val limit = maxFactor * legW
         java.util.Arrays.fill(f, INF); java.util.Arrays.fill(g, INF)
@@ -167,30 +182,42 @@ class DetourSearch internal constructor(private val net: MotorwayNet, private va
         }
         cancel.check()
         // 3-4. le catene di plateau (a → n legati se gNext[a] == n e fPar[n] == a), dalle teste
-        class Chain(val head: Int, val tail: Int, val p: Int, val q: Int, val plateauW: Double, val detourW: Double, val score: Double)
+        // (con la traccia, i conti per motivo: solo incrementi, le condizioni sono le stesse)
+        val cnt = if (diag != null) IntArray(5) else null
         val chains = ArrayList<Chain>()
         for (a in 0 until nA) {
-            if (f[a] == INF || g[a] == INF || gDest[a] <= fOrig[a]) continue
+            if (f[a] == INF || g[a] == INF) continue
             val x = fPar[a]
             if (x >= 0 && gNext[x] == a) continue // non è una testa
+            if (gDest[a] <= fOrig[a]) { if (cnt != null) cnt[0]++; continue }
             var plateau = net.arcW[a]; var cur = a
             while (true) { val nx = gNext[cur]; if (nx < 0 || fPar[nx] != cur) break; cur = nx; plateau += net.arcW[cur] }
             val tot = f[a] + g[a] - net.arcW[a]
-            if (tot > limit) continue
+            if (tot > limit) { if (cnt != null) cnt[1]++; continue }
             // corta (un giro di svincolo): fuori prima del tetto delle ricostruite (1 m di tolleranza sulle somme in float)
-            if (fM[a] + gM[a] - net.arcM[a] < minDetourM - 1.0) continue
+            if (fM[a] + gM[a] - net.arcM[a] < minDetourM - 1.0) { if (cnt != null) cnt[2]++; continue }
             val p = fOrig[a]; val q = gDest[a]
             val detourW = tot - legW + (trace.pre[q] - trace.pre[p])
-            if (detourW <= 0 || plateau < minPlateauShare * detourW) continue
+            if (detourW <= 0 || plateau < minPlateauShare * detourW) { if (cnt != null) cnt[if (detourW <= 0) 3 else 4]++; continue }
             chains += Chain(a, cur, p, q, plateau, detourW, score(tot - legW, plateau, detourW, legW))
         }
         chains.sortWith(compareBy<Chain>({ it.score }, { it.head }))
-        // 5. le prime perLeg, ricostruite (risalita di fPar, discesa di gNext)
+        // 5. le prime perLeg, ricostruite (risalita di fPar, discesa di gNext); con la traccia si
+        // continua oltre il tetto (fino a DetourTrace.maxKept) mettendo le altre da parte
         val out = ArrayList<Detour>()
         val seen = com.carrotsearch.hppc.IntHashSet()
         var built = 0
-        for (c in chains) {
-            if (out.size >= perLeg || built >= perLeg * MAX_BUILT_PER_KEPT) break
+        val extra = if (diag != null) ArrayList<Detour>() else null
+        val fate = if (diag != null) HashMap<Int, String>() else null
+        var stopAt = -1; var stopWhy = ""; var looked = 0
+        for ((ci, c) in chains.withIndex()) {
+            val over = out.size >= perLeg || built >= perLeg * MAX_BUILT_PER_KEPT
+            if (over) {
+                if (diag == null || extra == null) break
+                if (stopAt < 0) { stopAt = ci; stopWhy = if (out.size >= perLeg) "$perLeg tenute (perLeg)" else "${perLeg * MAX_BUILT_PER_KEPT} ricostruite" }
+                if (out.size + extra.size >= diag.maxKept || built >= diag.maxKept * MAX_BUILT_PER_KEPT) break
+            }
+            looked = ci + 1
             built++
             val up = com.carrotsearch.hppc.IntArrayList()
             var cur = c.tail
@@ -204,14 +231,138 @@ class DetourSearch internal constructor(private val net: MotorwayNet, private va
             var repeated = !seen.add(net.arcTail[ids[0]])
             var m = 0.0; var ms = 0L
             for (a in ids) { if (!seen.add(net.arcHead[a])) repeated = true; m += net.arcM[a]; ms += net.arcMs[a] }
-            if (repeated || m < minDetourM) continue
+            if (repeated || m < minDetourM) { fate?.put(c.head, if (repeated) "nodo ripetuto" else "corta (%.1f km)".format(m / 1000)); continue }
             val p = c.p - s; val q = c.q - s
-            if (out.any { o -> o.fromPos == p && o.toPos == q && commonMeters(o.arcs, ids) >= UNIFY_SHARE * minOf(m, o.detourM) }) continue
+            val twin = out.firstOrNull { o -> o.fromPos == p && o.toPos == q && commonMeters(o.arcs, ids) >= UNIFY_SHARE * minOf(m, o.detourM) }
+                ?: extra?.firstOrNull { o -> o.fromPos == p && o.toPos == q && commonMeters(o.arcs, ids) >= UNIFY_SHARE * minOf(m, o.detourM) }
+            if (twin != null) { fate?.put(c.head, "doppione (stesse posizioni, 80 % in comune)"); continue }
             val bestMs = trace.preMs[c.q] - trace.preMs[c.p]
-            out += Detour(leg, p, q, ids, c.detourW - (trace.pre[c.q] - trace.pre[c.p]), ms - bestMs, m - (trace.preM[c.q] - trace.preM[c.p]),
+            val d = Detour(leg, p, q, ids, c.detourW - (trace.pre[c.q] - trace.pre[c.p]), ms - bestMs, m - (trace.preM[c.q] - trace.preM[c.p]),
                 c.plateauW, ms, bestMs, m, c.score)
+            if (over) { extra!! += d; fate?.put(c.head, "oltre il tetto") } else { out += d; fate?.put(c.head, "tenuta") }
+            diag?.rank?.put(d, ci)
+        }
+        if (diag != null && cnt != null && extra != null && fate != null) {
+            diag.extra += extra
+            report(diag, leg, s, e, legW, maxFactor, minPlateauShare, minDetourM, cnt, chains, out, extra, fate, built, stopAt, stopWhy, looked)
         }
         return out
+    }
+
+    /** Una catena di plateau (passo 3-4): testa, coda, uscita, rientro, plateau, peso fra uscita e rientro, punteggio. */
+    private class Chain(val head: Int, val tail: Int, val p: Int, val q: Int, val plateauW: Double, val detourW: Double, val score: Double)
+
+    /** Le righe della traccia di un tratto ([detours] con [DetourTrace]): fuori dai cicli caldi, solo con la traccia. */
+    private fun report(diag: DetourTrace, leg: Int, s: Int, e: Int, legW: Double, maxFactor: Double, share: Double, minDetourM: Double, cnt: IntArray,
+                       chains: List<Chain>, out: List<Detour>, extra: List<Detour>, fate: Map<Int, String>, built: Int, stopAt: Int, stopWhy: String, looked: Int) {
+        val log = diag.log
+        var inNet = 0; var firstP = -1; var lastP = -1
+        for (p in s until e) if (net.netNode(trace.node[p]) >= 0) { inNet++; if (firstP < 0) firstP = p; lastP = p }
+        var nf = 0; var ng = 0; var nfg = 0
+        for (a in 0 until nA) { val hf = f[a] != INF; val hg = g[a] != INF; if (hf) nf++; if (hg) ng++; if (hf && hg) nfg++ }
+        fun km(p: Int) = if (p < 0) "-" else "%.1f".format(trace.preM[p] / 1000)
+        log("varianti: traccia M tratto $leg: peso %.0f, tetto ×%.3f, %d posizioni del migliore, %d nella rete (km %s–%s del migliore, posizioni %d–%d), archi con f %d, con g %d, con entrambe %d".format(
+            legW, maxFactor, e - s, inNet, km(firstP), km(lastP), if (firstP < 0) -1 else firstP - s, if (lastP < 0) -1 else lastP - s, nf, ng, nfg))
+        log("varianti: traccia M tratto $leg: teste scartate: rientro non dopo l'uscita ${cnt[0]}, oltre il tetto ${cnt[1]}, corte (< %.1f km) ${cnt[2]}, Δ ≤ 0 ${cnt[3]}, plateau < %.2f ${cnt[4]}; catene valide ${chains.size}".format(minDetourM / 1000, share))
+        val fates = fate.values.groupingBy { it.substringBefore(" (") }.eachCount()
+        log("varianti: traccia M tratto $leg: ricostruite $built (guardate $looked di ${chains.size}): tenute ${out.size}, oltre il tetto ${extra.size}; " +
+            fates.filterKeys { it != "tenuta" && it != "oltre il tetto" }.entries.joinToString(", ") { "${it.key} ${it.value}" }.ifEmpty { "nessuna scartata" } +
+            (if (stopAt >= 0) "; tetto: $stopWhy alla catena $stopAt (punteggio %.3f)".format(chains[stopAt].score) else "; tetto non raggiunto") +
+            "; catene non guardate ${chains.size - looked}")
+        if (diag.watch.isEmpty()) return
+        // le sonde: lungo il percorso forzato, gli archi nella rete e le loro etichette
+        val byEdge = com.carrotsearch.hppc.IntIntHashMap(nA * 2)
+        val byEdge2 = com.carrotsearch.hppc.IntIntHashMap()
+        for (a in 0 until nA) { val ed = net.arcEdge[a]; if (byEdge.containsKey(ed)) byEdge2.put(ed, a) else byEdge.put(ed, a) }
+        val rankOf = com.carrotsearch.hppc.IntIntHashMap(chains.size * 2)
+        for ((i, c) in chains.withIndex()) rankOf.put(c.head, i)
+        for (w in diag.watch) {
+            val n = w.edges.size
+            val arc = IntArray(n) { i ->
+                val ed = w.edges[i]
+                val a1 = byEdge.getOrDefault(ed, -1); val a2 = byEdge2.getOrDefault(ed, -1)
+                when {
+                    a1 >= 0 && net.nodeGraph[net.arcHead[a1]] == w.adjNodes[i] -> a1
+                    a2 >= 0 && net.nodeGraph[net.arcHead[a2]] == w.adjNodes[i] -> a2
+                    else -> -1
+                }
+            }
+            fun key(i: Int): String {
+                val ed = w.edges[i]; val a = arc[i]
+                return when {
+                    trace.edgeSet.contains(ed) -> "migliore"
+                    a < 0 -> "fuori rete"
+                    arcOnB[a] -> "esclusa (maschera della rete)"
+                    else -> "f:${if (f[a] == INF) -1 else fOrig[a]} g:${if (g[a] == INF) -1 else gDest[a]}"
+                }
+            }
+            var offM = 0.0; var labM = 0.0; var outM = 0.0
+            for (i in 0 until n) {
+                if (trace.edgeSet.contains(w.edges[i])) continue
+                offM += w.meters[i]
+                val a = arc[i]
+                if (a < 0 || arcOnB[a]) outM += w.meters[i] else if (f[a] != INF && g[a] != INF) labM += w.meters[i]
+            }
+            log("varianti: traccia sonda ${w.name} (tratto $leg): %.1f km fuori dal migliore, %.1f km fuori dalla rete, %.1f km con le due etichette".format(offM / 1000, outM / 1000, labM / 1000))
+            var i = 0; var at = 0.0; var groups = 0
+            while (i < n) {
+                val k = key(i)
+                var j = i; var m = 0.0
+                val refs = LinkedHashMap<String, Double>()
+                var fFollow = 0; var gFollow = 0; var links = 0
+                var minTot = INF
+                val heads = LinkedHashSet<Int>()
+                while (j < n && key(j) == k) {
+                    m += w.meters[j]
+                    diag.ref(w.edges[j])?.let { refs.merge(it, w.meters[j], Double::plus) }
+                    val a = arc[j]
+                    if (a >= 0 && !arcOnB[a] && !trace.edgeSet.contains(w.edges[j])) {
+                        // (lo stesso arco due volte di fila: le due metà al punto di passaggio della sonda)
+                        if (j > i && arc[j - 1] >= 0 && arc[j - 1] != a) { links++; if (fPar[a] == arc[j - 1]) fFollow++; if (gNext[arc[j - 1]] == a) gFollow++ }
+                        if (f[a] != INF && g[a] != INF) {
+                            minTot = minOf(minTot, f[a] + g[a] - net.arcW[a])
+                            var h = a; var guard = 0
+                            while (guard++ < nA) { val x = fPar[h]; if (x < 0 || gNext[x] != h) break; h = x }
+                            heads += h
+                        }
+                    }
+                    j++
+                }
+                val head = "  km %.1f–%.1f (%.1f km, %s)".format(at / 1000, (at + m) / 1000, m / 1000,
+                    refs.entries.sortedByDescending { it.value }.take(3).joinToString(" ") { "${it.key} %.0f".format(it.value / 1000) }.ifEmpty { "senza ref" })
+                val detail = if (k.startsWith("f:")) {
+                    val a = arc[i]
+                    val fo = if (f[a] == INF) "f infinita" else "esce dal migliore al km ${km(fOrig[a])} (pos ${fOrig[a] - s})"
+                    val gd = if (g[a] == INF) "g infinita" else "rientra al km ${km(gDest[a])} (pos ${gDest[a] - s})"
+                    val tot = if (minTot == INF) "" else ", via ×%.3f del tratto (tetto ×%.3f)".format(minTot / legW, maxFactor)
+                    val hs = heads.take(3).joinToString("; ") { h ->
+                        val r = rankOf.getOrDefault(h, -1)
+                        "catena con testa $h: ${why(h, legW, maxFactor * legW, minDetourM, share)}" + (if (r >= 0) ", rango $r di ${chains.size}, ${fate[h] ?: "non guardata"}" else "")
+                    }
+                    "$fo, $gd$tot; archi legati f $fFollow/$links, g $gFollow/$links" + (if (hs.isNotEmpty()) "; $hs" else "")
+                } else k
+                if (groups < MAX_WATCH_GROUPS) log("varianti: traccia sonda ${w.name}:$head: $detail")
+                groups++
+                at += m; i = j
+            }
+            if (groups > MAX_WATCH_GROUPS) log("varianti: traccia sonda ${w.name}: altri ${groups - MAX_WATCH_GROUPS} gruppi non scritti")
+        }
+    }
+
+    /** Perché la catena con testa [a] è o non è valida: le stesse condizioni del passo 3-4 (solo la traccia). */
+    private fun why(a: Int, legW: Double, limit: Double, minDetourM: Double, share: Double): String {
+        if (f[a] == INF || g[a] == INF) return "senza le due etichette"
+        if (gDest[a] <= fOrig[a]) return "rientro (pos ${gDest[a]}) non dopo l'uscita (pos ${fOrig[a]})"
+        var plateau = net.arcW[a]; var cur = a
+        while (true) { val nx = gNext[cur]; if (nx < 0 || fPar[nx] != cur) break; cur = nx; plateau += net.arcW[cur] }
+        val tot = f[a] + g[a] - net.arcW[a]
+        if (tot > limit) return "oltre il tetto (×%.3f > ×%.3f)".format(tot / legW, limit / legW)
+        val m = fM[a] + gM[a] - net.arcM[a]
+        if (m < minDetourM - 1.0) return "corta (%.1f km < %.1f)".format(m / 1000, minDetourM / 1000)
+        val detourW = tot - legW + (trace.pre[gDest[a]] - trace.pre[fOrig[a]])
+        if (detourW <= 0) return "Δ ≤ 0"
+        if (plateau < share * detourW) return "plateau %.2f < %.2f (×%.3f)".format(plateau / detourW, share, tot / legW)
+        return "valida (plateau %.2f, ×%.3f, %.1f km)".format(plateau / detourW, tot / legW, m / 1000)
     }
 
     /**
@@ -289,6 +440,8 @@ class DetourSearch internal constructor(private val net: MotorwayNet, private va
         const val COMBO_TOP = 8
         /** Quante catene si ricostruiscono al più per deviazione tenuta (le altre cadono per nodi ripetuti o doppioni). */
         private const val MAX_BUILT_PER_KEPT = 20
+        /** I gruppi di archi scritti al più per sonda nella traccia. */
+        private const val MAX_WATCH_GROUPS = 60
 
         /**
          * Il punteggio di una deviazione (più basso = meglio): il Δ di peso [dW] riferito a [refW]

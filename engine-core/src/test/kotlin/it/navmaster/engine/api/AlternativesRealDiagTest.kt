@@ -2,8 +2,12 @@ package it.navmaster.engine.api
 
 import it.navmaster.engine.RoutingGraph
 import it.navmaster.engine.routing.CancelToken
+import it.navmaster.engine.routing.CorridorAnalyzer
+import it.navmaster.engine.routing.EdgeInfo
 import it.navmaster.engine.routing.RouteNotFoundException
+import it.navmaster.engine.storage.FetchMode
 import it.navmaster.engine.util.DistanceCalc
+import it.navmaster.engine.weighting.EdgeFilter
 import it.navmaster.engine.weighting.EdgePenalties
 import java.io.File
 import java.util.Random
@@ -21,13 +25,23 @@ import kotlin.test.assertTrue
  * "4,1.2,1.1": la richiesta automatica dell'app); `NM_SOURCES="motorway,penalty[,crossing]"`.
  * Senza `NM_CB` la prova non fa nulla (e passa).
  *
+ * Sonde (`NM_PROBES`, solo un Paese e viaggi di due punti): voci separate da `§`, ognuna
+ * `viaggio|REF@lat,lon[;REF@lat,lon…]`, con il viaggio scritto come nel registro (`Torino→Mestre`,
+ * anche `Torino->Mestre`). Per ogni punto l'arco più vicino con quel ref entro [PROBE_RADIUS_M]
+ * (percorribile dal camion); il percorso migliore del viaggio per quei punti (punti di passaggio
+ * senza inversione, provati i due versi della carreggiata, tenuto il più leggero): tempo, km, r e
+ * rk sul migliore, la firma, il verdetto del giudice sul solo migliore coi valori. `NM_TRACE=1`
+ * (predefinito: acceso se ci sono sonde) accende la traccia delle varianti ([VariantTrace]): righe
+ * `varianti: traccia …` del motore, le sonde giudicate sulle tenute e sorvegliate nella fonte M.
+ *
  * La richiesta è quella camion dell'app (4 m, 2,55 m, 16,5 m, 27 t, 11,5 t per asse, maximum_speed
  * 80, roads, evita traghetti, pass_through sulle vie), con un aiutante e 2 posti di ricerca come sul
  * tablet. Per viaggio: ms del migliore (fonti dei tratti) e delle varianti, il registro delle fonti
  * (rete, deviazioni, candidati P), per percorso minuti, km, r, livello, fonte, firma; la memoria.
  *
  * Asserzioni (FAIL k/n): (a) ≥ 3 percorsi in ≥ 90 % dei viaggi, tappe comprese; (b) le firme attese
- * in almeno metà dei viaggi noti; (c) livello 1 entro tier1, tutte entro max_factor in tempo e km;
+ * in almeno metà dei viaggi noti (dentro i tetti 1,20: Torino→Mestre la A21, Bolzano→Milano la A22
+ * fino all'interconnessione di Verona e poi la A4, senza SR450 né SS11; Milano→Bologna nessuna, A21/A22 sono oltre 1,20×); (c) livello 1 entro tier1, tutte entro max_factor in tempo e km;
  * (d) la prima feature è la risposta senza varianti; (e) le varianti subito dopo il migliore: 0
  * ricerche per il migliore; (f) esattezza delle penalità: core-ALT penalizzato = Dijkstra pieno
  * penalizzato su 20 coppie; (g) una via in più: ≤ 2 tratti calcolati (un Paese).
@@ -69,6 +83,23 @@ class AlternativesRealDiagTest {
 
     private fun refsOf(v: Map<String, Any?>?): Set<String> = (v?.get("refs") as? List<*>)?.map { (it as Map<*, *>)["ref"] as String }?.toSet().orEmpty()
 
+    /** I km di [ref] nella firma di [v] (tutte le corse). */
+    private fun kmOf(v: Map<String, Any?>?, ref: String): Double =
+        (v?.get("refs") as? List<*>).orEmpty().map { it as Map<*, *> }.filter { it["ref"] == ref }.sumOf { (it["km"] as Number).toDouble() }
+
+    /** Una sonda di `NM_PROBES`: il viaggio, i punti (ref, lat, lon), il testo dei punti (il suo nome). */
+    private class ProbeSpec(val trip: String, val points: List<Triple<String, Double, Double>>, val name: String)
+
+    private fun probeSpecs(text: String?): List<ProbeSpec> = text.orEmpty().split('§').map { it.trim() }.filter { it.isNotEmpty() }.map { e ->
+        val (t, ps) = e.split('|', limit = 2).also { require(it.size == 2) { "sonda senza «|»: $e" } }
+        val points = ps.split(';').map { it.trim() }.filter { it.isNotEmpty() }.map { q ->
+            val (ref, ll) = q.split('@').also { require(it.size == 2) { "punto senza «@»: $q" } }
+            val (la, lo) = ll.split(',')
+            Triple(ref.trim(), la.trim().toDouble(), lo.trim().toDouble())
+        }
+        ProbeSpec(t.trim().replace("->", "→"), points, ps.trim())
+    }
+
     private fun usedMb(): Long { val r = Runtime.getRuntime(); return (r.totalMemory() - r.freeMemory()) / (1024 * 1024) }
 
     @Test
@@ -96,7 +127,10 @@ class AlternativesRealDiagTest {
         val tier1 = minOf(maxFactor, alt.getOrElse(2) { if (maxFactor <= 1.2) 1.1 else 1.3 })
         val sources = (System.getenv("NM_SOURCES")?.takeIf { it.isNotBlank() } ?: "motorway,penalty,crossing").split(',').map { s -> VariantSource.values().first { it.json == s.trim() } }.toSet()
         val opt = NavAlternativesOptions(count, tier1, maxFactor, 25_000, false, tier1, maxFactor, sources = sources)
-        println("varianti: count $count, livello 1 ≤ $tier1, tutte ≤ $maxFactor (tempo e km), fonti ${sources.joinToString { it.json }}; vie $viaCounts")
+        val probes = probeSpecs(System.getenv("NM_PROBES"))
+        val traceOn = System.getenv("NM_TRACE")?.trim()?.takeIf { it.isNotEmpty() }?.let { it == "1" || it.equals("true", true) } ?: probes.isNotEmpty()
+        println("varianti: count $count, livello 1 ≤ $tier1, tutte ≤ $maxFactor (tempo e km), fonti ${sources.joinToString { it.json }}; vie $viaCounts" +
+            "; traccia ${if (traceOn) "sì" else "no"}; sonde ${probes.size}")
 
         // come sul tablet: 2 posti di ricerca, un thread aiutante
         val slots = SearchSlots(2)
@@ -115,9 +149,59 @@ class AlternativesRealDiagTest {
                 "maximum_speed" to 80.0, "navmaster" to nm,
             ).apply { if (bearings != null) put("bearings", bearings.map { b -> if (b == null) emptyList<Double>() else listOf(b, 45.0) }) }
         }
-        fun request(pts: List<Pair<Double, Double>>, via: List<Boolean>, bearings: List<Double?>?, variants: Boolean): DirectionsRequest {
+        fun request(pts: List<Pair<Double, Double>>, via: List<Boolean>, bearings: List<Double?>?, variants: Boolean, o: NavAlternativesOptions = opt): DirectionsRequest {
             val r = DirectionsRequest.fromJson("driving-hgv", body(pts, via, bearings))
-            return if (variants) r.withNavAlternatives(opt) else r
+            return if (variants) r.withNavAlternatives(o) else r
+        }
+
+        /**
+         * La sonda [spec] del viaggio [pts] (un Paese): i punti agganciati agli archi col loro ref, il
+         * percorso per quei punti (i due versi di ogni carreggiata, il più leggero), stampato e
+         * giudicato sul solo migliore; null se un punto non si aggancia o nessun percorso.
+         */
+        fun probe(pts: List<Pair<Double, Double>>, spec: ProbeSpec): VariantTrace.Probe? {
+            val svc = graphs[0].service; val rg = svc.routingGraph
+            val req0 = request(pts, pts.map { false }, null, false)
+            val router = rg.router(svc.routeOptions(req0))
+            val acc = router.access(rg.encoding.shared)
+            val info = EdgeInfo(rg.graph, rg.encoding.shared, rg.guidance)
+            val tag = "sonda ${spec.name}"
+            class P(val lat: Double, val lon: Double, val bearing: Double, val ref: String, val edge: Int, val dist: Double)
+            val snapped = spec.points.map { (ref, lat, lon) ->
+                val s = rg.index.findClosest(lat, lon, EdgeFilter { e ->
+                    info.ref(e.edge) == ref && acc.filter.accept(e) && (acc.weighting.edgeWeight(e, false).isFinite() || acc.weighting.edgeWeight(e, true).isFinite())
+                }, PROBE_RINGS)
+                if (!s.isValid || s.distance > PROBE_RADIUS_M) { println("  $tag: nessun arco $ref entro ${(PROBE_RADIUS_M / 1000).toInt()} km da $lat,$lon"); return null }
+                val pl = rg.graph.fetchWayGeometry(s.edge, false, FetchMode.ALL)
+                val i = s.wayIndex.coerceIn(0, maxOf(0, pl.size - 2))
+                val b = if (pl.size < 2) 0.0 else (DistanceCalc.bearing(pl.lat(i), pl.lon(i), pl.lat(i + 1), pl.lon(i + 1)) + 360) % 360
+                P(s.snappedLat, s.snappedLon, b, ref, s.edge, s.distance)
+            }
+            val bestSolved = svc.solveAsHandled(req0, context())
+            var chosen: DirectionsService.Solved? = null; var chosenH = ""
+            val n = snapped.size
+            for (mask in 0 until (1 shl n)) {
+                val headings = snapped.mapIndexed { k, p -> if ((mask shr k) and 1 == 0) p.bearing else (p.bearing + 180) % 360 }
+                val vp = listOf(pts.first()) + snapped.map { it.lat to it.lon } + listOf(pts.last())
+                val via = vp.indices.map { it in 1 until vp.size - 1 }
+                val bearings = listOf<Double?>(null) + headings + listOf(null)
+                val sol = try { svc.solveAsHandled(request(vp, via, bearings, false), context()) } catch (e: Exception) { println("  $tag versi ${headings.map { Math.round(it) }}: ${e.javaClass.simpleName} ${e.message}"); null } ?: continue
+                println("  $tag versi ${headings.map { Math.round(it) }}: %.0f min, %.1f km, peso %.0f".format(sol.legs.sumOf { it.millis } / 60000.0, sol.legs.sumOf { it.distance } / 1000, sol.legs.sumOf { it.weight }))
+                if (chosen == null || sol.legs.sumOf { it.weight } < chosen.legs.sumOf { it.weight }) { chosen = sol; chosenH = headings.joinToString { "${Math.round(it)}°" } }
+            }
+            val sol = chosen ?: run { println("  $tag: nessun percorso"); return null }
+            val corridors = CorridorAnalyzer(rg.graph, info, rg.guidance)
+            val bestD = Draft(bestSolved.legs, VariantSource.BEST)
+            val v = Draft(sol.legs, VariantSource.PENALTY, tag = tag)
+            val judge = VariantJudge(bestD, info, corridors, opt, rg.graph)
+            val verdict = judge.evaluate(v, listOf(bestD), relaxed = false)
+            val at = snapped.mapIndexed { k, p -> "${p.ref} a %.0f m (arco ${p.edge}, preso ${info.ref(sol.snaps[k + 1].edge) ?: "senza ref"} arco ${sol.snaps[k + 1].edge})".format(p.dist) }
+            println("  $tag: punti ${at.joinToString("; ")}, versi $chosenH")
+            println("  $tag: %.0f min, %.1f km, r %.3f, km %.3f; firma %s".format(v.millis / 60000.0, v.meters / 1000, v.millis.toDouble() / bestD.millis, v.meters / bestD.meters,
+                corridors.signature(sol.legs).joinToString(" → ") { it.first + " " + Math.round(it.second) }))
+            println("  $tag: verdetto col solo migliore: " + (if (verdict.tier > 0) "livello ${verdict.tier}" + (if (verdict.reason.isNotEmpty()) " (${verdict.reason})" else "") else "scartata (${verdict.reason})") +
+                "; " + judge.explain(v, listOf(bestD), listOf("migliore")))
+            return VariantTrace.Probe(spec.name, sol.legs)
         }
 
         // i risultati delle asserzioni: per ognuna i casi e quelli falliti
@@ -150,10 +234,17 @@ class AlternativesRealDiagTest {
             val multi = countries(plainDoc) > 1
             println("  migliore in ${System.currentTimeMillis() - t0} ms: ${rc0.stats.line()}")
             val d0 = (summary(plain)["duration"] as Number).toDouble(); val l0 = (summary(plain)["distance"] as Number).toDouble()
+            // le sonde del viaggio (un Paese, due punti), poi la traccia delle varianti che le sorveglia
+            val tripName = "${placeOf(pts.first())}→${placeOf(pts.last())}"
+            val tripProbes = if (single && pts.size == 2) probes.filter { it.trip == tripName }.mapNotNull { probe(pts, it) } else emptyList()
+            // i percorsi delle sonde possono aver tolto il migliore dalla cache dei tratti (60 000 archi in
+            // tutto): di nuovo la richiesta senza varianti, perché le varianti partano come senza sonde, (e) compresa
+            if (single && pts.size == 2 && probes.any { it.trip == tripName }) handle(request(pts, via, bearings, false), context())
+            val optTrip = if (traceOn) opt.withTrace(VariantTrace(tripProbes)) else opt
             // le varianti subito dopo
             val rc = context()
             val t1 = System.currentTimeMillis()
-            val doc = try { handle(request(pts, via, bearings, true), rc) } catch (e: Exception) {
+            val doc = try { handle(request(pts, via, bearings, true, optTrip), rc) } catch (e: Exception) {
                 println("  varianti: errore ${e.javaClass.simpleName} ${e.message}")
                 check("a", false, "$name: errore delle varianti ${e.javaClass.simpleName} ${e.message}")
                 @Suppress("UNCHECKED_CAST")
@@ -191,9 +282,11 @@ class AlternativesRealDiagTest {
             val vs = fs.map { variant(it) }
             val others = vs.drop(1)
             val expected: Boolean? = when ("$from→$to") {
-                "Milano→Bologna" -> others.any { v -> "A22" in refsOf(v) || "A21" in refsOf(v) }
+                // Milano→Bologna: A21 e A22 sono oltre 1,20× (tempo o km), nessuna attesa realistica coi tetti dell'app
                 "Torino→Mestre" -> others.any { v -> "A21" in refsOf(v) }
-                "Bolzano→Milano" -> others.any { v -> "A1" in refsOf(v) }
+                // la A22 oltre Affi fino all'interconnessione con la A4 di Verona, poi tutta A4: niente SR450 né SS11
+                // (la forma con l'uscita a Peschiera e la SS11 non conta), almeno 10 km di A22 in più del migliore
+                "Bolzano→Milano" -> others.any { v -> "SR450" !in refsOf(v) && "SS11" !in refsOf(v) && kmOf(v, "A22") >= kmOf(vs[0], "A22") + 10.0 }
                 "Brescia→Milano" -> others.any { v -> "A35" in refsOf(v) }
                 "Genova→Milano" -> vs.any { v -> "A7" in refsOf(v) } && vs.any { v -> "A26" in refsOf(v) }
                 // un'altra A1 (Panoramica o Direttissima): una deviazione di almeno 20 km sulla A1
@@ -310,6 +403,9 @@ class AlternativesRealDiagTest {
     }
 
     companion object {
+        /** Il raggio di aggancio di un punto di sonda all'arco col suo ref, e gli anelli di celle dell'indice guardati al più. */
+        const val PROBE_RADIUS_M = 6_000.0
+        const val PROBE_RINGS = 60
         /** Milano→Bologna, Torino→Mestre, Bolzano→Milano, Brescia→Milano, Genova→Milano, Genova→Brescia, Soncino→Bologna, Bologna→Firenze, Verona→Torino, Milano→Roma, Milano→Bergamo e due viaggi con una tappa. */
         const val DEFAULT_TRIPS = "45.4642,9.1900;44.4949,11.3426|45.0703,7.6869;45.4847,12.2386|46.4983,11.3548;45.4642,9.1900|45.5416,10.2118;45.4642,9.1900|" +
             "44.4056,8.9463;45.4642,9.1900|44.4056,8.9463;45.5416,10.2118|45.4103,9.9428;44.4949,11.3426|44.4949,11.3426;43.7696,11.2558|45.4384,10.9916;45.0703,7.6869|" +

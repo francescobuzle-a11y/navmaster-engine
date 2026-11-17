@@ -388,6 +388,36 @@ class NavAlternativesServiceTest {
     }
 
     @Test
+    fun `the variants trace changes nothing in the answer`() {
+        var traced = 0; var printed = 0
+        for (seed in 1L..12L) {
+            val pts = Heidelberg.points(2, seed + 300)
+            val body = Heidelberg.body(pts)
+            fun run(o: NavAlternativesOptions, log: ((String) -> Unit)? = null): Map<String, Any?> {
+                val doc = DirectionsService(g).handle(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(o), ResponseFormat.GEOJSON, RequestContext(log = log, useCache = false))
+                // l'ora e il tempo della richiesta sono le uniche differenze ammesse
+                @Suppress("UNCHECKED_CAST")
+                val meta = LinkedHashMap((doc["metadata"] as Map<String, Any?>)).also { it.remove("timestamp") }; val nm = LinkedHashMap(meta["navmaster"] as Map<String, Any?>)
+                nm["alternatives"] = LinkedHashMap(nm["alternatives"] as Map<String, Any?>).also { it.remove("ms") }
+                meta["navmaster"] = nm
+                return LinkedHashMap(doc).also { it["metadata"] = meta }
+            }
+            val plain = run(opt)
+            // una sonda: il percorso per un punto in più
+            val extra = Heidelberg.points(1, seed + 900)[0]
+            val probeLegs = try { DirectionsService(g).solve(DirectionsRequest.fromJson("driving-hgv", Heidelberg.body(listOf(pts[0], extra, pts[1])))).legs } catch (e: Exception) { null }
+            val lines = ArrayList<String>()
+            val withTrace = run(opt.withTrace(VariantTrace(listOfNotNull(probeLegs?.let { VariantTrace.Probe("prova", it) }))), { lines += it })
+            assertEquals(Json.stringify(plain), Json.stringify(withTrace), "seme $seed")
+            // il primo viaggio con la traccia nel registro della prova, come esempio
+            if (lines.any { it.startsWith("varianti: traccia") }) traced++
+            if (lines.any { it.startsWith("varianti: traccia M rete") } && printed++ == 0) for (l in lines) println(l)
+            if (probeLegs != null && lines.any { it.startsWith("varianti: traccia M rete") }) assertTrue(lines.any { it.startsWith("varianti: traccia sonda prova:") }, lines.joinToString("\n"))
+        }
+        assertTrue(traced > 0, "nessuna riga di traccia")
+    }
+
+    @Test
     fun `motorway detours alone - spliced variants, no searches, off when avoiding motorways`() {
         val service = DirectionsService(g)
         val mOnly = NavAlternativesOptions(count = 3, sources = setOf(VariantSource.MOTORWAY), minDetourScale = 0.02)

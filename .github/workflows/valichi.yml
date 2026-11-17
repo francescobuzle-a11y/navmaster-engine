@@ -21,6 +21,12 @@ on:
       window:
         description: "Finestre delle ricerche di limite da provare (fattore,secondi,fattore capo,secondi capo|…); vuoto: quella del motore"
         default: ""
+      probes:
+        description: "Sonde delle varianti (viaggio|REF@lat,lon;REF@lat,lon§…, es. Torino->Mestre|A21@44.905,8.43); vuoto: nessuna"
+        default: ""
+      trace:
+        description: "Traccia delle varianti (1 accesa, 0 spenta); vuoto: accesa solo con le sonde"
+        default: ""
   push:
     branches: [main]
     paths: [".github/workflows/valichi.yml"]
@@ -64,11 +70,15 @@ jobs:
           NM_TRIPS: ${{ inputs.trips }}
           NM_AVOID: ${{ inputs.avoid }}
           NM_WINDOW: ${{ inputs.window }}
+          NM_PROBES: ${{ inputs.probes }}
+          NM_TRACE: ${{ inputs.trace }}
         run: |
           chmod +x gradlew
           [ -n "$NM_TRIPS" ] || unset NM_TRIPS
           [ -n "$NM_AVOID" ] || unset NM_AVOID
           [ -n "$NM_WINDOW" ] || unset NM_WINDOW
+          [ -n "$NM_PROBES" ] || unset NM_PROBES
+          [ -n "$NM_TRACE" ] || unset NM_TRACE
           ./gradlew --no-daemon :engine-core:test --tests "$TEST" -i 2>&1 | tee prova.log | grep -vE "^(> Task|Skipping|Caching|Resolving|Downloading|Download|Starting process|Successfully started|Finished generating)" | grep -E "^\s{4}|PASSED|FAILED|BUILD" || true
           grep -q "BUILD SUCCESSFUL" prova.log
       - name: Registro
