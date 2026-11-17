@@ -334,14 +334,19 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
      * Vero se il punto [i] della richiesta sta su una strada da evitare (il mezzo già in autostrada):
      * l'aggancio senza gli evitamenti cade su una di quelle strade e quello con il divieto cade
      * altrove, più lontano di [AVOIDED_ROAD_MARGIN] m (o non trova nulla). Falso se il punto non è
-     * in questo grafo.
+     * in questo grafo. Si guarda al più entro i 400 m di ORS ([DirectionsLimits.maximumSnappingRadius])
+     * anche con un raggio chiesto più largo: "il mezzo sta su quella strada" vale per la strada sotto
+     * il punto, non per un'autostrada a pedaggio a 2 km da una tappa di campagna (col raggio largo
+     * l'aggancio libero la trovava, quello col divieto no, e il viaggio intero passava alla penalità
+     * che agganciava la tappa sulla carreggiata dell'autostrada; ORS col divieto rifiuta il punto o
+     * lo aggancia alla strada ordinaria più lontana).
      */
     fun onAvoidedRoad(request: DirectionsRequest, i: Int): Boolean {
         if (request.avoidFeatures == 0) return false
         val (lat, lon) = request.coordinates[i]
         if (!graphs.graph.bounds.contains(lat, lon)) return false
         val o = routeOptions(request)
-        val radius = request.radiuses?.getOrNull(i)?.takeIf { it > 0 } ?: limits.maximumSnappingRadius
+        val radius = minOf(request.radiuses?.getOrNull(i)?.takeIf { it > 0 } ?: limits.maximumSnappingRadius, limits.maximumSnappingRadius)
         val heading = request.bearings?.getOrNull(i) ?: Double.NaN
         val freeOptions = o.copy(avoidFeatures = 0, avoidPenalty = 0.0)
         val free = try { snap(graphs.router(freeOptions), freeOptions, i, lat, lon, radius, true, heading) } catch (e: Exception) { return false }

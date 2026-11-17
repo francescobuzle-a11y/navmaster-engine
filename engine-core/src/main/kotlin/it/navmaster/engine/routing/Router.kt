@@ -127,15 +127,19 @@ class Router(
         if (!heading.isNaN()) {
             val withHeading = EdgeFilter { e -> snapFilter.accept(e) && headingMatches(e, lat, lon, heading) }
             for (attempt in 0 until 4) {
-                val s = index.findClosest(lat, lon, withHeading)
+                val s = index.findClosest(lat, lon, withHeading, maxDistance = minOf(maxDistance, HEADING_SNAP_DISTANCE))
                 if (!s.isValid || s.distance > minOf(maxDistance, HEADING_SNAP_DISTANCE)) break
                 if (!checkNetwork) return s
                 val small = smallNetwork(s.edge) ?: return s
                 excluded.addAll(small)
             }
         }
-        for (attempt in 0 until 8) {
-            val s = index.findClosest(lat, lon, snapFilter)
+        // le piccole reti isolate scartate prima di arrendersi: 8 entro i 400 m di ORS; con un raggio
+        // largo (una tappa in un centro chiuso ai camion: entro 5 km tratti con hgv=delivery chiusi ai
+        // due capi, piazzali, strade con maxweight in uscita) possono essere di più
+        val attempts = if (maxDistance > WIDE_SNAP_RADIUS) WIDE_SNAP_ATTEMPTS else SNAP_ATTEMPTS
+        for (attempt in 0 until attempts) {
+            val s = index.findClosest(lat, lon, snapFilter, maxDistance = maxDistance)
             if (!s.isValid || s.distance > maxDistance) break
             if (!checkNetwork) return s
             val small = smallNetwork(s.edge) ?: return s
@@ -223,6 +227,10 @@ class Router(
         /** GraphHopper `HeadingEdgeFilter`: entro 30° e 20 m. */
         const val HEADING_SNAP_TOLERANCE = 30.0
         const val HEADING_SNAP_DISTANCE = 20.0
+        /** Piccole reti isolate scartate in un aggancio entro i 400 m di ORS ([WIDE_SNAP_RADIUS]) e oltre. */
+        const val SNAP_ATTEMPTS = 8
+        const val WIDE_SNAP_ATTEMPTS = 24
+        const val WIDE_SNAP_RADIUS = 400.0
     }
 
     /**

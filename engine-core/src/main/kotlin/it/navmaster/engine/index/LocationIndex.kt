@@ -58,18 +58,24 @@ class LocationIndex private constructor(
     /**
      * Arco più vicino che passa il filtro, cercando in anelli di celle crescenti.
      * Si ferma quando l'anello successivo non può contenere nulla di più vicino, o dopo [maxRings] anelli.
+     * Con un [maxDistance] finito (il raggio di aggancio chiesto) gli anelli esplorati sono almeno
+     * quanti ne servono per coprirlo ([ringsFor], al più [MAX_RINGS]): con i 400 m di ORS restano gli
+     * 8 di sempre, con 5 km (una tappa in un centro chiuso ai camion) si arriva a 2-3 km dal punto.
+     * Oltre [maxDistance] non si cerca: un arco più lontano verrebbe comunque rifiutato.
      */
-    fun findClosest(lat: Double, lon: Double, filter: EdgeFilter = EdgeFilter.ALL, maxRings: Int = 8): Snap {
+    fun findClosest(lat: Double, lon: Double, filter: EdgeFilter = EdgeFilter.ALL, maxRings: Int = 8, maxDistance: Double = Double.POSITIVE_INFINITY): Snap {
         val snap = Snap(lat, lon)
         if (!graph.bounds.isValid || graph.edgeCount == 0) return snap
         val r0 = row(lat); val c0 = col(lon)
         val seen = IntHashSet()
         val it = graph.createEdgeIterator()
         val cellMeters = min(cellSizeLat, cellSizeLon * cos(Math.toRadians(lat))) * DistanceCalc.METERS_PER_DEGREE
-        for (ring in 0..maxRings) {
+        val rings = max(maxRings, ringsFor(maxDistance, cellMeters))
+        for (ring in 0..rings) {
             // la distanza minima a cui può stare un arco nell'anello `ring` (dal bordo della cella centrale)
             val minPossible = if (ring == 0) 0.0 else (ring - 1) * cellMeters + distanceToCellBorder(lat, lon, r0, c0)
             if (snap.distance < minPossible) break
+            if (minPossible > maxDistance) break
             var any = false
             for (r in r0 - ring..r0 + ring) {
                 if (r < 0 || r >= rows) continue
@@ -169,6 +175,17 @@ class LocationIndex private constructor(
     companion object {
         /** Passo minimo delle celle in gradi (circa 300 m in latitudine). */
         const val MIN_CELL_DEG = 0.0027
+        /** Tetto agli anelli esplorati per un raggio chiesto (celle da 300 m: oltre 19 km). */
+        const val MAX_RINGS = 64
+
+        /**
+         * Gli anelli che coprono [maxDistance] metri con celle da [cellMeters] (uno in più perché il
+         * punto può stare al bordo della sua cella), al più [MAX_RINGS]; 0 senza un raggio finito.
+         */
+        fun ringsFor(maxDistance: Double, cellMeters: Double): Int {
+            if (!maxDistance.isFinite() || maxDistance <= 0 || cellMeters <= 0) return 0
+            return min(MAX_RINGS.toDouble(), kotlin.math.ceil(maxDistance / cellMeters) + 1).toInt()
+        }
 
         /** Carica l'indice salvato, se esiste e corrisponde al grafo. */
         fun load(graph: BaseGraph, dir: it.navmaster.engine.storage.GraphDirectory): LocationIndex? {

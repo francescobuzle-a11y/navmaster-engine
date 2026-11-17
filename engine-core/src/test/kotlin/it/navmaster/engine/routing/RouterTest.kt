@@ -154,6 +154,57 @@ class RouterTest {
     }
 
     @Test
+    fun `snap radius of 400 m explores the rings of always`() {
+        // con il raggio ORS di 400 m l'indice risponde come senza raggio (parità ORS): stesso arco,
+        // stessa distanza, su punti in città e in collina
+        val filter = EdgeFilterFactory.create(encoding, "heavyvehicle", 0, params = null)
+        var lat = 49.37; var compared = 0
+        while (lat < 49.45) {
+            var lon = 8.62
+            while (lon < 8.78) {
+                val a = index.findClosest(lat, lon, filter)
+                val b = index.findClosest(lat, lon, filter, maxDistance = 400.0)
+                if (a.isValid && a.distance <= 400.0) {
+                    assertEquals(a.edge, b.edge, "arco diverso in (%.3f, %.3f)".format(lat, lon)); assertEquals(a.distance, b.distance, 1e-9); compared++
+                } else assertTrue(!b.isValid || b.distance > 400.0)
+                lon += 0.01
+            }
+            lat += 0.01
+        }
+        assertTrue(compared > 50, "confrontati $compared punti")
+        for ((la, lo) in listOf(bismarckplatz, hauptbahnhof, ziegelhausen)) {
+            val a = router("heavyvehicle").snap(la, lo, 400.0, 0); val b = router("heavyvehicle").snap(la, lo, 5000.0, 0)
+            assertEquals(a.edge, b.edge); assertEquals(a.distance, b.distance, 1e-9)
+        }
+        // gli anelli dal raggio: 400 m con celle da 195 m non superano gli 8 di sempre, 5 km ne chiedono 27, il tetto è 64
+        assertTrue(LocationIndex.ringsFor(400.0, 195.0) <= 8)
+        assertEquals(27, LocationIndex.ringsFor(5000.0, 195.0))
+        assertEquals(LocationIndex.MAX_RINGS, LocationIndex.ringsFor(50_000.0, 195.0))
+        assertEquals(0, LocationIndex.ringsFor(Double.POSITIVE_INFINITY, 195.0))
+        // le piccole reti scartate: 8 entro i 400 m di ORS, di più solo con un raggio largo
+        assertEquals(8, Router.SNAP_ATTEMPTS)
+        assertEquals(400.0, Router.WIDE_SNAP_RADIUS)
+        assertTrue(Router.WIDE_SNAP_ATTEMPTS > Router.SNAP_ATTEMPTS)
+    }
+
+    @Test
+    fun `a point 2 km from a truck road is snapped with a 5 km radius`() {
+        // nel bosco a est della città: nessuna strada per il camion entro 400 m, la più vicina a circa 1,9 km
+        val far = 49.36757 to 8.82347
+        val r = router("heavyvehicle")
+        val ex = assertFailsWith<PointNotFoundException> { r.snap(far.first, far.second, 400.0, 2) }
+        assertEquals(2, ex.pointIndex)
+        assertFailsWith<PointNotFoundException> { r.snap(far.first, far.second, 1000.0, 2) }
+        val s = r.snap(far.first, far.second, 5000.0, 2)
+        assertTrue(s.isValid)
+        assertTrue(s.distance in 1000.0..3000.0, "agganciato a ${s.distance} m")
+        assertTrue(DistanceCalc.planeDistance(far.first, far.second, s.snappedLat, s.snappedLon) in 1000.0..3000.0)
+        // e da lì un percorso fino in città
+        val path = r.route(r.snap(bismarckplatz.first, bismarckplatz.second, 400.0, 0), s)
+        assertTrue(path.distance > 5000)
+    }
+
+    @Test
     fun `same point gives empty route`() {
         val r = router("car-ors")
         val s = r.snap(bismarckplatz.first, bismarckplatz.second, 400.0, 0)
