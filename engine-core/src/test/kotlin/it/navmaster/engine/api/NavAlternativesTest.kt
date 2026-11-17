@@ -2,6 +2,7 @@ package it.navmaster.engine.api
 
 import it.navmaster.engine.RouteOptions
 import it.navmaster.engine.routing.CancelToken
+import it.navmaster.engine.routing.Circle
 import it.navmaster.engine.routing.CorridorAnalyzer
 import it.navmaster.engine.routing.Detour
 import it.navmaster.engine.routing.DetourSearch
@@ -262,8 +263,9 @@ class VariantRulesTest {
         val b = plain.take(100)
         val best = path(b)
         val j = judge(best)
-        // 10 km di deviazione: sotto dMin1 (15 km), livello 2
-        assertEquals(2, j.evaluate(replace(b, 30, 39, plain.subList(200, 210), 40_000), listOf(best), false).tier)
+        // 10 km di deviazione: sotto dMin1 (15 km), scartata a ogni livello (prima era di livello 2)
+        val short = j.evaluate(replace(b, 30, 39, plain.subList(200, 210), 40_000), listOf(best), true)
+        assertEquals(0, short.tier); assertEquals("diversità", short.reason)
         // un anello di 30 km fra due archi vicini: scartato per la sanità locale
         val loop = replace(b, 50, 51, plain.subList(300, 330), 36_000)
         val v = j.evaluate(loop, listOf(best), true)
@@ -276,6 +278,142 @@ class VariantRulesTest {
         val near = replace(b, 30, 59, plain.subList(100, 128) + plain.subList(400, 402), 40_000)
         val nv = j.evaluate(near, listOf(best, good), false)
         assertEquals(0, nv.tier); assertEquals("diversità", nv.reason)
+    }
+
+    @Test
+    fun `every tier asks for a deviation of dMin1, in scale on Heidelberg`() {
+        val b = plain.take(100)
+        val best = path(b)
+        // 10 km, +40 s: un giro di città, non un'alternativa (dMin1 di 100 km: 15 km), anche al livello 3
+        val short = replace(b, 30, 39, plain.subList(200, 210), 40_000)
+        for (relaxed in listOf(false, true)) {
+            val v = judge(best, NavAlternativesOptions(fill = true)).evaluate(short, listOf(best), relaxed)
+            assertEquals(0, v.tier, "relaxed $relaxed"); assertEquals("diversità", v.reason)
+        }
+        // in scala 0,5 (Heidelberg) dMin1 è 7,5 km: la stessa deviazione è un'alternativa di livello 1
+        assertEquals(1, judge(best, NavAlternativesOptions(minDetourScale = 0.5)).evaluate(short, listOf(best), false).tier)
+        // livello 2 (oltre 1,10 in tempo, entro 1,20): 15 km (dMin1) sì, 14 km no
+        val t = NavAlternativesOptions(tier1Factor = 1.1, maxFactor = 1.2, tier1KmFactor = 1.1, maxKmFactor = 1.2)
+        val at = replace(b, 30, 44, plain.subList(200, 215), 66_000)      // +450 s, r 1.125
+        assertEquals(2, judge(best, t).evaluate(at, listOf(best), false).tier)
+        val under = replace(b, 30, 43, plain.subList(200, 214), 69_000)   // +462 s, r 1.128
+        val u = judge(best, t).evaluate(under, listOf(best), false)
+        assertEquals(0, u.tier); assertEquals("diversità", u.reason)
+        // dal tenuto più vicino: 15 km dal migliore ma 5 km da una tenuta che ne fa 10 uguali, scartata
+        val kept = replace(b, 30, 44, plain.subList(200, 210) + plain.subList(600, 605), 66_000)
+        val near = replace(b, 30, 44, plain.subList(200, 210) + plain.subList(700, 705), 66_000)
+        assertEquals("diversità", judge(best, t).evaluate(near, listOf(best, kept), false).reason)
+    }
+
+    @Test
+    fun `titles name the roads the best does not use, never a tunnel, never twice the same`() {
+        assertTrue(a5.size >= 40, "archi A5: ${a5.size}")
+        assertTrue(l536.size >= 6, "archi L536: ${l536.size}")
+        val b = a5.take(10) + plain.take(90)
+        val best = path(b)
+        val j = judge(best)
+        // l'A5 di nuovo, altrove: il migliore la usa già → la strada e «altro tracciato» (prima «via A5», come il migliore)
+        val again = replace(b, 40, 69, a5.subList(10, 40), 37_000)
+        assertEquals("via A5, altro tracciato", j.title(again))
+        val withL = replace(b, 40, 69, l536.take(6) + plain.subList(500, 524), 37_000)
+        assertEquals("via L536", j.title(withL))
+        // due varianti con la stessa strada nuova: la seconda col km dove esce dal migliore
+        val withL2 = replace(b, 75, 99, l536.take(6) + plain.subList(600, 619), 37_000)
+        assertEquals(listOf("via L536", "via L536, dal km 75"), j.titles(listOf(withL, withL2)))
+        // tre strade che il migliore non usa: nel titolo prima quella che l'altra variante non ha
+        val refs = (0 until g.graph.edgeCount).filter { !info.isMotorwayOrTrunk(it) && info.ref(it) != null }.groupBy { info.ref(it)!! }
+            .filter { it.value.size >= 6 }.keys.sorted().take(3)
+        println("tre strade su Heidelberg: $refs")
+        if (refs.size == 3) {
+            fun six(r: String) = (0 until g.graph.edgeCount).filter { info.ref(it) == r }.take(6)
+            val bp = plain.take(100); val bestP = path(bp); val jp = judge(bestP)
+            val three = replace(bp, 10, 39, six(refs[0]) + six(refs[1]) + six(refs[2]) + plain.subList(500, 512), 37_000)
+            val two = replace(bp, 60, 89, six(refs[0]) + six(refs[1]) + plain.subList(600, 618), 37_000)
+            assertEquals("via ${refs[0]} + ${refs[1]}", jp.title(three))
+            assertEquals(listOf("via ${refs[0]} + ${refs[2]}", "via ${refs[0]} + ${refs[1]}"), jp.titles(listOf(three, two)))
+        }
+        // il tratto deviato più lungo con poco ref: né un raccordo di 2 km su 30 né 1 km dell'A5 del
+        // migliore danno il titolo (prima «via L536», «via A5, altro tracciato»): il nome della strada o «altro tracciato»
+        val bit = replace(b, 40, 69, plain.subList(700, 714) + l536.take(2) + plain.subList(714, 728), 37_000)
+        val bitT = j.title(bit)
+        assertTrue("L536" !in bitT && "A5" !in bitT, bitT)
+        val crossA5 = replace(b, 40, 69, plain.subList(800, 814) + a5.subList(10, 11) + plain.subList(814, 829), 37_000)
+        val crossT = j.title(crossA5)
+        assertTrue("A5" !in crossT && !VariantRules.isStructureName(crossT.removePrefix("via ")), crossT)
+        // per un titolo ripetuto non si aggiunge una strada che il migliore usa (l'A5): il km
+        val withLA5 = replace(b, 40, 69, l536.take(6) + a5.subList(10, 13) + plain.subList(500, 521), 37_000)
+        assertEquals(listOf("via L536", "via L536, dal km 40"), j.titles(listOf(withL2, withLA5)))
+        // una strada nuova solo sua, prima della L536 lungo la strada: aggiunta al suo posto
+        val other = (0 until g.graph.edgeCount).filter { !info.isMotorwayOrTrunk(it) && info.ref(it) != null && info.ref(it) !in setOf("L536", "A5") }
+            .groupBy { info.ref(it)!! }.filter { it.value.size >= 2 }.entries.firstOrNull()
+        if (other != null) {
+            val withXL = replace(b, 40, 69, plain.subList(900, 905) + other.value.take(2) + l536.take(6) + plain.subList(905, 922), 37_000)
+            assertEquals(listOf("via L536", "via ${other.key} + L536"), j.titles(listOf(withL2, withXL)))
+        }
+        // gallerie e ponti
+        for (n in listOf("Galleria Monte Sperone", "Viadotto del Ponte all'Indiano", "Ponte Vecchio", "Gotthardtunnel", "Traforo del Frejus")) assertTrue(VariantRules.isStructureName(n), n)
+        for (n in listOf("Tangenziale Sud", "Via Galleria Mazzini", "Viale XI Agosto", "Pontebbana")) assertTrue(!VariantRules.isStructureName(n), n)
+        // titoli tutti diversi, anche dal migliore
+        assertEquals(listOf("via A1, dal km 7", "via A1 (2)", "via A1 (3)"),
+            VariantRules.distinct(listOf("via A1", "via A1", "via A1"), { listOf("via A1, dal km 7") }, listOf("via A1")))
+        assertEquals(listOf("via A24", "via A50 + A24"), VariantRules.distinct(listOf("via A24", "via A50 + A24"), { emptyList() }, listOf("via A1")))
+        assertEquals("dal km 75", VariantRules.fromKm(74.6)); assertEquals("dalla partenza", VariantRules.fromKm(0.4))
+    }
+
+    /** I nodi del grafo entro [r] metri da (lat, lon) e quelli oltre [far] metri, al più [n] per gruppo. */
+    private fun nodesAround(lat: Double, lon: Double, r: Double, far: Double, n: Int): Pair<List<Int>, List<Int>> {
+        val near = ArrayList<Int>(); val away = ArrayList<Int>()
+        val bg = g.graph
+        for (k in 0 until bg.nodeCount) {
+            val d = it.navmaster.engine.util.DistanceCalc.haversine(lat, lon, bg.lat(k), bg.lon(k))
+            if (d <= r && near.size < n) near += k else if (d >= far && away.size < n) away += k
+            if (near.size >= n && away.size >= n) break
+        }
+        return near to away
+    }
+
+    @Test
+    fun `a variant only around the start or the end comes after the corridor ones`() {
+        val bg = g.graph
+        val c = bg.nodeCount / 2
+        val (near, away) = nodesAround(bg.lat(c), bg.lon(c), 1_500.0, 6_000.0, 30)
+        assertTrue(near.size == 30 && away.size == 30, "nodi vicini ${near.size}, lontani ${away.size}")
+        val circle = Circle(bg.lat(c), bg.lon(c), 2_000.0)
+        val b = plain.take(100)
+        val best = Draft(listOf(leg(b)), VariantSource.BEST)
+        fun judgeC(cs: List<Circle>) = VariantJudge(best, info, CorridorAnalyzer(g.graph, info, g.guidance), NavAlternativesOptions(count = 3), g.graph, circles = cs)
+        // 30 km nuovi fra le posizioni 30 e 59, coi nodi d'arrivo [nodes]; [msEach] per arco
+        fun variant(from: Int, ids: List<Int>, nodes: List<Int>, msEach: Long) = Draft(listOf(leg(b.subList(0, from) + ids + b.subList(from + ids.size, 100),
+            { i -> if (i in from until from + ids.size) msEach else 36_000L },
+            { i -> if (i in from until from + ids.size) (if (i == from) i else nodes[i - from - 1]) to nodes[i - from] else i to i + 1 })), VariantSource.MOTORWAY)
+        val local = variant(30, plain.subList(100, 130), near, 37_000)
+        val corridor = variant(60, plain.subList(200, 230), away, 38_000)
+        val j = judgeC(listOf(circle))
+        assertTrue(j.localOnly(local)); assertTrue(!j.localOnly(corridor))
+        // senza cerchi (un ricalcolo in marcia, agganciato all'autostrada) nessuna è solo locale
+        assertTrue(!judgeC(emptyList()).localOnly(variant(30, plain.subList(100, 130), near, 37_000)))
+        // un'autostrada che il migliore non usa non è un giro locale, anche dentro il cerchio
+        assertTrue(a5.size >= 30, "archi A5: ${a5.size}")
+        assertTrue(!j.localOnly(variant(30, a5.take(30), near, 37_000)))
+        // la scelta: la locale ha il punteggio migliore ma viene dopo; resta se non c'è altro
+        val vl = j.evaluate(local, listOf(best), false); val vc = j.evaluate(corridor, listOf(best), false)
+        assertEquals(1, vl.tier); assertEquals(1, vc.tier); assertTrue(vl.local && !vc.local); assertTrue(vl.score < vc.score)
+        val pool = VariantPool(j, NavAlternativesOptions(count = 3))
+        pool.drafts += local; pool.drafts += corridor
+        pool.admit(1)
+        assertEquals(listOf(corridor), pool.accepted.map { it.first })
+        pool.admit(2, local = true)
+        assertEquals(listOf(corridor, local), pool.accepted.map { it.first })
+        // l'ordine della risposta: una solo locale di livello 1 dopo una di corridoio di livello 2
+        pool.accepted.clear()
+        pool.accepted += corridor to Verdict(2, "", vc.dMaxM, emptyList(), "", vc.score)
+        pool.accepted += local to vl
+        assertEquals(listOf(corridor, local), pool.ordered().map { it.first })
+        // senza solo locali: per livello, poi nell'ordine di presa
+        pool.accepted.clear()
+        pool.accepted += corridor to Verdict(2, "", vc.dMaxM, emptyList(), "", vc.score)
+        pool.accepted += local to Verdict(1, "", vl.dMaxM, emptyList(), "", vl.score)
+        assertEquals(listOf(local, corridor), pool.ordered().map { it.first })
     }
 
     private fun leg(ids: List<Int>, ms: (Int) -> Long = { 36_000L }, nodes: (Int) -> Pair<Int, Int> = { i -> i to i + 1 }) =
@@ -443,6 +581,9 @@ class NavAlternativesServiceTest {
                 assertTrue(((props["summary"] as Map<*, *>)["duration"] as Double) <= 1.5 * d0 + 1)
             }
             variants += fs.size - 1
+            // i titoli tutti diversi (il migliore compreso)
+            val titles = fs.map { ((it["properties"] as Map<*, *>)["navmaster"] as Map<*, *>).let { nm -> (nm["variant"] as Map<*, *>)["label"] as String } }
+            assertEquals(titles.size, titles.toSet().size, titles.toString())
             val meta = ((doc["metadata"] as Map<*, *>)["navmaster"] as Map<*, *>)["alternatives"] as Map<*, *>
             assertEquals(3, meta["asked"]); assertEquals(fs.size, meta["found"])
             println("varianti $n punti pass_through=$pt seme $seed: ${fs.size - 1} (${meta["candidates"]}; ${meta["note"]})")
@@ -724,8 +865,9 @@ class NavAlternativesBudgetTest {
             assertTrue("non valutati ${r.variants.size}" in pool.discards(expired), pool.discards(expired))
             assertEquals(SearchCancelledException.Reason.CANCELLED,
                 assertFailsWith<SearchCancelledException> { pool.discards(CancelToken().also { it.cancel() }) }.reason)
-            // senza scadenza la scelta riprende da lì
+            // senza scadenza la scelta riprende da lì (come nel motore: poi le varianti solo locali, se ne mancano)
             pool.admit(2)
+            pool.admit(2, local = true)
             assertTrue(pool.accepted.isNotEmpty(), "seme $seed")
             assertTrue("non valutati" !in pool.discards())
             if (++checked >= 3) break

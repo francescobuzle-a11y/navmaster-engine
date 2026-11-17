@@ -144,8 +144,13 @@ internal class Draft(val legs: List<RoutePath>, val source: VariantSource, val d
     @Volatile var verdict: Verdict? = null
     /** I fatti per le regole, calcolati una volta ([VariantJudge.facts]). */
     internal var facts: DraftFacts? = null
-    /** L'etichetta senza strade nuove (la strada principale della deviazione più lunga), letta una volta. */
-    internal var roadLabel: String? = null
+    /** Il titolo senza gli altri tenuti ([VariantJudge.title]: le strade che il migliore non usa, o la strada del tratto deviato), letto una volta. */
+    internal var baseTitle: String? = null
+    /** Solo locale ([VariantJudge.localOnly]), calcolato una volta (legge le coordinate di pochi nodi). */
+    internal var localOnly: Boolean? = null
+
+    /** Il nodo d'arrivo dell'arco in posizione [i] di [edgeIds]. */
+    fun nodeAt(i: Int): Int { val j = legAt(i); return legs[j].edges[i - legStart[j]].adjNode }
 }
 
 /**
@@ -179,7 +184,11 @@ internal class DraftFacts(private val edges: IntArray, val refMeters: IntDoubleH
  * [reason]: tempo, km, diversità, locale, doppione, autostrade); [dMaxM]: la deviazione più lunga
  * dal tenuto più vicino; [newRefs]: le strade (ref) che nessun tenuto usa; [label]: «via A21».
  */
-internal class Verdict(val tier: Int, val reason: String, val dMaxM: Double, val newRefs: List<String>, val label: String, val score: Double = 0.0)
+internal class Verdict(val tier: Int, val reason: String, val dMaxM: Double, val newRefs: List<String>, val label: String, val score: Double = 0.0,
+                       /** Solo locale ([VariantJudge.localOnly]): nella scelta dopo tutte le altre. */
+                       val local: Boolean = false) {
+    fun withLabel(l: String) = Verdict(tier, reason, dMaxM, newRefs, l, score, local)
+}
 
 /** Un tratto contiguo di una variante fuori dagli archi di un altro percorso. */
 internal class Run(val from: Int, val to: Int, val meters: Double, val ms: Long, val mwMeters: Double, val motMeters: Double = 0.0) {
@@ -220,16 +229,19 @@ internal object VariantRules {
     /** Il migliore è «autostradale» (≥ 30 % autostrada o superstrada): una variante deve deviare su autostrada o cambiare firma. */
     const val MW_BEST_SHARE = 0.3
     const val MW_RUN_SHARE = 0.6
-    // livello 2
-    const val T2_D = 0.6
+    // livello 2 (la deviazione minima è dMin1 a ogni livello: una variante deve essere un'alternativa riconoscibile)
     const val T2_RUN_MS = 180_000L
     const val T2_A = 1.8
     const val T2_B_MS = 900_000L
     // livello 3
-    const val T3_D = 0.3
-    const val T3_D_MIN = 5_000.0
     const val T3_A = 2.0
     const val T3_B_MS = 1_200_000L
+    /**
+     * Le deviazioni più corte cercate dalla fonte M: max(5 km, 0,3·dMin1), in scala. Da sole non
+     * bastano (ogni livello chiede dMin1), servono nelle combinazioni (due cambi di autostrada).
+     */
+    const val SEARCH_D = 0.3
+    const val SEARCH_D_MIN = 5_000.0
     /** Una strada «nuova» ha almeno 5 km nella variante e meno di 1 km in ogni tenuto. */
     const val NEW_REF_M = 5_000.0
     const val ABSENT_REF_M = 1_000.0
@@ -259,6 +271,36 @@ internal object VariantRules {
     const val MW_SWAP_BONUS = 0.04
     /** Il bonus delle combinazioni solo se la quota autostradale persa ([MW_SWAP_BONUS]) non supera questa. */
     const val COMBO_MAX_LOSS = 0.1
+    /**
+     * Una variante «solo locale» ([VariantJudge.localOnly]): ogni tratto deviato di almeno
+     * [LOCAL_RUN_M] dentro i cerchi d'accesso dei punti (controllato ogni [LOCAL_SAMPLE_M] di strada),
+     * nessuna autostrada che il migliore non usa e un guadagno di quota autostradale sotto
+     * [LOCAL_MAX_GAIN]: un giro diverso per uscire dalla città, non un altro corridoio.
+     */
+    const val LOCAL_RUN_M = 1_000.0
+    const val LOCAL_SAMPLE_M = 1_000.0
+    const val LOCAL_MAX_GAIN = 0.1
+
+    /** I nomi di gallerie e ponti (mai nel titolo di una variante se c'è un'altra strada). */
+    private val STRUCTURE = Regex("^(galleria|ponte|viadotto|traforo|sottopasso|sovrappasso|cavalcavia|tunnel)\\b|(tunnel|brücke|bruecke)$", RegexOption.IGNORE_CASE)
+    fun isStructureName(n: String): Boolean = STRUCTURE.containsMatchIn(n.trim())
+
+    /** Dove una deviazione esce dal migliore, per distinguere due titoli: «dal km 75», «dalla partenza» (km 0). */
+    fun fromKm(km: Double): String = Math.round(km).let { if (it == 0L) "dalla partenza" else "dal km $it" }
+
+    /**
+     * Titoli tutti diversi: [titles] nell'ordine, e per un titolo già usato (anche in [taken]) la
+     * prima delle sue alternative [alternatives] libera, se no un numero ("via A1 (2)").
+     */
+    fun distinct(titles: List<String>, alternatives: (Int) -> List<String>, taken: Collection<String> = emptyList()): List<String> {
+        val used = HashSet<String>(taken)
+        return titles.mapIndexed { i, t ->
+            val pick = if (t !in used) t else alternatives(i).firstOrNull { it !in used }
+                ?: generateSequence(2) { it + 1 }.map { "$t ($it)" }.first { it !in used }
+            used += pick
+            pick
+        }
+    }
 }
 
 /**
@@ -266,10 +308,12 @@ internal object VariantRules {
  * (classe e ref degli archi, firma), le ancore dei tratti deviati sul migliore, la validità.
  * [router], [request] e [snaps] servono ai controlli di validità (svolte, verso ai punti di passaggio).
  * [trip]: un pezzo di un viaggio tra Paesi, tempi e km si confrontano sul viaggio intero.
+ * [circles]: i cerchi d'accesso dei punti ([accessCircles]): una variante che devia solo lì è «solo locale» ([localOnly]).
  */
 internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private val corridors: CorridorAnalyzer, private val opt: NavAlternativesOptions,
                             private val graph: BaseGraph, private val router: Router? = null, private val request: DirectionsRequest? = null,
-                            private val snaps: List<Snap>? = null, val trip: TripContext = TripContext.NONE) {
+                            private val snaps: List<Snap>? = null, val trip: TripContext = TripContext.NONE,
+                            private val circles: List<Circle> = emptyList()) {
     /** Durata e metri del viaggio del migliore (con gli altri pezzi di un viaggio tra Paesi). */
     val tripMillis: Long get() = best.millis + trip.extraMillis
     val tripMeters: Double get() = best.meters + trip.extraMeters
@@ -310,6 +354,10 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
     }
 
     private val scale = opt.minDetourScale
+    private companion object {
+        /** Una strada sotto i 5 km nel titolo solo con almeno questa quota di un tratto deviato ([titleRefs]). */
+        const val TITLE_RUN_SHARE = 0.2
+    }
     val tier1Factor: Double get() = opt.tier1Factor
     val bestMwShare: Double get() = facts(best).mwMeters / maxOf(1.0, best.meters)
 
@@ -423,19 +471,21 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
         val majorB = runsB.maxByOrNull { it.meters }!!
         val mwOk = bestMwShare < VariantRules.MW_BEST_SHARE || majorB.mwShare >= VariantRules.MW_RUN_SHARE || !sameSignature
         val newRefs = newRefs(v, kept)
+        // a ogni livello la deviazione più lunga dal tenuto più vicino almeno dMin1 (in scala): un'alternativa riconoscibile
+        val diverse = dMax >= d1
         val tier1Time = (r <= opt.tier1Factor && rk <= opt.tier1KmFactor) || (opt.allowFewerKm && rk < 1.0 && r <= opt.maxFactor)
-        val tier1Rest = dMax >= d1 && majorMs >= VariantRules.T1_RUN_MS * scale && sane(runsB, VariantRules.T1_A, VariantRules.T1_B_MS)
+        val tier1Rest = diverse && majorMs >= VariantRules.T1_RUN_MS * scale && sane(runsB, VariantRules.T1_A, VariantRules.T1_B_MS)
         val score = score(v, r, rk, newRefs, runsB, d1)
-        fun ok(tier: Int, reason: String = "") = Verdict(tier, reason, dMax, newRefs, label(v, newRefs, majorB), score)
+        fun ok(tier: Int, reason: String = "") = Verdict(tier, reason, dMax, newRefs, title(v), score, localOnly(v, runsB, d1))
         if (tier1Time && tier1Rest && mwOk) return ok(1)
         val withinMax = r <= opt.maxFactor && (rk <= opt.maxKmFactor || (opt.allowFewerKm && rk < 1.0))
         if (tier1Time && tier1Rest) return ok(2, "autostrade")
-        if (withinMax && dMax >= VariantRules.T2_D * d1 && majorMs >= VariantRules.T2_RUN_MS * scale && sane(runsB, VariantRules.T2_A, VariantRules.T2_B_MS)) return ok(2)
-        if (relaxed && opt.fill && withinMax && dMax >= maxOf(VariantRules.T3_D_MIN * scale, VariantRules.T3_D * d1) && sane(runsB, VariantRules.T3_A, VariantRules.T3_B_MS)) return ok(3)
+        if (withinMax && diverse && majorMs >= VariantRules.T2_RUN_MS * scale && sane(runsB, VariantRules.T2_A, VariantRules.T2_B_MS)) return ok(2)
+        if (relaxed && opt.fill && withinMax && diverse && sane(runsB, VariantRules.T3_A, VariantRules.T3_B_MS)) return ok(3)
         val reason = when {
             r > opt.maxFactor -> "tempo"
             !withinMax -> "km"
-            dMax < VariantRules.T3_D * d1 || majorMs < VariantRules.T2_RUN_MS * scale -> "diversità"
+            !diverse || majorMs < VariantRules.T2_RUN_MS * scale -> "diversità"
             !sane(runsB, VariantRules.T2_A, VariantRules.T2_B_MS) -> "locale"
             else -> "diversità"
         }
@@ -487,12 +537,13 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
         val mwOk = bestMwShare < VariantRules.MW_BEST_SHARE || majorB.mwShare >= VariantRules.MW_RUN_SHARE || !sameSignature
         sb.append("; autostrade ${yn(mwOk)} (migliore %.0f %% MW, tratto maggiore %.0f %% MW, stessa firma ${yn(sameSignature)})".format(bestMwShare * 100, majorB.mwShare * 100))
         val withinMax = r <= opt.maxFactor && (rk <= opt.maxKmFactor || (opt.allowFewerKm && rk < 1.0))
-        sb.append("; L2: entro ${yn(withinMax)} (≤ %.2f/%.2f)".format(opt.maxFactor, opt.maxKmFactor)).append(", dMax ≥ 0,6·d1 ${yn(dMax >= VariantRules.T2_D * d1)}, corsa ≥ 180 s ${yn(majorMs >= VariantRules.T2_RUN_MS * scale)}, sana 1,8·+900 s ")
+        sb.append("; L2: entro ${yn(withinMax)} (≤ %.2f/%.2f)".format(opt.maxFactor, opt.maxKmFactor)).append(", dMax ≥ d1 ${yn(dMax >= d1)}, corsa ≥ 180 s ${yn(majorMs >= VariantRules.T2_RUN_MS * scale)}, sana 1,8·+900 s ")
             .append(worst(VariantRules.T2_A, VariantRules.T2_B_MS))
         val nr = newRefs(v, kept)
         val score = score(v, r, rk, nr, runsB, d1)
         sb.append("; strade nuove ").append(nr.ifEmpty { listOf("nessuna") }.joinToString(" ")).append(" (autostrade ").append(motorwayRefs(v, nr).ifEmpty { listOf("nessuna") }.joinToString(" "))
-            .append("), guadagno autostradale %.2f, perdita %.2f, parti ${v.parts}, punteggio %.3f; firma ".format(motorwayGain(runsB, d1), motorwayGain(runsB, d1, loss = true), score))
+            .append("), guadagno autostradale %.2f, perdita %.2f, parti ${v.parts}, punteggio %.3f".format(motorwayGain(runsB, d1), motorwayGain(runsB, d1, loss = true), score))
+            .append(if (circles.isEmpty()) "" else "; solo locale ${yn(localOnly(v, runsB, d1))}").append("; titolo «${title(v)}»; firma ")
             .append(f.signature.joinToString(" ") { it.first + " %.0f".format(it.second) })
         return sb.toString()
     }
@@ -556,24 +607,141 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
         return out
     }
 
-    /** «via A21», «via A4 + A22»; senza strade nuove la strada principale del tratto deviato più lungo («via SS9»). */
-    fun label(v: Draft, newRefs: List<String>, major: Run): String {
-        if (newRefs.size >= 2) return "via ${newRefs[0]} + ${newRefs[1]}"
-        if (newRefs.size == 1) return "via ${newRefs[0]}"
-        v.roadLabel?.let { return it }
-        return roadLabel(v, major).also { v.roadLabel = it }
+    /**
+     * Le strade (ref) di [v] che il migliore non usa: almeno [minM] metri in [v] e meno di 1 km nel
+     * migliore, nell'ordine di [v] (dalla firma). Solo RAM (i fatti delle bozze).
+     */
+    fun refsNotInBest(v: Draft, minM: Double = VariantRules.NEW_REF_M): List<String> {
+        val f = facts(v); val fb = facts(best)
+        val out = ArrayList<String>()
+        for ((ref, _) in f.signature) {
+            if (ref in out) continue
+            val id = info.idOf(ref)
+            if (id < 0 || f.refMeters.getOrDefault(id, 0.0) < minM) continue
+            if (fb.refMeters.getOrDefault(id, 0.0) < VariantRules.ABSENT_REF_M) out += ref
+        }
+        return out
     }
 
-    private fun roadLabel(v: Draft, major: Run): String {
+    /**
+     * Le strade per il titolo: [refsNotInBest]; se nessuna ha 5 km, quelle che il migliore non usa
+     * con almeno 1 km e un quinto di un tratto deviato (la SR62, 4 km su 16), non un raccordo di 2 km
+     * in una deviazione di 34.
+     */
+    private fun titleRefs(v: Draft): List<String> {
+        val refs = refsNotInBest(v)
+        if (refs.isNotEmpty()) return refs
+        val fb = facts(best)
+        val out = ArrayList<String>()
+        for (r in runsFromBest(v)) {
+            val m = LinkedHashMap<Int, Double>()
+            for (i in r.from..r.to) { val id = info.refId(v.edgeIds[i]); if (id >= 0) m.merge(id, v.edgeM[i], Double::plus) }
+            for ((id, mm) in m) if (mm >= maxOf(VariantRules.ABSENT_REF_M, TITLE_RUN_SHARE * r.meters) && fb.refMeters.getOrDefault(id, 0.0) < VariantRules.ABSENT_REF_M) {
+                val name = info.refName(id)
+                if (name !in out) out += name
+            }
+        }
+        return out
+    }
+
+    /**
+     * Il titolo di [v]: le strade che il migliore non usa ([titleRefs]), al più due nell'ordine della
+     * strada, prima quelle che nessuno di [others] usa («via A24», «via A50 + A24»); se il migliore
+     * le usa già tutte, la strada (ref) del tratto deviato più lungo «via A1, altro tracciato», o il
+     * suo nome se non ha ref (mai una galleria o un ponte), o «altro tracciato». Senza [others]
+     * letto una volta per bozza (i nomi sono letture del grafo).
+     */
+    fun title(v: Draft, others: List<Draft> = emptyList()): String {
+        val base = v.baseTitle ?: titleRefs(v).let { refs -> if (refs.isNotEmpty()) "via " + refs.take(2).joinToString(" + ") else roadTitle(v) }.also { v.baseTitle = it }
+        if (others.isEmpty()) return base
+        val refs = titleRefs(v)
+        if (refs.size <= 2) return base
+        val own = refs.filter { ref -> val id = info.idOf(ref); others.all { o -> facts(o).refMeters.getOrDefault(id, 0.0) < VariantRules.ABSENT_REF_M } }
+        val pick = (own + refs.filter { it !in own }).take(2).toSet()
+        return "via " + refs.filter { it in pick }.joinToString(" + ")
+    }
+
+    /**
+     * Il titolo quando [titleRefs] è vuoto: la strada (ref) del tratto deviato più lungo, se copre
+     * almeno 1 km e un quinto del tratto come in [titleRefs] («via A1, altro tracciato» se il migliore
+     * la usa già), se no il nome più lungo del tratto (mai una galleria o un ponte), se no «altro
+     * tracciato»: non un raccordo di 2 km in una deviazione di 34, non 80 m della SS9 attraversata.
+     */
+    private fun roadTitle(v: Draft): String {
+        val major = runsFromBest(v).maxByOrNull { it.meters } ?: return "altro tracciato"
         val byRef = IntDoubleHashMap()
         for (i in major.from..major.to) { val r = info.refId(v.edgeIds[i]); if (r >= 0) byRef.addTo(r, v.edgeM[i]) }
         var bestRef = -1; var bestM = 0.0
         for (c in byRef) if (c.value > bestM) { bestM = c.value; bestRef = c.key }
-        if (bestRef >= 0 && bestM >= 0.2 * major.meters) return "via ${info.refName(bestRef)}"
-        // nessun ref: il nome più lungo del tratto (letto solo qui)
+        if (bestRef >= 0 && bestM >= maxOf(VariantRules.ABSENT_REF_M, TITLE_RUN_SHARE * major.meters)) {
+            val inBest = facts(best).refMeters.getOrDefault(bestRef, 0.0) >= VariantRules.ABSENT_REF_M
+            return "via ${info.refName(bestRef)}" + if (inBest) ", altro tracciato" else ""
+        }
+        // nessun ref: il nome più lungo del tratto che non sia una galleria o un ponte (letto solo qui)
         val byName = HashMap<String, Double>()
-        for (i in major.from..major.to) { val n = graph.name(v.edgeIds[i]); if (n.isNotEmpty()) byName.merge(n, v.edgeM[i], Double::plus) }
-        return byName.maxByOrNull { it.value }?.let { "via ${it.key}" } ?: "variante"
+        for (i in major.from..major.to) { val n = graph.name(v.edgeIds[i]); if (n.isNotEmpty() && !VariantRules.isStructureName(n)) byName.merge(n, v.edgeM[i], Double::plus) }
+        return byName.maxByOrNull { it.value }?.let { "via ${it.key}" } ?: "altro tracciato"
+    }
+
+    /**
+     * I titoli delle varianti [vs] (nell'ordine della risposta), tutti diversi fra loro e dal
+     * migliore ([bestLabel]): [title] rispetto alle altre; per un titolo già usato una strada in più
+     * dei tratti deviati che né il migliore né le altre usano (nell'ordine della strada), poi il km
+     * del migliore dove la deviazione più lunga esce.
+     */
+    fun titles(vs: List<Draft>): List<String> {
+        val others = vs.map { v -> vs.filter { it !== v } }
+        val base = vs.indices.map { title(vs[it], others[it]) }
+        return VariantRules.distinct(base, { i -> alternativeTitles(vs[i], others[i], base[i]) }, listOf(bestLabel()))
+    }
+
+    private fun alternativeTitles(v: Draft, others: List<Draft>, t: String): List<String> {
+        val out = ArrayList<String>()
+        val runs = runsFromBest(v)
+        if (t.startsWith("via ") && ',' !in t) {
+            val shown = t.removePrefix("via ").split(" + ")
+            val m = LinkedHashMap<Int, Double>()
+            for (r in runs) for (i in r.from..r.to) { val id = info.refId(v.edgeIds[i]); if (id >= 0) m.merge(id, v.edgeM[i], Double::plus) }
+            val fb = facts(best)
+            m.entries.firstOrNull { (id, mm) -> mm >= VariantRules.ABSENT_REF_M && info.refName(id) !in shown && fb.refMeters.getOrDefault(id, 0.0) < VariantRules.ABSENT_REF_M &&
+                    others.all { o -> facts(o).refMeters.getOrDefault(id, 0.0) < VariantRules.ABSENT_REF_M } }
+                ?.let { extra ->
+                    // nell'ordine della strada (i tratti deviati sono in ordine): una strada che non c'è resta dov'era
+                    val order = m.keys.map { info.refName(it) }
+                    out += "via " + (shown.toList() + info.refName(extra.key)).sortedBy { r -> order.indexOf(r).let { if (it < 0) Int.MAX_VALUE else it } }.joinToString(" + ")
+                }
+        }
+        runs.maxByOrNull { it.meters }?.let { out += "$t, ${VariantRules.fromKm(bestKmAt(it).first)}" }
+        return out
+    }
+
+    /**
+     * Vero se [v] devia solo vicino ai punti del viaggio: ogni suo tratto deviato dal migliore
+     * ([runsB]) di almeno [VariantRules.LOCAL_RUN_M] sta dentro i cerchi d'accesso ([circles]; un
+     * nodo ogni [VariantRules.LOCAL_SAMPLE_M] di strada), nessuna autostrada che il migliore non usa
+     * ([motorwayRefs] fra [refsNotInBest]) e un guadagno di quota autostradale ([motorwayGain]) sotto
+     * [VariantRules.LOCAL_MAX_GAIN]: un altro modo di uscire dalla città, non un altro corridoio.
+     * Senza cerchi mai. Una volta per bozza: le coordinate di pochi nodi, solo se le strade non bastano.
+     */
+    fun localOnly(v: Draft, runsB: List<Run> = runsFromBest(v), d1: Double = VariantRules.dMin1(tripMeters) * scale): Boolean {
+        v.localOnly?.let { return it }
+        val local = circles.isNotEmpty() && runsB.any { it.meters >= VariantRules.LOCAL_RUN_M } &&
+            motorwayRefs(v, refsNotInBest(v)).isEmpty() && motorwayGain(runsB, d1) < VariantRules.LOCAL_MAX_GAIN &&
+            runsB.all { r -> r.meters < VariantRules.LOCAL_RUN_M || inCircles(v, r) }
+        v.localOnly = local
+        return local
+    }
+
+    private fun inCircles(v: Draft, r: Run): Boolean {
+        var acc = 0.0
+        for (i in r.from..r.to) {
+            acc += v.edgeM[i]
+            if (acc < VariantRules.LOCAL_SAMPLE_M && i < r.to) continue
+            acc = 0.0
+            val n = v.nodeAt(i)
+            if (!Circle.inAny(circles, graph.lat(n), graph.lon(n), MotorwayNet.KIND_MAIN)) return false
+        }
+        return true
     }
 
     /** Le strade (ref) con almeno 1 km nel tratto [r] di [v], in ordine. */
@@ -595,7 +763,8 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
 /**
  * I candidati ammessi finora e la scelta golosa e deterministica fra loro: dentro un livello prima
  * le fonti nell'ordine (M, P, V), poi il punteggio più basso; a ogni scelta si rivalutano gli altri
- * rispetto ai nuovi tenuti.
+ * rispetto ai nuovi tenuti. Le varianti solo locali ([Verdict.local]) solo nell'ultima passata
+ * ([admit] con `local`), dopo tutte le altre: restano se non c'è altro.
  */
 internal class VariantPool(val judge: VariantJudge, private val opt: NavAlternativesOptions) {
     val best: Draft get() = judge.best
@@ -632,10 +801,11 @@ internal class VariantPool(val judge: VariantJudge, private val opt: NavAlternat
     }
 
     /**
-     * Tiene, fra i non tenuti, quelli di livello ≤ [maxTier] finché ne servono. [stop] si controlla a
-     * ogni valutazione: fermata (lancia [SearchCancelledException]), restano i tenuti fino a lì.
+     * Tiene, fra i non tenuti, quelli di livello ≤ [maxTier] finché ne servono; quelli solo locali
+     * ([Verdict.local]) solo con [local], e dopo gli altri. [stop] si controlla a ogni valutazione:
+     * fermata (lancia [SearchCancelledException]), restano i tenuti fino a lì.
      */
-    fun admit(maxTier: Int, stop: CancelToken = CancelToken.NEVER) {
+    fun admit(maxTier: Int, stop: CancelToken = CancelToken.NEVER, local: Boolean = false) {
         val tl = traceLog
         while (!full) {
             val k = kept
@@ -648,19 +818,36 @@ internal class VariantPool(val judge: VariantJudge, private val opt: NavAlternat
                 d.verdict = v
                 if (v.tier !in 1..maxTier) continue
                 race?.add(d to v)
+                if (v.local && !local) continue
                 val pv = pickV
-                if (pv == null || v.tier < pv.tier || (v.tier == pv.tier && (d.source.ordinal < pick!!.source.ordinal ||
-                        (d.source == pick.source && v.score < pv.score)))) { pick = d; pickV = v }
+                if (pv == null || before(d, v, pick!!, pv)) { pick = d; pickV = v }
             }
             if (tl != null && race != null && race.isNotEmpty()) {
-                val order = race.sortedWith(compareBy<Pair<Draft, Verdict>>({ it.second.tier }, { it.first.source.ordinal }, { it.second.score }))
-                tl("varianti: traccia scelta ${accepted.size + 1} (livelli ≤ $maxTier, sui tenuti di ora): " + order.take(TRACE_RACE).joinToString("; ") { (d, v) ->
-                    (if (d === pick) "PRESA " else "") + d.tag.ifEmpty { d.source.json } + " liv. ${v.tier} punteggio %.3f".format(v.score) + (if (v.newRefs.isEmpty()) "" else " nuove " + v.newRefs.joinToString(" "))
+                val order = race.sortedWith(compareBy<Pair<Draft, Verdict>>({ it.second.local }, { it.second.tier }, { it.first.source.ordinal }, { it.second.score }))
+                tl("varianti: traccia scelta ${accepted.size + 1} (livelli ≤ $maxTier${if (local) ", anche solo locali" else ""}, sui tenuti di ora): " + order.take(TRACE_RACE).joinToString("; ") { (d, v) ->
+                    (if (d === pick) "PRESA " else "") + d.tag.ifEmpty { d.source.json } + " liv. ${v.tier} punteggio %.3f".format(v.score) + (if (v.newRefs.isEmpty()) "" else " nuove " + v.newRefs.joinToString(" ")) +
+                        (if (v.local) " solo locale" else "")
                 } + (if (order.size > TRACE_RACE) "; altri ${order.size - TRACE_RACE}" else ""))
             }
             if (pick == null) return
             accepted += pick to pickV!!
         }
+    }
+
+    /**
+     * Le tenute nell'ordine della risposta (rank): prima le non solo locali, poi per livello, poi
+     * nell'ordine di presa. Una solo locale di livello 1 presa nell'ultima passata resta dopo le
+     * varianti di corridoio di livello 2, come nella scelta (e come tra Paesi).
+     */
+    fun ordered(): List<Pair<Draft, Verdict>> =
+        accepted.withIndex().sortedWith(compareBy({ it.value.second.local }, { it.value.second.tier }, { it.index })).map { it.value }
+
+    /** Vero se [d] ([v]) viene prima di [p] ([pv]) nella scelta: non solo locale, livello, fonte, punteggio. */
+    private fun before(d: Draft, v: Verdict, p: Draft, pv: Verdict): Boolean = when {
+        v.local != pv.local -> !v.local
+        v.tier != pv.tier -> v.tier < pv.tier
+        d.source != p.source -> d.source.ordinal < p.source.ordinal
+        else -> v.score < pv.score
     }
 
     /** La traccia delle varianti: i giri della scelta golosa ([admit]); null: spenta. */
@@ -773,6 +960,32 @@ private fun awaitQuietly(l: CountDownLatch) {
     var interrupted = false
     while (true) { try { l.await(); break } catch (e: InterruptedException) { interrupted = true } }
     if (interrupted) Thread.currentThread().interrupt()
+}
+
+/**
+ * Un cerchio d'accesso per punto del viaggio ([Circle]): raggio [NavAlternativesEngine.ACCESS_RADIUS_M],
+ * al più [NavAlternativesEngine.ACCESS_LEG_SHARE] del tratto più lungo che tocca il punto (in un
+ * viaggio corto le strade principali non diventano tutta la rete). Un punto ripetuto (andata e
+ * ritorno) una volta; nessun cerchio per un punto agganciato a un'autostrada o una superstrada (un
+ * ricalcolo in marcia: si è già sulla rete, le strade urbane attorno non servono). Per la rete della
+ * fonte M e per le varianti solo locali ([VariantJudge.localOnly]).
+ * Con [trip] (un pezzo di un viaggio tra Paesi) nessun cerchio sui punti di trasferimento al
+ * confine (il primo se il pezzo non apre il viaggio, l'ultimo se non lo chiude): una deviazione
+ * attorno a un valico non è un'uscita dalla città. Senza [trip] (la rete M) tutti i punti.
+ */
+internal fun accessCircles(solved: DirectionsService.Solved, info: EdgeInfo, trip: TripContext? = null): List<Circle> {
+    val out = ArrayList<Circle>()
+    val last = solved.snaps.size - 1
+    for ((j, s) in solved.snaps.withIndex()) {
+        if (trip != null && ((j == 0 && trip.offsetMeters > 0.5) || (j == last && trip.extraMeters - trip.offsetMeters > 0.5))) continue
+        if (s.edge >= 0 && info.isMotorwayOrTrunk(s.edge)) continue
+        val legM = maxOf(solved.legs.getOrNull(j - 1)?.distance ?: 0.0, solved.legs.getOrNull(j)?.distance ?: 0.0)
+        val r = minOf(NavAlternativesEngine.ACCESS_RADIUS_M, NavAlternativesEngine.ACCESS_LEG_SHARE * legM)
+        if (r < 1.0) continue
+        val c = Circle(s.snappedLat, s.snappedLon, r)
+        if (out.none { it.covers(c) }) out += c
+    }
+    return out
 }
 
 /**
@@ -893,7 +1106,7 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         val corridors = CorridorAnalyzer(graphs.graph, info, graphs.guidance)
         val router = graphs.router(solved.options)
         val best = Draft(solved.legs, VariantSource.BEST)
-        val judge = VariantJudge(best, info, corridors, opt, graphs.graph, router, request, solved.snaps, trip)
+        val judge = VariantJudge(best, info, corridors, opt, graphs.graph, router, request, solved.snaps, trip, accessCircles(solved, info, trip))
         return VariantContext(service, rc, request, solved, opt, info, corridors, BestTrace(solved.legs), VariantPool(judge, opt).also { if (opt.trace != null) it.traceLog = log }, router, log, trip)
     }
 
@@ -935,6 +1148,8 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         try {
             pool.admit(2, fillStop)
             if (opt.fill) pool.admit(3, fillStop)
+            // le varianti solo locali (un altro modo di uscire dalla città) solo se non c'è altro
+            pool.admit(if (opt.fill) 3 else 2, fillStop, local = true)
         } catch (e: SearchCancelledException) {
             if (e.reason != SearchCancelledException.Reason.DEADLINE || rc.cancel.isCancelled) throw e
             note = "budget"
@@ -943,9 +1158,11 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             used.isEmpty() -> "nessuna fonte di varianti per questa richiesta"
             else -> "nessun'altra strada entro +${Math.round((opt.maxFactor - 1) * 100)} %"
         }
-        // 5. le tenute complete (geometria e nomi), in ordine di livello
-        val ordered = pool.accepted.withIndex().sortedWith(compareBy({ it.value.second.tier }, { it.index })).map { it.value }
-        val variants = ordered.mapIndexed { i, (d, v) -> Accepted(d, v, i + 1, d.legs.map { router.materialize(it) }) }
+        // 5. le tenute complete (geometria e nomi), nell'ordine della risposta
+        val ordered = pool.ordered()
+        // i titoli sulle altre varianti della risposta: prima le strade che il migliore non usa, tutti diversi
+        val titles = judge.titles(ordered.map { it.first })
+        val variants = ordered.mapIndexed { i, (d, v) -> Accepted(d, v.withLabel(titles[i]), i + 1, d.legs.map { router.materialize(it) }) }
         val summary = (used.joinToString(", ") { it.summary() }.ifEmpty { "nessuna fonte" }) + " | " + pool.discards(fillStop)
         val ms = (System.nanoTime() - t0) / 1_000_000
         log("varianti: ${variants.size}/${pool.want} in $ms ms ($summary)" + (note?.let { "; $it" } ?: ""))
@@ -1047,27 +1264,6 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         private var t0 = 0L
 
         /**
-         * Un cerchio d'accesso per punto del viaggio ([Circle]): raggio [ACCESS_RADIUS_M], al più
-         * [ACCESS_LEG_SHARE] del tratto più lungo che tocca il punto (in un viaggio corto le strade
-         * principali non diventano tutta la rete). Un punto ripetuto (andata e ritorno) una volta;
-         * nessun cerchio per un punto agganciato a un'autostrada o una superstrada (un ricalcolo in
-         * marcia: si è già sulla rete, le strade urbane attorno non servono).
-         */
-        private fun accessCircles(ctx: VariantContext): List<Circle> {
-            val solved = ctx.solved
-            val out = ArrayList<Circle>()
-            for ((j, s) in solved.snaps.withIndex()) {
-                if (s.edge >= 0 && ctx.info.isMotorwayOrTrunk(s.edge)) continue
-                val legM = maxOf(solved.legs.getOrNull(j - 1)?.distance ?: 0.0, solved.legs.getOrNull(j)?.distance ?: 0.0)
-                val r = minOf(ACCESS_RADIUS_M, ACCESS_LEG_SHARE * legM)
-                if (r < 1.0) continue
-                val c = Circle(s.snappedLat, s.snappedLon, r)
-                if (out.none { it.covers(c) }) out += c
-            }
-            return out
-        }
-
-        /**
          * I nodi del migliore non autostradali dentro un cerchio d'accesso, come semi: solo le
          * posizioni a non più di 3 raggi di strada dall'inizio o dalla fine di un tratto (fuori
          * nessun nodo può stare nel cerchio della partenza o dell'arrivo), una lettura delle
@@ -1110,7 +1306,7 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             val mwSeeds = seeds.size()
             val mwSeedArr = seeds.toArray()
             // i cerchi d'accesso attorno ai punti, e i nodi del migliore dentro (la parte urbana: deviazioni che escono lì)
-            val circles = accessCircles(ctx)
+            val circles = accessCircles(ctx.solved, ctx.info)
             addAccessSeeds(ctx, circles, seeds)
             val seedArr = seeds.toArray()
             // la regione: un'ellisse per tratto coi fuochi sui suoi punti
@@ -1189,7 +1385,7 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             val w0 = trace.legW.sum() + ctx.trip.extraWeight
             val scale = ctx.opt.minDetourScale
             val d1 = scale * VariantRules.dMin1(ctx.pool.best.meters + ctx.trip.extraMeters)
-            val minM = maxOf(scale * VariantRules.T3_D_MIN, VariantRules.T3_D * d1)
+            val minM = maxOf(scale * VariantRules.SEARCH_D_MIN, VariantRules.SEARCH_D * d1)
             val all = ArrayList<Detour>()
             val diag = ctx.opt.trace?.let { tr ->
                 DetourTrace(log, { e -> ctx.info.ref(e) }, tr.probes.map { p ->

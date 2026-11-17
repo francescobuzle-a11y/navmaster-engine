@@ -55,6 +55,12 @@ class CrossBorderVariantsTest {
         var trips = 0
         // le varianti da un altro valico di una richiesta con la sola fonte V (quando le altre fonti le battono)
         var crossingOnly = 0
+        // titoli tutti diversi (anche dal migliore), mai «altro valico, altro valico»
+        fun checkTitles(fs: List<Map<*, *>>) {
+            val labels = fs.map { (((it["properties"] as Map<*, *>)["navmaster"] as Map<*, *>)["variant"] as Map<*, *>)["label"] as String }
+            assertEquals(labels.size, labels.toSet().size, "titoli ripetuti: $labels")
+            assertTrue(labels.none { it.split("altro valico").size > 2 }, "titolo doppio: $labels")
+        }
         fun checkCrossing(v: Map<*, *>) {
             val tier = v["tier"] as Int
             assertTrue(tier in 1..3, "livello $tier")
@@ -89,6 +95,7 @@ class CrossBorderVariantsTest {
                 assertTrue(((props["summary"] as Map<*, *>)["duration"] as Double) <= 1.5 * d0 + 1, "durata ${(props["summary"] as Map<*, *>)["duration"]} oltre 1,5 × $d0")
                 assertTrue((v["factor"] as Double) <= 1.5 + 1e-3, "fattore ${v["factor"]}")
             }
+            checkTitles(fs)
             val meta = ((doc["metadata"] as Map<*, *>)["navmaster"] as Map<*, *>)["alternatives"] as Map<*, *>
             assertEquals(3, meta["asked"]); assertEquals(fs.size, meta["found"])
             println("tra Paesi $n punti, seme $seed: ${fs.size - 1} varianti (${fs.drop(1).joinToString { ((it["properties"] as Map<*, *>)["navmaster"] as Map<*, *>)["variant"].let { v -> "${(v as Map<*, *>)["source"]} ${v["label"]}" } }}; ${meta["candidates"]}; ${meta["note"]})")
@@ -102,6 +109,7 @@ class CrossBorderVariantsTest {
                 val only = features(cb.handle(DirectionsRequest.fromJson("driving-hgv", Heidelberg.body(pts, ""","navmaster":{"roads":true}""")).withNavAlternatives(
                     NavAlternativesOptions(count = 3, sources = setOf(VariantSource.CROSSING), minDetourScale = 0.02)), countries))
                 assertEquals(withoutVariant(plain), withoutVariant(only[0]))
+                checkTitles(only)
                 for (f in only.drop(1)) {
                     val v = ((f["properties"] as Map<*, *>)["navmaster"] as Map<*, *>)["variant"] as Map<*, *>
                     assertEquals("crossing", v["source"]); checkCrossing(v); crossingOnly++

@@ -44,14 +44,18 @@ import kotlin.test.assertTrue
  * fino all'interconnessione di Verona e poi la A4, senza SR450 né SS11; Milano→Bologna nessuna, A21/A22 sono oltre 1,20×); (c) livello 1 entro tier1, tutte entro max_factor in tempo e km;
  * (d) la prima feature è la risposta senza varianti; (e) le varianti subito dopo il migliore: 0
  * ricerche per il migliore; (f) esattezza delle penalità: core-ALT penalizzato = Dijkstra pieno
- * penalizzato su 20 coppie; (g) una via in più: ≤ 2 tratti calcolati (un Paese).
+ * penalizzato su 20 coppie; (g) una via in più: ≤ 2 tratti calcolati (un Paese); (h) i titoli delle
+ * varianti tutti diversi e mai il nome di una galleria o di un ponte.
  */
 class AlternativesRealDiagTest {
     private class Place(val name: String, val lat: Double, val lon: Double)
 
     private val places = listOf(
         Place("Milano", 45.4642, 9.1900), Place("Bologna", 44.4949, 11.3426), Place("Torino", 45.0703, 7.6869), Place("Mestre", 45.4847, 12.2386),
-        Place("Bolzano", 46.4983, 11.3548), Place("Brescia", 45.5416, 10.2118), Place("Genova", 44.4056, 8.9463), Place("Firenze", 43.7696, 11.2558),
+        Place("Bolzano", 46.4983, 11.3548), Place("Brescia", 45.5416, 10.2118), Place("Genova", 44.4056, 8.9463),
+        // Firenze: viale Guidoni (Novoli), la via di scorrimento fra l'uscita Firenze Nord dell'A1/A11 e la città, a ~4 km
+        // dal Duomo; il centro (43.7696, 11.2558) è zona a traffico limitato, nessuna strada per il camion entro 400 m
+        Place("Firenze", 43.7981, 11.2149),
     )
 
     private fun placeOf(p: Pair<Double, Double>): String? = places.firstOrNull { DistanceCalc.haversine(it.lat, it.lon, p.first, p.second) < 3_000.0 }?.name
@@ -207,7 +211,8 @@ class AlternativesRealDiagTest {
         // i risultati delle asserzioni: per ognuna i casi e quelli falliti
         class Check(val name: String) { var n = 0; var fail = 0; val lines = ArrayList<String>() }
         val checks = linkedMapOf("a" to Check("(a) ≥ 3 percorsi"), "b" to Check("(b) firme attese"), "c" to Check("(c) fattori"), "d" to Check("(d) prima feature = migliore"),
-            "e" to Check("(e) 0 ricerche per il migliore"), "f" to Check("(f) esattezza delle penalità"), "g" to Check("(g) via in più: ≤ 2 tratti"))
+            "e" to Check("(e) 0 ricerche per il migliore"), "f" to Check("(f) esattezza delle penalità"), "g" to Check("(g) via in più: ≤ 2 tratti"),
+            "h" to Check("(h) titoli diversi"))
         fun check(key: String, ok: Boolean, what: String) {
             val c = checks.getValue(key); c.n++
             if (!ok) { c.fail++; c.lines += what; println("  FAIL ${c.name}: $what") }
@@ -277,6 +282,9 @@ class AlternativesRealDiagTest {
             val legs = if (!multi) synchronized(rc.stats.legs) { rc.stats.legs.toList() } else
                 synchronized(rc.stats.children) { rc.stats.children.filter { (n, _) -> graphs.any { it.id == n } }.flatMap { (_, s) -> synchronized(s.legs) { s.legs.toList() } } }
             check("e", legs.isNotEmpty() && legs.all { it.source == LegStats.Source.CACHE }, "$name: ${legs.joinToString { it.source.name.lowercase() }}")
+            // (h) i titoli: tutti diversi, mai il nome di una galleria o di un ponte
+            val titles = fs.mapNotNull { variant(it)?.get("label") as? String }
+            check("h", titles.size == titles.toSet().size && titles.none { VariantRules.isStructureName(it.removePrefix("via ")) }, "$name: ${titles.joinToString(" | ")}")
             // (b) le firme attese
             val from = placeOf(pts.first()); val to = placeOf(pts.last())
             val vs = fs.map { variant(it) }
@@ -408,7 +416,7 @@ class AlternativesRealDiagTest {
         const val PROBE_RINGS = 60
         /** Milano→Bologna, Torino→Mestre, Bolzano→Milano, Brescia→Milano, Genova→Milano, Genova→Brescia, Soncino→Bologna, Bologna→Firenze, Verona→Torino, Milano→Roma, Milano→Bergamo e due viaggi con una tappa. */
         const val DEFAULT_TRIPS = "45.4642,9.1900;44.4949,11.3426|45.0703,7.6869;45.4847,12.2386|46.4983,11.3548;45.4642,9.1900|45.5416,10.2118;45.4642,9.1900|" +
-            "44.4056,8.9463;45.4642,9.1900|44.4056,8.9463;45.5416,10.2118|45.4103,9.9428;44.4949,11.3426|44.4949,11.3426;43.7696,11.2558|45.4384,10.9916;45.0703,7.6869|" +
+            "44.4056,8.9463;45.4642,9.1900|44.4056,8.9463;45.5416,10.2118|45.4103,9.9428;44.4949,11.3426|44.4949,11.3426;43.7981,11.2149|45.4384,10.9916;45.0703,7.6869|" +
             "45.4642,9.1900;41.9028,12.4964|45.4642,9.1900;45.6983,9.6773|45.1502,10.3792;45.1333,10.0227;45.0526,9.6930|45.4103,9.9428;44.8015,10.3279;44.4949,11.3426"
     }
 }

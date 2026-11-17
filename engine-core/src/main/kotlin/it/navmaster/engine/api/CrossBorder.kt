@@ -659,12 +659,9 @@ class CrossBorderDirections(
 
         private fun sane(v: TripEdges, runs: List<Run>, a: Double, bMs: Long): Boolean = runs.all { r -> r.ms <= a * bestMsAround(v, r) + bMs * scale }
 
-        /** La deviazione minima da ogni tenuto per il livello [tier]. */
-        fun minDev(tier: Int): Double = when (tier) {
-            1 -> d1
-            2 -> VariantRules.T2_D * d1
-            else -> maxOf(VariantRules.T3_D_MIN * scale, VariantRules.T3_D * d1)
-        }
+        /** La deviazione minima da ogni tenuto per il livello [tier]: dMin1 a ogni livello (un'alternativa riconoscibile, come [VariantJudge.evaluate]). */
+        @Suppress("UNUSED_PARAMETER")
+        fun minDev(tier: Int): Double = d1
 
         /** Vero se [v], già giudicata dal suo pezzo al livello [tier], devia da ognuno di [others] quanto chiede il livello. */
         fun diverse(v: TripEdges, tier: Int, others: List<TripEdges>): Boolean =
@@ -715,7 +712,32 @@ class CrossBorderDirections(
      * costruisce la feature (solo per le tenute).
      */
     private class CrossVariant(val tier: Int, val source: VariantSource, val score: Double, val r: Double, val rk: Double, val edges: TripEdges,
-                               val sig: List<String>, val order: Int, val json: MutableMap<String, Any?>, val build: () -> Map<String, Any?>)
+                               val sig: List<String>, val order: Int, val json: MutableMap<String, Any?>,
+                               /** Solo locale nel suo pezzo ([Verdict.local]): dopo tutte le altre. */
+                               val local: Boolean = false, val build: () -> Map<String, Any?>)
+
+    /**
+     * La strada (ref) al valico di [alt] (due pezzi): la prima con un ref andando indietro dal
+     * valico per al più [CROSSING_REF_M] nel pezzo prima, se no in avanti nel pezzo dopo. Letta
+     * una volta per variante V (pochi archi), solo per il titolo.
+     */
+    private fun crossingRef(labels: TripLabels, alt: List<FinalPiece>): String? {
+        val a = alt.first(); val b = alt.getOrNull(1)
+        val ia = labels.info(a.graph)
+        var m = 0.0
+        back@ for (l in a.solved.legs.asReversed()) for (e in l.edges.asReversed()) {
+            ia.ref(e.edge)?.let { return it }
+            m += e.distance; if (m > CROSSING_REF_M) break@back
+        }
+        if (b == null) return null
+        val ib = labels.info(b.graph)
+        m = 0.0
+        for (l in b.solved.legs) for (e in l.edges) {
+            ib.ref(e.edge)?.let { return it }
+            m += e.distance; if (m > CROSSING_REF_M) return null
+        }
+        return null
+    }
 
     /** "+4 min, −6 km". */
     private fun diff(extraS: Double, extraM: Double): String {
@@ -759,7 +781,10 @@ class CrossBorderDirections(
         val notes = ArrayList<String>(); val summaries = ArrayList<String>()
         if (ctx.topStopped) notes += "budget"
         fun leftMs() = nav.budgetMs - (System.nanoTime() - t0) / 1_000_000
-        fun tier1() = cands.count { it.tier == 1 }
+        // le varianti solo locali di un pezzo (un'uscita dalla città) non bastano a fermare la ricerca
+        fun tier1() = cands.count { it.tier == 1 && !it.local }
+        // i titoli di riserva delle varianti V (la strada al valico, il km del valico), per due valichi con lo stesso titolo
+        val crossingTitles = HashMap<CrossVariant, List<String>>()
         fun sigJson(sig: List<Pair<String, Double>>) = sig.map { linkedMapOf("ref" to it.first, "km" to it.second) }
         fun factor(x: Double) = Math.round(x * 1000) / 1000.0
 
@@ -784,7 +809,7 @@ class CrossBorderDirections(
                 val json = LinkedHashMap(res.json(a))
                 json["signature"] = sig.joinToString(" · ") { it.first }; json["refs"] = sigJson(sig)
                 val r = (json["factor"] as Number).toDouble(); val rk = (json["km_factor"] as Number).toDouble()
-                cands += CrossVariant(a.verdict.tier, a.draft.source, a.verdict.score, r, rk, edgesOf(parts), sig.map { it.first }, cands.size, json) {
+                cands += CrossVariant(a.verdict.tier, a.draft.source, a.verdict.score, r, rk, edgesOf(parts), sig.map { it.first }, cands.size, json, a.verdict.local) {
                     merge(finals.mapIndexed { i, p -> if (i == j) f.graph.service.feature(f.solved.request, a.legs, encoder, null) else featureOf(p) }, request)
                 }
             }
@@ -827,9 +852,12 @@ class CrossBorderDirections(
                             "longer" to false, "detours" to emptyList<Any>(), "crossing" to linkedMapOf("lat" to t.lat, "lon" to t.lon))
                         // il bonus delle strade nuove come il giudice: solo le autostrade (una superstrada statale, SS o B, no)
                         val score = 0.6 * r + 0.4 * rk - VariantRules.NEW_REF_BONUS * minOf(VariantRules.NEW_REF_MAX, newRefs.count { CorridorAnalyzer.isMotorwayRef(it) })
-                        cands += CrossVariant(0, VariantSource.CROSSING, score, r, rk, edgesOf(alt.map { it.graph to it.solved.legs }), sig.map { it.first }, cands.size, json) {
+                        val cv = CrossVariant(0, VariantSource.CROSSING, score, r, rk, edgesOf(alt.map { it.graph to it.solved.legs }), sig.map { it.first }, cands.size, json) {
                             merge(alt.map { featureOf(it) }, request)
                         }
+                        cands += cv
+                        val where = listOfNotNull(crossingRef(labels, alt)?.let { "sulla $it" }, "al km ${Math.round(alt[0].meters / 1000)}")
+                        crossingTitles[cv] = where.map { w -> if (newRefs.isEmpty()) "altro valico $w" else "$label, valico $w" }
                     }
                 } catch (e: SearchCancelledException) {
                     if (e.reason != SearchCancelledException.Reason.DEADLINE || rc.cancel.isCancelled) throw e
@@ -854,8 +882,8 @@ class CrossBorderDirections(
                 // con più tenuti un livello non migliora: lo scarto è definitivo
                 if (t == 0) { out += c; continue }
                 val p = pick
-                if (p == null || t < pickTier || (t == pickTier && (c.source.ordinal < p.source.ordinal ||
-                        (c.source == p.source && (c.score < p.score || (c.score == p.score && c.order < p.order)))))) { pick = c; pickTier = t }
+                if (p == null || (c.local != p.local && !c.local) || (c.local == p.local && (t < pickTier || (t == pickTier && (c.source.ordinal < p.source.ordinal ||
+                        (c.source == p.source && (c.score < p.score || (c.score == p.score && c.order < p.order)))))))) { pick = c; pickTier = t }
             }
             left.removeAll(out.toSet())
             val p = pick ?: break
@@ -880,7 +908,16 @@ class CrossBorderDirections(
         val built = arrayOfNulls<Map<String, Any?>>(chosen.size)
         fun build(parity: Int) { for (i in chosen.indices) if (i % 2 == parity) built[i] = chosen[i].build() }
         onTwoThreads(rc, rc.cancel, if (chosen.size >= 2) helperSlot(rc, rc.cancel) else null, { build(0) }, if (chosen.size >= 2) { _ -> build(1) } else null)
-        for ((i, v) in chosen.withIndex()) { v.json["rank"] = i + 1; features += withVariant(built[i]!!, v.json) }
+        // titoli tutti diversi (le varianti di pezzi diversi e dei valichi possono dire la stessa strada)
+        val bestTitle = bestSig.sortedByDescending { it.second }.take(2).map { it.first }.toSet().let { top ->
+            bestSig.map { it.first }.filter { it in top }.distinct().let { if (it.isEmpty()) "percorso migliore" else "via " + it.joinToString(" + ") } }
+        val titles = VariantRules.distinct(chosen.map { it.json["label"] as? String ?: "" }, { i ->
+            val c = chosen[i]; val t = c.json["label"] as? String ?: ""
+            if (c.source == VariantSource.CROSSING) crossingTitles[c].orEmpty()
+            else (c.json["detours"] as? List<*>).orEmpty().mapNotNull { it as? Map<*, *> }.maxByOrNull { (it["km"] as? Number)?.toDouble() ?: 0.0 }
+                ?.let { d -> listOf("$t, ${VariantRules.fromKm((d["from_km"] as? Number)?.toDouble() ?: 0.0)}") }.orEmpty()
+        }, listOf(bestTitle))
+        for ((i, v) in chosen.withIndex()) { v.json["rank"] = i + 1; v.json["label"] = titles[i]; features += withVariant(built[i]!!, v.json) }
         val ms = (System.nanoTime() - t0) / 1_000_000
         val note = if (chosen.size >= want) null else notes.firstOrNull() ?: "nessun'altra strada entro +${Math.round((nav.maxFactor - 1) * 100)} %"
         val summary = summaries.joinToString(" | ").ifEmpty { "nessuna fonte" }
@@ -1653,6 +1690,8 @@ class CrossBorderDirections(
 
         /** Varianti tra Paesi: oltre al pezzo più lungo, anche i pezzi di almeno questa quota del viaggio. */
         const val PIECE_SHARE = 0.25
+        /** Fin dove si cerca la strada al valico per il titolo di una variante V ([crossingRef]). */
+        const val CROSSING_REF_M = 3_000.0
         /** Sotto questo tempo rimasto non si cercano le varianti di un altro pezzo (ms). */
         const val MIN_PIECE_BUDGET_MS = 1_000L
 
