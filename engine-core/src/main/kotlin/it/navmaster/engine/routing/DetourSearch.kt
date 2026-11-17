@@ -58,6 +58,21 @@ class Detour(val leg: Int, val fromPos: Int, val toPos: Int, val arcs: IntArray,
              val plateauW: Double, val detourMs: Long, val bestMsBetween: Long,
              /** I metri della deviazione e il punteggio con cui si è scelta (più basso = meglio). */
              val detourM: Double = 0.0, val score: Double = 0.0) {
+    /**
+     * Il gruppo nell'ordine dei posti di [DetourSearch.detours]: [RANK_LONG] lunga di un corridoio
+     * nuovo, [RANK_SAME_CORRIDOR] lunga rimandata (stesso corridoio di una presa), [RANK_SHORT] corta
+     * (sotto la deviazione minima del giudice). Le singole offerte e le prime per le combinazioni
+     * ([DetourSearch.comboTop]) seguono quest'ordine prima del punteggio.
+     */
+    var rankClass: Int = RANK_LONG
+        internal set
+
+    companion object {
+        const val RANK_LONG = 0
+        const val RANK_SAME_CORRIDOR = 1
+        const val RANK_SHORT = 2
+    }
+
     /** Vero se le due deviazioni si possono fare insieme: tratti diversi, o una rientra prima che l'altra esca. */
     fun disjoint(o: Detour): Boolean = leg != o.leg || toPos < o.fromPos || o.toPos < fromPos
 }
@@ -84,10 +99,12 @@ fun interface TurnCheck { fun forbidden(inEdge: Int, node: Int, outEdge: Int): B
  * verso di esse (etichette [g] con la destinazione), entrambe sugli archi diretti della rete, con i
  * nodi del migliore come barriera (non si espandono) e senza i suoi archi. Una deviazione è una
  * catena di archi su cui le due etichette coincidono (plateau, come le alternative «via» di ORS),
- * col rientro più avanti dell'uscita. Le uniche letture del grafo sono le svolte nei nodi con
- * divieti ([MotorwayNet.restricted]). [allowed]: i nodi usabili ([MotorwayNet.mask]; null tutti),
- * gli archi con un capo fuori non si usano mai. Gli array per arco si riusano fra i tratti: un
- * oggetto per richiesta, su un thread.
+ * col rientro più avanti dell'uscita. Le svolte nei nodi con divieti ([MotorwayNet.restricted]):
+ * fra due archi della rete dalle coppie vietate della rete ([MotorwayNet.turnBans], in RAM, lette
+ * una volta alla costruzione), se ci sono; se no (una rete giocattolo) e all'uscita dal migliore e
+ * al rientro (un arco del migliore) da [turns]. [allowed]: i nodi usabili ([MotorwayNet.mask]; null
+ * tutti), gli archi con un capo fuori non si usano mai. Gli array per arco si riusano fra i tratti:
+ * un oggetto per richiesta, su un thread.
  */
 class DetourSearch internal constructor(private val net: MotorwayNet, private val trace: BestTrace, private val turns: TurnCheck?,
                                         allowed: BooleanArray? = null) {
@@ -109,18 +126,39 @@ class DetourSearch internal constructor(private val net: MotorwayNet, private va
     private val heap = ArcHeap()
 
     private fun forbidden(inEdge: Int, node: Int, outEdge: Int): Boolean = turns?.forbidden(inEdge, node, outEdge) == true
+    private val bans = net.turnBans
+
+    /** La svolta dall'arco [a] all'arco [b] della rete nel nodo [node] (della rete, con divieti) è vietata: dalle coppie in RAM se ci sono. */
+    private fun banned(a: Int, node: Int, b: Int): Boolean =
+        if (bans != null) bans.contains(MotorwayNet.pairKey(a, b)) else forbidden(net.arcEdge[a], net.nodeGraph[node], net.arcEdge[b])
 
     /**
-     * Le deviazioni del tratto [leg], al più [perLeg], dal punteggio migliore (Δ peso relativo meno
-     * metà della quota di plateau): solo percorsi via con peso ≤ [maxFactor] volte il tratto, quota
-     * di plateau ≥ [minPlateauShare] (ottimalità locale), almeno [minDetourM] metri fuori dal
-     * migliore, nessun nodo ripetuto; due con la stessa uscita e lo stesso rientro e l'80 % dei km
-     * in comune contano per una. [diag]: la traccia delle varianti (solo le prove; null: nessun
-     * conto in più): righe di registro e le deviazioni oltre [perLeg] in [DetourTrace.extra], mai
-     * restituite (le prime [perLeg] sono le stesse senza traccia).
+     * Le deviazioni del tratto [leg], al più [perLeg]: solo percorsi via con peso ≤ [maxFactor]
+     * volte il tratto, quota di plateau ≥ [minPlateauShare] (ottimalità locale), almeno
+     * [minDetourM] metri fuori dal migliore, nessun nodo ripetuto; due con la stessa uscita e lo
+     * stesso rientro e l'80 % dei km in comune contano per una. L'ordine per i posti di [perLeg]:
+     * 1. le catene «lunghe» (deviazione di almeno [rankMinM] metri: la deviazione minima del
+     *    giudice, [VariantRules.dMin1] del viaggio) per punteggio (Δ peso relativo meno metà della
+     *    quota di plateau), saltando quelle che hanno almeno [CORRIDOR_SHARE] dei propri km in
+     *    comune con una lunga già presa (stesso corridoio: rimandate);
+     * 2. le lunghe rimandate, nel loro ordine;
+     * 3. le corte (sotto [rankMinM]: giri di svincolo, scorciatoie di pochi km che il giudice scarta
+     *    da sole, ma che servono alle combinazioni con una lunga), per punteggio.
+     * Prima tutte stavano in un solo ordine per punteggio, che premia le deviazioni minuscole con
+     * plateau ~1: le vie lunghe su un'altra autostrada finivano oltre il tetto. Una catena è lunga
+     * se anche il pezzo del migliore che sostituisce è almeno [LONG_BEST_SHARE] di [rankMinM] (un
+     * anello di uscita e rientro è corto). Le lunghe tengono al più perLeg meno [SHORT_RESERVE]
+     * posti (un quarto di perLeg al più) se ci sono corte: le corte servono alle combinazioni.
+     * Scartate anche: le deviazioni con più di [maxAccessShare] dei km su strade d'accesso
+     * ([MotorwayNet.KIND_MAIN], [MotorwayNet.KIND_TERTIARY]: un giro urbano), e quelle che il
+     * giudice non accetterebbe mai, nemmeno da sole (tempo oltre [saneA] volte il migliore fra
+     * uscita e rientro più [saneBMs] ms: la sanità locale più larga). [diag]: la traccia
+     * delle varianti (solo le prove; null: nessun conto in più): righe di registro e le deviazioni
+     * oltre [perLeg] in [DetourTrace.extra], mai restituite (le prime [perLeg] sono le stesse senza traccia).
      */
-    fun detours(leg: Int, maxFactor: Double, minPlateauShare: Double = 0.25, perLeg: Int = 12, cancel: CancelToken = CancelToken.NEVER,
-                minDetourM: Double = 0.0, diag: DetourTrace? = null): List<Detour> {
+    fun detours(leg: Int, maxFactor: Double, minPlateauShare: Double = 0.25, perLeg: Int = PER_LEG, cancel: CancelToken = CancelToken.NEVER,
+                minDetourM: Double = 0.0, diag: DetourTrace? = null, rankMinM: Double = 0.0, maxAccessShare: Double = 1.0,
+                saneA: Double = Double.POSITIVE_INFINITY, saneBMs: Double = Double.POSITIVE_INFINITY): List<Detour> {
         val s = trace.legStart[leg]; val e = trace.legStart[leg + 1]
         if (e - s < 2 || nA == 0) { diag?.log?.invoke("varianti: traccia M tratto $leg: ${e - s} posizioni, rete di $nA archi: nessuna ricerca"); return emptyList() }
         val legW = trace.legW[leg]
@@ -149,7 +187,7 @@ class DetourSearch internal constructor(private val net: MotorwayNet, private va
             for (k in net.outStart[h] until net.outStart[h + 1]) {
                 val b = net.outArcs[k]
                 if (arcOnB[b] || net.arcEdge[b] == net.arcEdge[a]) continue
-                if (net.restricted[h] && forbidden(net.arcEdge[a], net.nodeGraph[h], net.arcEdge[b])) continue
+                if (net.restricted[h] && banned(a, h, b)) continue
                 val v = key + net.arcW[b]
                 if (v <= limit && v < f[b]) { f[b] = v; fOrig[b] = fOrig[a]; fPar[b] = a; fM[b] = fM[a] + net.arcM[b]; heap.push(v, b) }
             }
@@ -175,7 +213,7 @@ class DetourSearch internal constructor(private val net: MotorwayNet, private va
             for (k in net.inStart[t] until net.inStart[t + 1]) {
                 val b = net.inArcs[k]
                 if (arcOnB[b] || net.arcEdge[b] == net.arcEdge[a]) continue
-                if (net.restricted[t] && forbidden(net.arcEdge[b], net.nodeGraph[t], net.arcEdge[a])) continue
+                if (net.restricted[t] && banned(b, t, a)) continue
                 val v = key + net.arcW[b]
                 if (v <= limit && v < g[b]) { g[b] = v; gDest[b] = gDest[a]; gNext[b] = a; gM[b] = gM[a] + net.arcM[b]; heap.push(v, b) }
             }
@@ -199,26 +237,34 @@ class DetourSearch internal constructor(private val net: MotorwayNet, private va
             val p = fOrig[a]; val q = gDest[a]
             val detourW = tot - legW + (trace.pre[q] - trace.pre[p])
             if (detourW <= 0 || plateau < minPlateauShare * detourW) { if (cnt != null) cnt[if (detourW <= 0) 3 else 4]++; continue }
-            chains += Chain(a, cur, p, q, plateau, detourW, score(tot - legW, plateau, detourW, legW))
+            val m = (fM[a] + gM[a] - net.arcM[a]).toDouble()
+            // lunga: la deviazione e il pezzo del migliore che sostituisce (un anello di uscita e rientro
+            // di 40 km al posto di 400 m è un giro, non una via lunga)
+            val long = m >= rankMinM - 1.0 && trace.preM[q] - trace.preM[p] >= LONG_BEST_SHARE * rankMinM - 1.0
+            chains += Chain(a, cur, p, q, plateau, detourW, score(tot - legW, plateau, detourW, legW), long)
         }
-        chains.sortWith(compareBy<Chain>({ it.score }, { it.head }))
-        // 5. le prime perLeg, ricostruite (risalita di fPar, discesa di gNext); con la traccia si
-        // continua oltre il tetto (fino a DetourTrace.maxKept) mettendo le altre da parte
-        val out = ArrayList<Detour>()
+        // le lunghe prima delle corte, dentro ognuna per punteggio
+        chains.sortWith(compareBy<Chain>({ if (it.long) 0 else 1 }, { it.score }, { it.head }))
+        val longCount = chains.count { it.long }
+        // 5. ricostruite (risalita di fPar, discesa di gNext) in due giri: le lunghe (con quelle dello
+        // stesso corridoio di una presa da parte), poi le corte. Le tenute: le lunghe fino a perLeg
+        // meno i posti delle corte ([SHORT_RESERVE], se ce ne sono), poi le corte. Con la traccia si
+        // continua oltre il tetto (fino a DetourTrace.maxKept) mettendo le altre da parte: le tenute
+        // sono quelle che si avrebbero senza traccia (i conti fino al punto in cui ci si sarebbe fermati).
         val seen = com.carrotsearch.hppc.IntHashSet()
-        var built = 0
-        val extra = if (diag != null) ArrayList<Detour>() else null
         val fate = if (diag != null) HashMap<Int, String>() else null
         var stopAt = -1; var stopWhy = ""; var looked = 0
-        for ((ci, c) in chains.withIndex()) {
-            val over = out.size >= perLeg || built >= perLeg * MAX_BUILT_PER_KEPT
-            if (over) {
-                if (diag == null || extra == null) break
-                if (stopAt < 0) { stopAt = ci; stopWhy = if (out.size >= perLeg) "$perLeg tenute (perLeg)" else "${perLeg * MAX_BUILT_PER_KEPT} ricostruite" }
-                if (out.size + extra.size >= diag.maxKept || built >= diag.maxKept * MAX_BUILT_PER_KEPT) break
-            }
-            looked = ci + 1
-            built++
+        val longs = ArrayList<Built>(); val deferred = ArrayList<Built>(); val shorts = ArrayList<Built>()
+        // gli archi delle lunghe prese (per il corridoio): un insieme per lunga, fatto una volta
+        val longSets = ArrayList<com.carrotsearch.hppc.IntHashSet>()
+        var cutLongs = -1; var cutDeferred = -1; var cutShorts = -1
+        val maxBuilt = perLeg * MAX_BUILT_PER_KEPT
+        val diagBuilt = if (diag != null) maxOf(diag.maxKept, perLeg) * MAX_BUILT_PER_KEPT else 0
+        var builtL = 0; var builtS = 0
+        fun stop(ci: Int, why: String) { if (stopAt < 0) { stopAt = ci; stopWhy = why } }
+        // una catena ricostruita, o null (scartata, col motivo nella traccia)
+        fun build(ci: Int, c: Chain): Built? {
+            if ((ci and 15) == 0) cancel.check()
             val up = com.carrotsearch.hppc.IntArrayList()
             var cur = c.tail
             while (cur >= 0 && up.size() <= nA) { up.add(cur); cur = fPar[cur] }
@@ -229,28 +275,93 @@ class DetourSearch internal constructor(private val net: MotorwayNet, private va
             val ids = arcs.toArray()
             seen.clear()
             var repeated = !seen.add(net.arcTail[ids[0]])
-            var m = 0.0; var ms = 0L
-            for (a in ids) { if (!seen.add(net.arcHead[a])) repeated = true; m += net.arcM[a]; ms += net.arcMs[a] }
-            if (repeated || m < minDetourM) { fate?.put(c.head, if (repeated) "nodo ripetuto" else "corta (%.1f km)".format(m / 1000)); continue }
-            val p = c.p - s; val q = c.q - s
-            val twin = out.firstOrNull { o -> o.fromPos == p && o.toPos == q && commonMeters(o.arcs, ids) >= UNIFY_SHARE * minOf(m, o.detourM) }
-                ?: extra?.firstOrNull { o -> o.fromPos == p && o.toPos == q && commonMeters(o.arcs, ids) >= UNIFY_SHARE * minOf(m, o.detourM) }
-            if (twin != null) { fate?.put(c.head, "doppione (stesse posizioni, 80 % in comune)"); continue }
+            var m = 0.0; var ms = 0L; var accM = 0.0
+            for (a in ids) {
+                if (!seen.add(net.arcHead[a])) repeated = true
+                m += net.arcM[a]; ms += net.arcMs[a]
+                if (net.kind(a) != MotorwayNet.KIND_MAJOR) accM += net.arcM[a]
+            }
+            if (repeated || m < minDetourM) { fate?.put(c.head, if (repeated) "nodo ripetuto" else "corta (%.1f km)".format(m / 1000)); return null }
+            // quasi tutta su strade d'accesso: un giro urbano, non un'altra autostrada
+            if (accM > maxAccessShare * m + 1.0) { fate?.put(c.head, "strade d'accesso (%.0f %%)".format(100 * accM / m)); return null }
             val bestMs = trace.preMs[c.q] - trace.preMs[c.p]
+            // mai accettata dal giudice, nemmeno da sola (la sanità più larga): fuori prima dei posti
+            if (saneA.isFinite() && ms > saneA * bestMs + saneBMs) { fate?.put(c.head, "locale (%.0f s, migliore %.0f s)".format(ms / 1000.0, bestMs / 1000.0)); return null }
+            val p = c.p - s; val q = c.q - s
+            val isTwin = { o: Built -> o.d.fromPos == p && o.d.toPos == q && commonMeters(o.d.arcs, ids) >= UNIFY_SHARE * minOf(m, o.d.detourM) }
+            if (longs.any(isTwin) || deferred.any(isTwin) || shorts.any(isTwin)) { fate?.put(c.head, "doppione (stesse posizioni, 80 % in comune)"); return null }
             val d = Detour(leg, p, q, ids, c.detourW - (trace.pre[c.q] - trace.pre[c.p]), ms - bestMs, m - (trace.preM[c.q] - trace.preM[c.p]),
                 c.plateauW, ms, bestMs, m, c.score)
-            if (over) { extra!! += d; fate?.put(c.head, "oltre il tetto") } else { out += d; fate?.put(c.head, "tenuta") }
             diag?.rank?.put(d, ci)
+            return Built(d, c.head, m)
         }
-        if (diag != null && cnt != null && extra != null && fate != null) {
+        // le lunghe
+        for (ci in 0 until longCount) {
+            val c = chains[ci]
+            if (cutLongs < 0 && (longs.size >= perLeg || builtL >= maxBuilt)) {
+                cutLongs = longs.size; cutDeferred = deferred.size
+                stop(ci, if (longs.size >= perLeg) "$perLeg tenute (perLeg)" else "$maxBuilt ricostruite")
+            }
+            if (cutLongs >= 0 && (diag == null || longs.size + deferred.size >= diag.maxKept || builtL >= diagBuilt)) break
+            looked = ci + 1
+            builtL++
+            val b = build(ci, c) ?: continue
+            // stesso corridoio di una lunga già presa: rimandata finché ci sono lunghe di altri corridoi
+            if (cutLongs < 0 && longSets.any { set -> commonMeters(set, b.d.arcs) >= CORRIDOR_SHARE * b.m }) {
+                b.d.rankClass = Detour.RANK_SAME_CORRIDOR; deferred += b
+                continue
+            }
+            longs += b
+            if (cutLongs < 0) longSets += com.carrotsearch.hppc.IntHashSet(b.d.arcs.size * 2).also { set -> for (a in b.d.arcs) set.add(a) }
+        }
+        if (cutLongs < 0) { cutLongs = longs.size; cutDeferred = deferred.size }
+        val lCount = cutLongs + cutDeferred
+        // le corte: quante ne servono (i posti tenuti per loro, o quelli lasciati dalle lunghe)
+        val reserve = minOf(SHORT_RESERVE, perLeg / 4)
+        val needShorts = minOf(perLeg, maxOf(reserve, perLeg - lCount))
+        for (ci in longCount until chains.size) {
+            val c = chains[ci]
+            if (cutShorts < 0 && (shorts.size >= needShorts || builtS >= maxBuilt)) {
+                cutShorts = shorts.size
+                if (shorts.size < needShorts) stop(ci, "$maxBuilt ricostruite")
+            }
+            if (cutShorts >= 0 && (diag == null || shorts.size >= diag.maxKept || builtS >= diagBuilt)) break
+            looked = maxOf(looked, ci + 1)
+            builtS++
+            val b = build(ci, c) ?: continue
+            b.d.rankClass = Detour.RANK_SHORT
+            shorts += b
+        }
+        if (cutShorts < 0) cutShorts = shorts.size
+        // le tenute: le lunghe (poi le rimandate) meno i posti delle corte, poi le corte
+        val nS = minOf(cutShorts, maxOf(reserve, perLeg - lCount))
+        val nL = minOf(lCount, perLeg - nS)
+        val longPart = longs.take(cutLongs) + deferred.take(cutDeferred)
+        val kept = longPart.take(nL) + shorts.take(nS)
+        val out = ArrayList<Detour>(kept.size).also { o -> for (b in kept) o += b.d }
+        if (diag != null && cnt != null && fate != null) {
+            val keptSet = java.util.IdentityHashMap<Built, Boolean>().also { m -> for (b in kept) m[b] = true }
+            val extraBuilt = (longs + deferred + shorts).filter { it !in keptSet.keys }.let { rest ->
+                // l'ordine della traccia: le lunghe oltre il tetto, le rimandate, le corte
+                rest.sortedBy { if (it.d.rankClass == Detour.RANK_LONG) 0 else if (it.d.rankClass == Detour.RANK_SAME_CORRIDOR) 1 else 2 }
+            }.take(maxOf(0, diag.maxKept - out.size))
+            for (b in kept) fate[b.head] = if (b.d.rankClass == Detour.RANK_SAME_CORRIDOR) "tenuta (stesso corridoio, rimandata)" else "tenuta"
+            for (b in (longs + deferred + shorts)) if (b !in keptSet.keys)
+                fate[b.head] = if (b.d.rankClass == Detour.RANK_SAME_CORRIDOR) "oltre il tetto (stesso corridoio)" else "oltre il tetto"
+            val extra = extraBuilt.map { it.d }
             diag.extra += extra
-            report(diag, leg, s, e, legW, maxFactor, minPlateauShare, minDetourM, cnt, chains, out, extra, fate, built, stopAt, stopWhy, looked)
+            report(diag, leg, s, e, legW, maxFactor, minPlateauShare, minDetourM, cnt, chains, out, extra, fate, builtL + builtS, stopAt, stopWhy, looked)
         }
         return out
     }
 
+    /** Una deviazione ricostruita, con la testa della sua catena e i suoi metri. */
+    private class Built(val d: Detour, val head: Int, val m: Double)
+
     /** Una catena di plateau (passo 3-4): testa, coda, uscita, rientro, plateau, peso fra uscita e rientro, punteggio. */
-    private class Chain(val head: Int, val tail: Int, val p: Int, val q: Int, val plateauW: Double, val detourW: Double, val score: Double)
+    private class Chain(val head: Int, val tail: Int, val p: Int, val q: Int, val plateauW: Double, val detourW: Double, val score: Double,
+                        /** La deviazione è lunga almeno quanto la deviazione minima del giudice (passa prima delle corte). */
+                        val long: Boolean = true)
 
     /** Le righe della traccia di un tratto ([detours] con [DetourTrace]): fuori dai cicli caldi, solo con la traccia. */
     private fun report(diag: DetourTrace, leg: Int, s: Int, e: Int, legW: Double, maxFactor: Double, share: Double, minDetourM: Double, cnt: IntArray,
@@ -377,27 +488,57 @@ class DetourSearch internal constructor(private val net: MotorwayNet, private va
         return score(d.dW, d.plateauW, d.dW + (trace.pre[s + d.toPos] - trace.pre[s + d.fromPos]), tripW)
     }
 
+    /**
+     * Le singole da cui si combinano le combinazioni: le prime [COMBO_TOP] nell'ordine dei posti
+     * ([Detour.rankClass]: le lunghe di corridoi diversi, le rimandate, le corte), poi per [key],
+     * con almeno [COMBO_SHORT_RESERVE] posti alle corte se ce ne sono.
+     * Prima erano le prime per solo punteggio: i giri di svincolo minuscoli prendevano tutti gli 8
+     * posti e le combinazioni non contenevano mai una deviazione lunga.
+     */
+    fun comboTop(ds: List<Detour>, key: (Detour) -> Double = { it.score }): List<Detour> {
+        val sorted = ds.sortedWith(compareBy<Detour>({ it.rankClass }, key))
+        // le corte tengono almeno COMBO_SHORT_RESERVE posti (i cambi in più punti: una lunga e una corta)
+        val shorts = sorted.filter { it.rankClass == Detour.RANK_SHORT }
+        val nS = minOf(shorts.size, maxOf(COMBO_SHORT_RESERVE, COMBO_TOP - (sorted.size - shorts.size)))
+        return sorted.filter { it.rankClass != Detour.RANK_SHORT }.take(COMBO_TOP - nS) + shorts.take(nS)
+    }
+
     private fun commonMeters(a: IntArray, b: IntArray): Double {
         val set = com.carrotsearch.hppc.IntHashSet(a.size * 2)
         for (x in a) set.add(x)
+        return commonMeters(set, b)
+    }
+
+    private fun commonMeters(set: com.carrotsearch.hppc.IntHashSet, b: IntArray): Double {
         var m = 0.0
         for (x in b) if (set.contains(x)) m += net.arcM[x]
         return m
     }
 
     /**
-     * Le combinazioni di 2 (e, con [maxParts] 3, di 3) deviazioni compatibili ([Detour.disjoint])
+     * Le combinazioni di 2 (e, con [maxParts] 3, di 3) deviazioni compatibili ([Detour.disjoint], e
+     * nello stesso tratto senza nodi in comune: con le strade d'accesso due deviazioni disgiunte
+     * sul migliore possono passare per lo stesso incrocio, e il tratto cucito ripeterebbe un nodo)
      * fra le prime 8 di [ds] per punteggio ([key]: [Detour.score], sul tratto, o [tripScore], sul
      * viaggio), dalla più leggera, al più [limit]. Il Δ di una
      * combinazione è la somma: fra le deviazioni resta il migliore, e le svolte di raccordo sono già controllate.
      */
     fun combos(ds: List<Detour>, maxParts: Int = 3, limit: Int = 40, key: (Detour) -> Double = { it.score }): List<List<Detour>> {
-        val top = ds.sortedBy(key).take(COMBO_TOP)
+        val top = comboTop(ds, key)
+        // i nodi della rete di ogni deviazione (solo RAM, al più 8 insiemi)
+        val nodes = top.map { d -> com.carrotsearch.hppc.IntHashSet(d.arcs.size * 2 + 2).also { s -> for (a in d.arcs) { s.add(net.arcTail[a]); s.add(net.arcHead[a]) } } }
+        fun ok(i: Int, j: Int): Boolean {
+            if (!top[i].disjoint(top[j])) return false
+            if (top[i].leg != top[j].leg) return true
+            val (small, big) = if (nodes[i].size() <= nodes[j].size()) nodes[i] to nodes[j] else nodes[j] to nodes[i]
+            for (c in small) if (big.contains(c.value)) return false
+            return true
+        }
         val out = ArrayList<List<Detour>>()
         for (i in top.indices) for (j in i + 1 until top.size) {
-            if (!top[i].disjoint(top[j])) continue
+            if (!ok(i, j)) continue
             out += sortedParts(top[i], top[j])
-            if (maxParts >= 3) for (k in j + 1 until top.size) if (top[k].disjoint(top[i]) && top[k].disjoint(top[j])) out += sortedParts(top[i], top[j], top[k])
+            if (maxParts >= 3) for (k in j + 1 until top.size) if (ok(i, k) && ok(j, k)) out += sortedParts(top[i], top[j], top[k])
         }
         return out.sortedBy { c -> c.sumOf { it.dW } }.take(limit)
     }
@@ -438,7 +579,24 @@ class DetourSearch internal constructor(private val net: MotorwayNet, private va
         const val UNIFY_SHARE = 0.8
         /** Le singole da cui si combinano le combinazioni. */
         const val COMBO_TOP = 8
-        /** Quante catene si ricostruiscono al più per deviazione tenuta (le altre cadono per nodi ripetuti o doppioni). */
+        /**
+         * Le deviazioni tenute al più per tratto. Era 12: con le lunghe prima delle corte e la
+         * varietà di corridoio 16 lascia posto anche ai giri di svincolo per le combinazioni; la
+         * memoria resta sotto il tetto degli insiemi offerti per richiesta (`MAX_M_SETS` = 64).
+         */
+        const val PER_LEG = 16
+        /**
+         * Una deviazione lunga con almeno questa quota dei propri km in comune con una lunga già
+         * presa è dello stesso corridoio: non occupa un posto finché ce ne sono di corridoi diversi.
+         */
+        const val CORRIDOR_SHARE = 0.6
+        /** Una catena è lunga se anche il pezzo del migliore che sostituisce è almeno questa quota della soglia. */
+        const val LONG_BEST_SHARE = 0.5
+        /** I posti per tratto tenuti alle corte se ce ne sono (al più un quarto di perLeg). */
+        const val SHORT_RESERVE = 4
+        /** I posti delle prime per le combinazioni tenuti alle corte se ce ne sono. */
+        const val COMBO_SHORT_RESERVE = 2
+        /** Quante catene si ricostruiscono al più per deviazione tenuta, per giro (le altre cadono per nodi ripetuti, doppioni, giri urbani). */
         private const val MAX_BUILT_PER_KEPT = 20
         /** I gruppi di archi scritti al più per sonda nella traccia. */
         private const val MAX_WATCH_GROUPS = 60

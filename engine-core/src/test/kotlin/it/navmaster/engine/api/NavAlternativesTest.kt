@@ -322,21 +322,84 @@ class VariantRulesTest {
     }
 
     @Test
-    fun `new roads come first and name the variant`() {
+    fun `new roads name the variant, only new motorways come first`() {
+        // (prima ogni strada nuova dava il bonus, anche la L536: ora solo le autostrade)
         assertTrue(l536.size >= 6, "archi L536: ${l536.size}")
+        assertTrue(a5.size >= 30, "archi A5: ${a5.size}")
         val b = plain.take(100)
         val best = path(b)
         val j = judge(best)
         val plainV = replace(b, 30, 59, plain.subList(100, 130), 37_000)
         val withRef = replace(b, 30, 59, l536.take(6) + plain.subList(500, 524), 37_000)
         val v = j.evaluate(withRef, listOf(best), false)
+        val pv = j.evaluate(plainV, listOf(best), false)
+        // la strada nuova dà il nome, ma la L536 non è un'autostrada: nessun bonus
         assertEquals(listOf("L536"), v.newRefs); assertEquals("via L536", v.label)
-        assertTrue(v.score < j.evaluate(plainV, listOf(best), false).score)
-        // la scelta: una sola variante, quella con la strada nuova
+        assertEquals(emptyList(), j.motorwayRefs(withRef, v.newRefs))
+        assertEquals(pv.score, v.score, 1e-12)
+        // l'A5 al posto dello stesso pezzo, stessi tempi e km: il bonus dell'autostrada nuova e il premio della quota autostradale
+        val withA5 = replace(b, 30, 59, a5.take(30), 37_000)
+        val va = j.evaluate(withA5, listOf(best), false)
+        assertEquals(listOf("A5"), va.newRefs); assertEquals("via A5", va.label)
+        assertEquals(pv.score - VariantRules.NEW_REF_BONUS - VariantRules.MW_SWAP_BONUS, va.score, 1e-9)
+        // la scelta: una sola variante, quella sull'autostrada nuova
         val pool = VariantPool(j, NavAlternativesOptions(count = 2))
-        pool.drafts += plainV; pool.drafts += withRef
+        pool.drafts += plainV; pool.drafts += withRef; pool.drafts += withA5
         pool.admit(1)
-        assertEquals(1, pool.accepted.size); assertSame(withRef, pool.accepted[0].first)
+        assertEquals(1, pool.accepted.size); assertSame(withA5, pool.accepted[0].first)
+    }
+
+    @Test
+    fun `a trunk road is not a new motorway`() {
+        // le superstrade con un ref (statali come la SS42 della prova Bolzano→Milano): strade nuove sì, bonus no
+        // (una superstrada con un ref da autostrada, RA/T/E45, conta invece come autostrada)
+        val trunk = (0 until g.graph.edgeCount).filter { info.isMotorwayOrTrunk(it) && !info.isMotorway(it) && info.ref(it)?.let { r -> !CorridorAnalyzer.isMotorwayRef(r) } == true }
+        val byRef = trunk.groupBy { info.ref(it)!! }.maxByOrNull { it.value.size }
+        println("superstrade con ref su Heidelberg: " + trunk.groupingBy { info.ref(it) }.eachCount())
+        if (byRef == null || byRef.value.size < 6) return
+        val b = plain.take(100)
+        val best = path(b)
+        val j = judge(best)
+        val plainV = replace(b, 30, 59, plain.subList(100, 130), 37_000)
+        val withTrunk = replace(b, 30, 59, byRef.value.take(6) + plain.subList(500, 524), 37_000)
+        val v = j.evaluate(withTrunk, listOf(best), false)
+        assertEquals(listOf(byRef.key), v.newRefs)
+        assertEquals(emptyList(), j.motorwayRefs(withTrunk, v.newRefs))
+        assertEquals(j.evaluate(plainV, listOf(best), false).score, v.score, 1e-12)
+    }
+
+    @Test
+    fun `motorway in place of plain road earns the swap premium, the reverse pays it`() {
+        assertTrue(a5.size >= 40, "archi A5: ${a5.size}")
+        // il migliore ha già 10 km di A5: l'A5 della variante non è una strada nuova, resta solo il premio
+        val b = a5.take(10) + plain.take(90)
+        val best = path(b)
+        val j = judge(best)
+        val d1 = VariantRules.dMin1(best.meters)
+        val plainV = replace(b, 40, 69, plain.subList(100, 130), 37_000)
+        val mwV = replace(b, 40, 69, a5.subList(10, 40), 37_000)
+        val vp = j.evaluate(plainV, listOf(best), false); val vm = j.evaluate(mwV, listOf(best), false)
+        assertEquals(emptyList(), vm.newRefs)
+        assertEquals(1.0, j.motorwayGain(j.runsFromBest(mwV), d1), 1e-9)
+        assertEquals(vp.score - VariantRules.MW_SWAP_BONUS, vm.score, 1e-9)
+        // un pezzo sostituito corto (6 km su dMin1 15 km) vale in proporzione
+        val shortV = replace(b, 40, 45, a5.subList(10, 16), 37_000)
+        assertEquals(6_000.0 / d1, j.motorwayGain(j.runsFromBest(shortV), d1), 1e-9)
+        // una statale al posto dell'autostrada: nessun premio, lo stesso come malus
+        val best2 = path(a5.take(40) + plain.take(60))
+        val j2 = judge(best2)
+        val down = replace(a5.take(40) + plain.take(60), 5, 34, plain.subList(200, 230), 36_000)
+        val d2 = VariantRules.dMin1(best2.meters)
+        assertEquals(0.0, j2.motorwayGain(j2.runsFromBest(down), d2), 1e-12)
+        val loss = j2.motorwayGain(j2.runsFromBest(down), d2, loss = true)
+        assertTrue(loss > 0.5, "perdita $loss")
+        val r = down.millis.toDouble() / best2.millis; val rk = down.meters / best2.meters
+        assertEquals(0.6 * r + 0.4 * rk + VariantRules.MW_SWAP_BONUS * loss, j2.evaluate(down, listOf(best2), false).score, 1e-9)
+        // la scelta fra le due varianti di pari tempo e km: quella che porta sull'autostrada
+        val pool = VariantPool(j, NavAlternativesOptions(count = 2))
+        pool.drafts += plainV; pool.drafts += mwV
+        pool.admit(1)
+        assertSame(mwV, pool.accepted.single().first)
     }
 }
 
@@ -420,7 +483,9 @@ class NavAlternativesServiceTest {
     @Test
     fun `motorway detours alone - spliced variants, no searches, off when avoiding motorways`() {
         val service = DirectionsService(g)
-        val mOnly = NavAlternativesOptions(count = 3, sources = setOf(VariantSource.MOTORWAY), minDetourScale = 0.02)
+        // soglie a 0,3: a 0,02 la sanità locale del giudice (2·migliore + 1200 s in scala: 24 s) scarta ogni
+        // deviazione di Heidelberg, e la fonte M non le offre più
+        val mOnly = NavAlternativesOptions(count = 3, sources = setOf(VariantSource.MOTORWAY), minDetourScale = 0.3)
         var variants = 0; var withDetours = 0
         for (seed in 1L..40L) {
             val pts = Heidelberg.points(if (seed % 3 == 0L) 3 else 2, seed + 300)
@@ -514,11 +579,11 @@ class NavAlternativesServiceTest {
         val r = NavAlternativesEngine(service, RequestContext(log = { lines += it })).run(req, opt0)
         assertEquals("budget", r.note); assertEquals(0, r.variants.size)
         assertEquals(1, service.netCache.size)
-        assertTrue(lines.any { "M rete" in it && "costruita" in it && "troncata" !in it }, "$lines")
+        assertTrue(lines.any { "M rete" in it && "autostrade costruite" in it && "troncata" !in it }, "$lines")
         // la richiesta dopo la trova in cache
         lines.clear()
         NavAlternativesEngine(service, RequestContext(log = { lines += it })).run(req, NavAlternativesOptions(count = 3, sources = setOf(VariantSource.MOTORWAY), minDetourScale = 0.02))
-        assertTrue(lines.any { "M rete" in it && "dalla cache" in it }, "$lines")
+        assertTrue(lines.any { "M rete" in it && "autostrade dalla cache" in it }, "$lines")
     }
 
     @Test

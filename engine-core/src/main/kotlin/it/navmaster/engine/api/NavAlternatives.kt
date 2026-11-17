@@ -7,6 +7,7 @@ import com.carrotsearch.hppc.LongIntHashMap
 import it.navmaster.engine.index.Snap
 import it.navmaster.engine.routing.BestTrace
 import it.navmaster.engine.routing.CancelToken
+import it.navmaster.engine.routing.Circle
 import it.navmaster.engine.routing.CorridorAnalyzer
 import it.navmaster.engine.routing.Detour
 import it.navmaster.engine.routing.DetourSearch
@@ -161,7 +162,15 @@ internal class TripContext(val extraMillis: Long = 0L, val extraMeters: Double =
  * lettura: serve solo per i percorsi tenuti (il migliore compreso), non per ogni candidato (memoria
  * della fonte M: circa 16 byte per arco per candidato risparmiati).
  */
-internal class DraftFacts(private val edges: IntArray, val refMeters: IntDoubleHashMap, val signature: List<Pair<String, Double>>, val mw: BooleanArray, val mwMeters: Double) {
+internal class DraftFacts(private val edges: IntArray, val refMeters: IntDoubleHashMap, val signature: List<Pair<String, Double>>, val mw: BooleanArray, val mwMeters: Double,
+                          /**
+                           * Per arco: autostradale, cioè `highway=motorway` (rampe comprese) o una superstrada
+                           * (`trunk`) con un ref da autostrada ([CorridorAnalyzer.isMotorwayRef]: RA, T, E45…);
+                           * le superstrade statali (SS42, SR450, SS11, B37) no. La quota autostradale del punteggio.
+                           */
+                          val motorway: BooleanArray = BooleanArray(edges.size),
+                          /** ref → i suoi metri autostradali ([motorway]): il bonus delle strade nuove vale solo per le autostrade. */
+                          val refMotorwayMeters: IntDoubleHashMap = IntDoubleHashMap()) {
     val edgeSet: IntHashSet by lazy { IntHashSet(edges.size * 2).also { s -> for (e in edges) s.add(e) } }
 }
 
@@ -173,7 +182,7 @@ internal class DraftFacts(private val edges: IntArray, val refMeters: IntDoubleH
 internal class Verdict(val tier: Int, val reason: String, val dMaxM: Double, val newRefs: List<String>, val label: String, val score: Double = 0.0)
 
 /** Un tratto contiguo di una variante fuori dagli archi di un altro percorso. */
-internal class Run(val from: Int, val to: Int, val meters: Double, val ms: Long, val mwMeters: Double) {
+internal class Run(val from: Int, val to: Int, val meters: Double, val ms: Long, val mwMeters: Double, val motMeters: Double = 0.0) {
     /** Le posizioni sul migliore dell'ultimo arco comune prima e del primo dopo (-1 / size se nessuno). */
     var anchorFrom = -1; var anchorTo = -1
     val mwShare: Double get() = if (meters > 0) mwMeters / meters else 0.0
@@ -184,16 +193,21 @@ internal object VariantRules {
     /** La deviazione minima del livello 1 per un viaggio di [L] metri. */
     fun dMin1(L: Double): Double = minOf(40_000.0, maxOf(0.05 * L, minOf(15_000.0, 0.25 * L)))
 
-    /** I tratti massimali di [v] con archi fuori da [k]; [mw]: per arco di [v], autostrada o superstrada. */
-    fun runsOff(v: Draft, k: IntHashSet, mw: BooleanArray? = null): List<Run> {
+    /** I tratti massimali di [v] con archi fuori da [k]; [mw]: per arco di [v], autostrada o superstrada; [mot]: solo autostrada. */
+    fun runsOff(v: Draft, k: IntHashSet, mw: BooleanArray? = null, mot: BooleanArray? = null): List<Run> {
         val out = ArrayList<Run>()
         var i = 0
         val n = v.edgeIds.size
         while (i < n) {
             if (k.contains(v.edgeIds[i])) { i++; continue }
-            var j = i; var m = 0.0; var ms = 0L; var mwm = 0.0
-            while (j < n && !k.contains(v.edgeIds[j])) { m += v.edgeM[j]; ms += v.edgeMs[j]; if (mw != null && mw[j]) mwm += v.edgeM[j]; j++ }
-            out += Run(i, j - 1, m, ms, mwm)
+            var j = i; var m = 0.0; var ms = 0L; var mwm = 0.0; var motm = 0.0
+            while (j < n && !k.contains(v.edgeIds[j])) {
+                m += v.edgeM[j]; ms += v.edgeMs[j]
+                if (mw != null && mw[j]) mwm += v.edgeM[j]
+                if (mot != null && mot[j]) motm += v.edgeM[j]
+                j++
+            }
+            out += Run(i, j - 1, m, ms, mwm, motm)
             i = j
         }
         return out
@@ -219,6 +233,32 @@ internal object VariantRules {
     /** Una strada «nuova» ha almeno 5 km nella variante e meno di 1 km in ogni tenuto. */
     const val NEW_REF_M = 5_000.0
     const val ABSENT_REF_M = 1_000.0
+
+    // il punteggio della scelta golosa (più basso = meglio):
+    // 0,6·r + 0,4·rk − NEW_REF_BONUS·(autostrade nuove, al più 2) − COMBO_BONUS (2+ deviazioni, senza lasciare l'autostrada)
+    // − MW_SWAP_BONUS·guadagno + MW_SWAP_BONUS·perdita
+    /** Per ogni autostrada nuova (al più [NEW_REF_MAX]): una strada nuova vale solo se è autostrada per almeno [NEW_REF_MW_SHARE] dei suoi km nella variante. */
+    const val NEW_REF_BONUS = 0.04
+    const val NEW_REF_MAX = 2
+    const val NEW_REF_MW_SHARE = 0.5
+    /** Una combinazione di più deviazioni (cambi di autostrada in più punti). */
+    const val COMBO_BONUS = 0.02
+    /**
+     * Il premio quando la variante sostituisce km non autostradali del migliore con autostrada,
+     * dello stesso ordine di un'autostrada nuova: per ogni tratto deviato il guadagno di quota
+     * autostradale ([DraftFacts.motorway]: quota del tratto meno quella del pezzo del migliore che
+     * sostituisce, se positivo) pesato col pezzo sostituito su dMin1 (al più 1: un pezzo di 1 km
+     * vale poco), sommato sui tratti e al più 1. Una deviazione su statale al posto di
+     * un'autostrada (guadagno negativo) non prende nulla. Le superstrade statali (`trunk` con ref
+     * SS/SR/B: SR450, SS11, SS42) non contano come autostrada; quelle con un ref da autostrada (RA,
+     * T, E45) sì. Esempio Bolzano→Milano: il migliore fa SR450+SS11 fra A22 e A4, la variante A22
+     * fino a Verona e A4 sostituisce ~50 km di statali con autostrada (guadagno ~0,8-1: −0,03/0,04).
+     * Il caso inverso (una statale al posto dell'autostrada del migliore) paga lo stesso come malus:
+     * per un camion le statali che attraversano i paesi valgono meno a parità di tempo e km.
+     */
+    const val MW_SWAP_BONUS = 0.04
+    /** Il bonus delle combinazioni solo se la quota autostradale persa ([MW_SWAP_BONUS]) non supera questa. */
+    const val COMBO_MAX_LOSS = 0.1
 }
 
 /**
@@ -243,6 +283,11 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
     private val bestPos = IntIntHashMap(best.edgeIds.size * 2)
     private val bestPreMs = LongArray(best.edgeIds.size + 1)
     private val bestPreM = DoubleArray(best.edgeIds.size + 1)
+    /** I metri cumulati autostradali del migliore ([DraftFacts.motorway], prefisso come [bestPreM]): calcolati alla prima variante. */
+    private val bestPreMot: DoubleArray by lazy {
+        val mot = facts(best).motorway
+        DoubleArray(best.edgeIds.size + 1).also { a -> for (i in best.edgeIds.indices) a[i + 1] = a[i] + (if (mot[i]) best.edgeM[i] else 0.0) }
+    }
 
     init {
         var leg = 0
@@ -271,21 +316,33 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
     fun facts(d: Draft): DraftFacts {
         d.facts?.let { return it }
         val refs = IntDoubleHashMap()
+        val refsMot = IntDoubleHashMap()
         val mw = BooleanArray(d.edgeIds.size)
+        val mot = BooleanArray(d.edgeIds.size)
         var mwm = 0.0
+        // per ref d'una superstrada: 1 se è un ref da autostrada, 2 se no (letto una volta per ref in questa bozza)
+        val trunkRef = com.carrotsearch.hppc.IntByteHashMap()
         for (i in d.edgeIds.indices) {
             val e = d.edgeIds[i]
-            if (info.isMotorwayOrTrunk(e)) { mw[i] = true; mwm += d.edgeM[i] }
             val r = info.refId(e)
-            if (r >= 0) refs.addTo(r, d.edgeM[i])
+            if (info.isMotorwayOrTrunk(e)) {
+                mw[i] = true; mwm += d.edgeM[i]
+                // autostradale: `highway=motorway`, o una superstrada con un ref da autostrada (RA, T, A, E45…)
+                mot[i] = info.isMotorway(e) || r >= 0 && run {
+                    var c = trunkRef.get(r)
+                    if (c.toInt() == 0) { c = if (CorridorAnalyzer.isMotorwayRef(info.refName(r))) 1 else 2; trunkRef.put(r, c) }
+                    c.toInt() == 1
+                }
+            }
+            if (r >= 0) { refs.addTo(r, d.edgeM[i]); if (mot[i]) refsMot.addTo(r, d.edgeM[i]) }
         }
-        return DraftFacts(d.edgeIds, refs, corridors.signature(d.legs), mw, mwm).also { d.facts = it }
+        return DraftFacts(d.edgeIds, refs, corridors.signature(d.legs), mw, mwm, mot, refsMot).also { d.facts = it }
     }
 
     /** I tratti di [v] fuori dal migliore, con le ancore sul migliore. */
     fun runsFromBest(v: Draft): List<Run> {
         val f = facts(v)
-        val runs = VariantRules.runsOff(v, facts(best).edgeSet, f.mw)
+        val runs = VariantRules.runsOff(v, facts(best).edgeSet, f.mw, f.motorway)
         for (r in runs) {
             r.anchorFrom = if (r.from > 0) posInBest(v, r.from - 1, -1) else -1
             r.anchorTo = if (r.to + 1 < v.edgeIds.size) posInBest(v, r.to + 1, best.edgeIds.size) else best.edgeIds.size
@@ -368,7 +425,7 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
         val newRefs = newRefs(v, kept)
         val tier1Time = (r <= opt.tier1Factor && rk <= opt.tier1KmFactor) || (opt.allowFewerKm && rk < 1.0 && r <= opt.maxFactor)
         val tier1Rest = dMax >= d1 && majorMs >= VariantRules.T1_RUN_MS * scale && sane(runsB, VariantRules.T1_A, VariantRules.T1_B_MS)
-        val score = 0.6 * r + 0.4 * rk - 0.04 * minOf(2, newRefs.size) - (if (v.parts >= 2) 0.02 else 0.0)
+        val score = score(v, r, rk, newRefs, runsB, d1)
         fun ok(tier: Int, reason: String = "") = Verdict(tier, reason, dMax, newRefs, label(v, newRefs, majorB), score)
         if (tier1Time && tier1Rest && mwOk) return ok(1)
         val withinMax = r <= opt.maxFactor && (rk <= opt.maxKmFactor || (opt.allowFewerKm && rk < 1.0))
@@ -433,10 +490,57 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
         sb.append("; L2: entro ${yn(withinMax)} (≤ %.2f/%.2f)".format(opt.maxFactor, opt.maxKmFactor)).append(", dMax ≥ 0,6·d1 ${yn(dMax >= VariantRules.T2_D * d1)}, corsa ≥ 180 s ${yn(majorMs >= VariantRules.T2_RUN_MS * scale)}, sana 1,8·+900 s ")
             .append(worst(VariantRules.T2_A, VariantRules.T2_B_MS))
         val nr = newRefs(v, kept)
-        val score = 0.6 * r + 0.4 * rk - 0.04 * minOf(2, nr.size) - (if (v.parts >= 2) 0.02 else 0.0)
-        sb.append("; strade nuove ").append(nr.ifEmpty { listOf("nessuna") }.joinToString(" ")).append(", parti ${v.parts}, punteggio %.3f; firma ".format(score))
+        val score = score(v, r, rk, nr, runsB, d1)
+        sb.append("; strade nuove ").append(nr.ifEmpty { listOf("nessuna") }.joinToString(" ")).append(" (autostrade ").append(motorwayRefs(v, nr).ifEmpty { listOf("nessuna") }.joinToString(" "))
+            .append("), guadagno autostradale %.2f, perdita %.2f, parti ${v.parts}, punteggio %.3f; firma ".format(motorwayGain(runsB, d1), motorwayGain(runsB, d1, loss = true), score))
             .append(f.signature.joinToString(" ") { it.first + " %.0f".format(it.second) })
         return sb.toString()
+    }
+
+    /**
+     * Il punteggio della scelta golosa di [v] (più basso = meglio, valori in [VariantRules]):
+     * 0,6·[r] + 0,4·[rk] − il bonus delle autostrade nuove ([motorwayRefs] fra [newRefs]) − quello
+     * delle combinazioni (solo se non lasciano l'autostrada: perdita ≤ [VariantRules.COMBO_MAX_LOSS])
+     * − il premio della quota autostradale guadagnata sul migliore ([motorwayGain]) + lo stesso per
+     * quella persa (una statale al posto dell'autostrada).
+     */
+    private fun score(v: Draft, r: Double, rk: Double, newRefs: List<String>, runsB: List<Run>, d1: Double): Double {
+        val loss = motorwayGain(runsB, d1, loss = true)
+        return 0.6 * r + 0.4 * rk - VariantRules.NEW_REF_BONUS * minOf(VariantRules.NEW_REF_MAX, motorwayRefs(v, newRefs).size) -
+            (if (v.parts >= 2 && loss <= VariantRules.COMBO_MAX_LOSS) VariantRules.COMBO_BONUS else 0.0) -
+            VariantRules.MW_SWAP_BONUS * motorwayGain(runsB, d1) + VariantRules.MW_SWAP_BONUS * loss
+    }
+
+    /** Fra le strade nuove [newRefs] di [v], quelle che in [v] sono autostradali ([DraftFacts.motorway]) per almeno metà dei loro km. */
+    fun motorwayRefs(v: Draft, newRefs: List<String>): List<String> {
+        if (newRefs.isEmpty()) return newRefs
+        val f = facts(v)
+        return newRefs.filter { ref ->
+            val id = info.idOf(ref)
+            id >= 0 && f.refMotorwayMeters.getOrDefault(id, 0.0) >= VariantRules.NEW_REF_MW_SHARE * f.refMeters.getOrDefault(id, 0.0)
+        }
+    }
+
+    /**
+     * La quota autostradale guadagnata sul migliore ([VariantRules.MW_SWAP_BONUS]), in [0, 1]: per
+     * ogni tratto deviato [runsB] (con le ancore, [runsFromBest]) la quota autostradale del
+     * tratto meno quella del pezzo del migliore fra le ancore, se positiva, per min(1, metri del
+     * pezzo sostituito / [d1]); la somma, al più 1. Con [loss] la quota persa (quella del pezzo del
+     * migliore meno quella del tratto, se positiva), allo stesso modo. Solo RAM (i fatti della bozza, già letti).
+     */
+    fun motorwayGain(runsB: List<Run>, d1: Double, loss: Boolean = false): Double {
+        if (runsB.isEmpty()) return 0.0
+        var g = 0.0
+        for (r in runsB) {
+            if (r.meters <= 0) continue
+            val a = r.anchorFrom + 1; val b = maxOf(a, r.anchorTo)
+            val bestM = bestPreM[b] - bestPreM[a]
+            if (bestM <= 0) continue
+            val shareB = (bestPreMot[b] - bestPreMot[a]) / bestM
+            val gain = if (loss) shareB - r.motMeters / r.meters else r.motMeters / r.meters - shareB
+            if (gain > 0) g += gain * minOf(1.0, bestM / maxOf(1.0, d1))
+        }
+        return minOf(1.0, g)
     }
 
     /** Le strade (ref) con almeno 5 km in [v] e meno di 1 km in ogni tenuto, nell'ordine di [v]. */
@@ -687,6 +791,19 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         /** Il margine di peso di una deviazione, riferito al suo tratto, al più questo (un tratto corto in un viaggio lungo). */
         const val MAX_LEG_FACTOR = 3.0
         /**
+         * I cerchi d'accesso della rete M ([Circle]): attorno a ogni punto del viaggio le strade
+         * primarie e secondarie entro 10 km (le terziarie entro 4 km), al più un quarto del tratto
+         * più lungo che tocca il punto. Torino centro → tangenziale A55: ~8 km di strade urbane.
+         */
+        const val ACCESS_RADIUS_M = 10_000.0
+        const val ACCESS_LEG_SHARE = 0.25
+        /**
+         * Una deviazione M con più di questa quota dei km su strade d'accesso (primarie, secondarie,
+         * terziarie dei cerchi) è un giro urbano, non un'altra autostrada: scartata. Le strade
+         * d'accesso servono a raggiungere un'altra autostrada dalla parte urbana (Torino centro → A21: 8 km su 225).
+         */
+        const val MAX_ACCESS_SHARE = 0.5
+        /**
          * Gli insiemi di deviazioni della fonte M offerti per richiesta, al più (combinazioni comprese):
          * ogni insieme è un [Draft] con gli archi di tutto il viaggio, e con molti tratti su un viaggio
          * lungo la memoria crescerebbe troppo per il tablet.
@@ -707,8 +824,8 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
 
         /**
          * Gli insiemi offerti dalla fonte M: le combinazioni ([combos], dalle prime [DetourSearch.COMBO_TOP]
-         * singole per punteggio) e le singole [singles] (già in ordine di punteggio su tutto il viaggio,
-         * [DetourSearch.tripScore])
+         * singole, [DetourSearch.comboTop]) e le singole [singles] (già in ordine: [Detour.rankClass],
+         * poi punteggio su tutto il viaggio, [DetourSearch.tripScore])
          * fino a [max] in tutto, mai meno delle prime [DetourSearch.COMBO_TOP].
          */
         internal fun offeredSets(singles: List<Detour>, combos: List<List<Detour>>, max: Int = MAX_M_SETS): List<List<Detour>> =
@@ -930,6 +1047,52 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         private var t0 = 0L
 
         /**
+         * Un cerchio d'accesso per punto del viaggio ([Circle]): raggio [ACCESS_RADIUS_M], al più
+         * [ACCESS_LEG_SHARE] del tratto più lungo che tocca il punto (in un viaggio corto le strade
+         * principali non diventano tutta la rete). Un punto ripetuto (andata e ritorno) una volta;
+         * nessun cerchio per un punto agganciato a un'autostrada o una superstrada (un ricalcolo in
+         * marcia: si è già sulla rete, le strade urbane attorno non servono).
+         */
+        private fun accessCircles(ctx: VariantContext): List<Circle> {
+            val solved = ctx.solved
+            val out = ArrayList<Circle>()
+            for ((j, s) in solved.snaps.withIndex()) {
+                if (s.edge >= 0 && ctx.info.isMotorwayOrTrunk(s.edge)) continue
+                val legM = maxOf(solved.legs.getOrNull(j - 1)?.distance ?: 0.0, solved.legs.getOrNull(j)?.distance ?: 0.0)
+                val r = minOf(ACCESS_RADIUS_M, ACCESS_LEG_SHARE * legM)
+                if (r < 1.0) continue
+                val c = Circle(s.snappedLat, s.snappedLon, r)
+                if (out.none { it.covers(c) }) out += c
+            }
+            return out
+        }
+
+        /**
+         * I nodi del migliore non autostradali dentro un cerchio d'accesso, come semi: solo le
+         * posizioni a non più di 3 raggi di strada dall'inizio o dalla fine di un tratto (fuori
+         * nessun nodo può stare nel cerchio della partenza o dell'arrivo), una lettura delle
+         * coordinate per nodo, fuori dai cicli delle ricerche.
+         */
+        private fun addAccessSeeds(ctx: VariantContext, circles: List<Circle>, seeds: com.carrotsearch.hppc.IntArrayList) {
+            if (circles.isEmpty()) return
+            val g = service.routingGraph.graph
+            val trace = ctx.trace
+            val have = com.carrotsearch.hppc.IntHashSet(seeds.size() * 2).also { h -> for (k in 0 until seeds.size()) h.add(seeds.get(k)) }
+            val maxR = circles.maxOf { it.radiusM }
+            for (l in ctx.solved.legs.indices) {
+                val s = trace.legStart[l]; val e = trace.legStart[l + 1]
+                val legM = ctx.solved.legs[l].distance
+                for (p in s until e) {
+                    val alongM = trace.preM[p]
+                    if (alongM > 3 * maxR && legM - alongM > 3 * maxR) continue
+                    val n = trace.node[p]
+                    if (have.contains(n)) continue
+                    if (Circle.inAny(circles, g.lat(n), g.lon(n), MotorwayNet.KIND_MAIN)) { have.add(n); seeds.add(n) }
+                }
+            }
+        }
+
+        /**
          * La rete autostradale attorno al viaggio: dalla cache del servizio se ne ha una che lo copre
          * (con [RequestContext.useCache]), se no costruita col solo annullamento della richiesta
          * (mai fermata dal tempo dei candidati, che però la conta: una costruzione fermata a metà non
@@ -944,6 +1107,11 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             val seeds = com.carrotsearch.hppc.IntArrayList()
             for (k in trace.node.indices) if (ctx.info.isMotorwayOrTrunk(trace.inEdge[k]) || ctx.info.isMotorwayOrTrunk(trace.outEdge[k])) seeds.add(trace.node[k])
             if (seeds.isEmpty) { log("varianti: M nessun tratto autostradale nel migliore"); return }
+            val mwSeeds = seeds.size()
+            val mwSeedArr = seeds.toArray()
+            // i cerchi d'accesso attorno ai punti, e i nodi del migliore dentro (la parte urbana: deviazioni che escono lì)
+            val circles = accessCircles(ctx)
+            addAccessSeeds(ctx, circles, seeds)
             val seedArr = seeds.toArray()
             // la regione: un'ellisse per tratto coi fuochi sui suoi punti
             val need = Region(solved.legs.indices.map { j ->
@@ -951,17 +1119,29 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
                 Ellipse(a.snappedLat, a.snappedLon, b.snappedLat, b.snappedLon, REGION_FACTOR * solved.legs[j].distance + REGION_EXTRA_M)
             })
             val access = ctx.router.access(graphs.encoding.shared)
-            var built = false
+            var built = false; var accessBuilt = false
             val counts = if (ctx.opt.trace != null) IntArray(4) else null
-            val buildNet = { built = true; MotorwayNet.build(access, seedArr, need, cancel = rc.cancel, counts = counts) }
-            val n = if (!rc.useCache) buildNet()
-                else service.netCache.get(graphs.routerKey(solved.options), need, fits = { c -> seedArr.all { c.netNode(it) >= 0 } }, cancel = rc.cancel, build = buildNet)
+            // la parte autostradale (dai soli semi autostradali): in cache per i viaggi che la regione copre
+            val buildNet = { built = true; MotorwayNet.build(access, mwSeedArr, need, cancel = rc.cancel, counts = counts) }
+            val base = if (!rc.useCache) buildNet()
+                else service.netCache.get(graphs.routerKey(solved.options), need, fits = { c -> mwSeedArr.all { c.netNode(it) >= 0 } }, cancel = rc.cancel, build = buildNet)
+            val tBase = (System.nanoTime() - t0) / 1_000_000
+            // le strade d'accesso dei cerchi di questo viaggio, sopra la parte autostradale (letti solo i nodi nei cerchi)
+            val buildAccess = { accessBuilt = true; MotorwayNet.withAccess(access, base, seedArr, need, circles, cancel = rc.cancel, counts = counts) }
+            val n = when {
+                circles.isEmpty() -> base
+                !rc.useCache -> buildAccess()
+                else -> service.netCache.overlay(base, need, circles, fits = { c -> seedArr.all { c.netNode(it) >= 0 } }, build = buildAccess)
+            }
             // una rete della cache per una regione più grande: solo i nodi che una nuova avrebbe
             allowed = if (built) null else n.mask(need, seedArr)
             net = n
             truncated = n.truncated
             val tNet = (System.nanoTime() - t0) / 1_000_000
-            log("varianti: M rete ${n.arcCount} archi, ${n.nodeCount} nodi " + (if (built) "costruita in $tNet ms" else "dalla cache") + (if (n.truncated) " (troncata)" else ""))
+            log("varianti: M rete ${n.arcCount} archi (${n.accessArcs} d'accesso in ${circles.size} cerchi" + (if (n.accessCapped) ", al tetto" else "") +
+                "), ${n.nodeCount} nodi (${n.accessNodes} solo d'accesso), ${seedArr.size} semi (${seedArr.size - mwSeeds} d'accesso), svolte vietate ${n.turnBans?.size() ?: 0}; autostrade " +
+                (if (built) "costruite in $tBase ms" else "dalla cache") + ", strade d'accesso " +
+                (if (circles.isEmpty()) "nessuna" else if (accessBuilt) "costruite in ${tNet - tBase} ms" else "dalla cache") + (if (n.truncated) " (troncata)" else ""))
             if (ctx.opt.trace != null) traceNet(ctx, n, seedArr, need, if (built) counts else null)
         }
 
@@ -1008,20 +1188,24 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             // il margine e la deviazione minima sul viaggio intero (con gli altri pezzi di un viaggio tra Paesi)
             val w0 = trace.legW.sum() + ctx.trip.extraWeight
             val scale = ctx.opt.minDetourScale
-            val minM = scale * maxOf(VariantRules.T3_D_MIN, VariantRules.T3_D * VariantRules.dMin1(ctx.pool.best.meters + ctx.trip.extraMeters))
+            val d1 = scale * VariantRules.dMin1(ctx.pool.best.meters + ctx.trip.extraMeters)
+            val minM = maxOf(scale * VariantRules.T3_D_MIN, VariantRules.T3_D * d1)
             val all = ArrayList<Detour>()
             val diag = ctx.opt.trace?.let { tr ->
                 DetourTrace(log, { e -> ctx.info.ref(e) }, tr.probes.map { p ->
                     val es = p.legs.flatMap { it.edges }
                     DetourTrace.Watch(p.name, IntArray(es.size) { es[it].edge }, IntArray(es.size) { es[it].adjNode }, DoubleArray(es.size) { es[it].distance })
-                }, maxOf(tr.maxDetoursPerLeg, 12))
+                }, maxOf(tr.maxDetoursPerLeg, DetourSearch.PER_LEG))
             }
             for (j in solved.legs.indices) {
                 budget.check()
                 val lw = trace.legW[j]
                 if (lw <= 0) continue
                 val factor = minOf(MAX_LEG_FACTOR, 1 + PenaltyCandidates.CAP_SLACK * (ctx.opt.maxFactor - 1) * w0 / lw)
-                all += search.detours(j, factor, cancel = budget, minDetourM = minM, diag = diag)
+                // le deviazioni più corte di dMin1 del viaggio dopo le lunghe, solo nell'ordine dei posti
+                // fuori le deviazioni quasi tutte su strade d'accesso e quelle che il giudice non terrebbe mai (sanità del livello 3)
+                all += search.detours(j, factor, cancel = budget, minDetourM = minM, diag = diag, rankMinM = d1, maxAccessShare = MAX_ACCESS_SHARE,
+                    saneA = VariantRules.T3_A, saneBMs = VariantRules.T3_B_MS * scale)
             }
             // un tetto per richiesta: le prime per punteggio su tutto il viaggio (le combinazioni vengono
             // dalle prime 8). Prima l'ordine era quello di Detour.score, riferito al proprio tratto:
@@ -1031,7 +1215,9 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             val onTrip = java.util.IdentityHashMap<Detour, Double>(all.size * 2)
             for (d in all) onTrip[d] = search.tripScore(d, tripW)
             val tripKey = { d: Detour -> onTrip.getValue(d) }
-            all.sortWith(compareBy(tripKey, { it.leg }, { it.fromPos }))
+            // (come nella ricerca: le lunghe di corridoi diversi, poi le rimandate dello stesso corridoio,
+            // poi le corte sotto dMin1, anche per il tetto degli insiemi e per le prime 8 delle combinazioni)
+            all.sortWith(compareBy({ it.rankClass }, tripKey, { it.leg }, { it.fromPos }))
             val comboSets = search.combos(all, key = tripKey)
             val sets = offeredSets(all, comboSets)
             combos = comboSets.size; singles = sets.size - combos
@@ -1077,8 +1263,8 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             }
             for ((i, d) in all.withIndex()) line(i, d, if (d in offered) " (offerta)" else " (oltre il tetto degli insiemi)")
             for ((i, d) in diag.extra.withIndex()) line(all.size + i, d, " (oltre perLeg)")
-            // le coppie fra le prime 8 per punteggio sul viaggio: non disgiunte, e fra queste quelle che si toccano nello stesso nodo
-            val top = all.sortedBy(tripKey).take(DetourSearch.COMBO_TOP)
+            // le coppie fra le prime 8 (come le combinazioni, DetourSearch.comboTop): non disgiunte, e fra queste quelle che si toccano nello stesso nodo
+            val top = search.comboTop(all, tripKey)
             var notDisjoint = 0; var touching = 0
             for (i in top.indices) for (j in i + 1 until top.size) if (!top[i].disjoint(top[j])) {
                 notDisjoint++

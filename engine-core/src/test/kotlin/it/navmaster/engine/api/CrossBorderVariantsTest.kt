@@ -53,6 +53,13 @@ class CrossBorderVariantsTest {
         val opt = NavAlternativesOptions(count = 3, sources = setOf(VariantSource.MOTORWAY, VariantSource.PENALTY, VariantSource.CROSSING), minDetourScale = 0.02)
         val bySource = HashMap<String, Int>()
         var trips = 0
+        // le varianti da un altro valico di una richiesta con la sola fonte V (quando le altre fonti le battono)
+        var crossingOnly = 0
+        fun checkCrossing(v: Map<*, *>) {
+            val tier = v["tier"] as Int
+            assertTrue(tier in 1..3, "livello $tier")
+            assertTrue(v["longer"] != true || (tier >= 2 && (v["factor"] as Double) >= opt.tier1Factor), "più lunga: $v")
+        }
         for (seed in 1L..8L) {
             val n = if (seed % 3 == 0L) 3 else 2
             val pts = Heidelberg.points(n, seed + 700)
@@ -78,11 +85,7 @@ class CrossBorderVariantsTest {
                 assertEquals(i, v["rank"])
                 if (i > 0) bySource.merge(v["source"] as String, 1, Int::plus)
                 // un altro valico: il livello dalla regola sul viaggio intero, «più lunga» coerente
-                if (i > 0 && v["source"] == "crossing") {
-                    val tier = v["tier"] as Int
-                    assertTrue(tier in 1..3, "livello $tier")
-                    assertTrue(v["longer"] != true || (tier >= 2 && (v["factor"] as Double) >= opt.tier1Factor), "più lunga: $v")
-                }
+                if (i > 0 && v["source"] == "crossing") checkCrossing(v)
                 assertTrue(((props["summary"] as Map<*, *>)["duration"] as Double) <= 1.5 * d0 + 1, "durata ${(props["summary"] as Map<*, *>)["duration"]} oltre 1,5 × $d0")
                 assertTrue((v["factor"] as Double) <= 1.5 + 1e-3, "fattore ${v["factor"]}")
             }
@@ -93,8 +96,19 @@ class CrossBorderVariantsTest {
             val ex = features(cb.handle(DirectionsRequest.fromJson("driving-hgv", Heidelberg.body(pts, ""","navmaster":{"roads":true}""")).withNavAlternatives(
                 NavAlternativesOptions(count = 3, excludeBest = true, sources = opt.sources, minDetourScale = 0.02)), countries))
             assertEquals(fs.size - 1, ex.size)
+            // nessuna da un altro valico fra le tenute: la sola fonte V deve comunque arrivare in fondo
+            // (con le strade d'accesso della fonte M una deviazione M può prendere il posto di un valico)
+            if (fs.drop(1).none { ((it["properties"] as Map<*, *>)["navmaster"] as Map<*, *>)["variant"].let { v -> (v as Map<*, *>)["source"] == "crossing" } }) {
+                val only = features(cb.handle(DirectionsRequest.fromJson("driving-hgv", Heidelberg.body(pts, ""","navmaster":{"roads":true}""")).withNavAlternatives(
+                    NavAlternativesOptions(count = 3, sources = setOf(VariantSource.CROSSING), minDetourScale = 0.02)), countries))
+                assertEquals(withoutVariant(plain), withoutVariant(only[0]))
+                for (f in only.drop(1)) {
+                    val v = ((f["properties"] as Map<*, *>)["navmaster"] as Map<*, *>)["variant"] as Map<*, *>
+                    assertEquals("crossing", v["source"]); checkCrossing(v); crossingOnly++
+                }
+            }
         }
-        println("varianti tra Paesi per fonte: $bySource in $trips viaggi")
+        println("varianti tra Paesi per fonte: $bySource in $trips viaggi, da un altro valico con la sola fonte V: $crossingOnly")
         assertTrue(trips >= 4, "viaggi: $trips")
         assertTrue((bySource["crossing"] ?: 0) > 0, "nessuna variante da un altro valico: $bySource")
         assertTrue(bySource.keys.any { it != "crossing" }, "nessuna variante a valichi fissi: $bySource")

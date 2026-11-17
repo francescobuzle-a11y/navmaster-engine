@@ -1,8 +1,10 @@
 package it.navmaster.engine.api
 
 import it.navmaster.engine.RouteOptions
+import it.navmaster.engine.profile.RoadClass
 import it.navmaster.engine.routing.BestTrace
 import it.navmaster.engine.routing.CancelToken
+import it.navmaster.engine.routing.Circle
 import it.navmaster.engine.routing.Detour
 import it.navmaster.engine.routing.DetourSearch
 import it.navmaster.engine.routing.DetourTrace
@@ -167,6 +169,111 @@ class DetourSearchTest {
         assertTrue(lines.any { "catena con testa" in it && "tenuta" in it }, lines.joinToString("\n"))
     }
 
+    /**
+     * Una rete con metri liberi: il corridoio X (1→10→11, lungo e leggero) che rientra in 6 (D1) o,
+     * dopo un'altra uscita, in 7 (D2, l'89 % dei km in comune con D1), l'A22 (Y, 4→20→21→7) e 20
+     * giri di svincolo da 3 m fra 4 e 5 (punteggio migliore di tutte le vie vere).
+     */
+    private class A(val t: Int, val h: Int, val e: Int, val w: Double, val m: Float)
+
+    private fun corridorNet(extra: List<A> = emptyList(), extraNodes: IntArray = IntArray(0), access: Set<Int> = emptySet()): MotorwayNet {
+        val list = (0..7).map { A(it, it + 1, it, 10.0, 1000f) } +
+            listOf(A(1, 10, 400, 1.0, 4000f), A(10, 11, 401, 1.0, 4000f), A(11, 6, 402, 50.0, 1000f), A(11, 12, 403, 30.0, 500f), A(12, 7, 404, 31.0, 500f)) +
+            listOf(A(4, 20, 200, 12.0, 1200f), A(20, 21, 201, 12.0, 1200f), A(21, 7, 202, 12.0, 1200f)) +
+            (0 until 20).flatMap { i -> listOf(A(4, 1000 + i, 5000 + 2 * i, 0.6, 1.5f), A(1000 + i, 5, 5001 + 2 * i, 10.0, 1.5f)) } + extra
+        val nodes = intArrayOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 20, 21) + IntArray(20) { 1000 + it } + extraNodes
+        val idx = nodes.withIndex().associate { it.value to it.index }
+        return MotorwayNet.of(nodes, BooleanArray(nodes.size), IntArray(list.size) { idx.getValue(list[it].t) }, IntArray(list.size) { idx.getValue(list[it].h) },
+            IntArray(list.size) { list[it].e }, BooleanArray(list.size), DoubleArray(list.size) { list[it].w }, IntArray(list.size) { (list[it].w * 1000).toInt() },
+            FloatArray(list.size) { list[it].m }, Region(listOf(Ellipse(0.0, 0.0, 0.0, 0.1, 50_000.0))),
+            kinds = if (access.isEmpty()) ByteArray(0) else ByteArray(list.size) { if (list[it].e in access) MotorwayNet.KIND_MAIN else MotorwayNet.KIND_MAJOR })
+    }
+
+    @Test
+    fun `exit and re-entry loops are short, short detours keep a place, urban and hopeless detours are dropped`() {
+        // un anello di 10 km fra le posizioni 4 e 5 (1 km del migliore), più lento del migliore di 1,8 volte
+        val loop = listOf(A(4, 30, 600, 9.0, 5000f), A(30, 5, 601, 9.0, 5000f))
+        val n = corridorNet(loop, intArrayOf(30))
+        fun last(ds: List<Detour>) = ds.map { d -> edges(n, d).last() }
+        val all = DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 40, rankMinM = 3_000.0)
+        val ring = all.single { edges(n, it).last() == 601 }
+        // lungo 10 km, ma al posto di 1 km: corto (in coda dopo le lunghe)
+        assertEquals(Detour.RANK_SHORT, ring.rankClass)
+        assertEquals(listOf(402, 202, 404), last(all).take(3))
+        // con 4 posti: le 3 lunghe e un posto per le corte; con 3 nessuno (un quarto di perLeg)
+        val four = DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 4, rankMinM = 3_000.0)
+        assertEquals(listOf(Detour.RANK_LONG, Detour.RANK_LONG, Detour.RANK_SAME_CORRIDOR, Detour.RANK_SHORT), four.map { it.rankClass })
+        assertEquals(listOf(402, 202, 404), last(DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 3, rankMinM = 3_000.0)))
+        // nelle prime per le combinazioni almeno due corte, anche con tante lunghe
+        val many = all.filter { it.rankClass != Detour.RANK_SHORT }.let { l -> List(3) { l }.flatten() } + all.filter { it.rankClass == Detour.RANK_SHORT }
+        val top = DetourSearch(n, trace, null as TurnCheck?).comboTop(many)
+        assertEquals(DetourSearch.COMBO_TOP, top.size)
+        assertEquals(DetourSearch.COMBO_SHORT_RESERVE, top.count { it.rankClass == Detour.RANK_SHORT })
+        // mai accettato dal giudice (oltre 1,5 volte il migliore fra uscita e rientro): fuori, le altre restano
+        val sane = DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 40, rankMinM = 3_000.0, saneA = 1.5, saneBMs = 0.0)
+        assertTrue(601 !in last(sane)); assertEquals(all.size - 1, sane.size)
+        // l'A22 su strade d'accesso: un giro urbano, fuori solo con la quota massima
+        val urban = corridorNet(loop, intArrayOf(30), access = setOf(200, 201, 202))
+        assertTrue(202 in last(DetourSearch(urban, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 40, rankMinM = 3_000.0)).map { it })
+        assertTrue(202 !in DetourSearch(urban, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 40, rankMinM = 3_000.0, maxAccessShare = 0.5).map { d -> d.arcs.map { urban.arcEdge[it] }.last() })
+    }
+
+    @Test
+    fun `long detours of different corridors take the places before tiny loops and same-corridor twins`() {
+        val n = corridorNet()
+        // ognuna riconosciuta dal suo ultimo arco
+        fun first(ds: List<Detour>) = ds.map { d -> edges(n, d).last() }
+        val d1 = 402; val d2 = 404; val y = 202
+        // per solo punteggio (nessuna soglia di lunghezza): i 20 giri prendono i posti
+        val plain = DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 2)
+        assertTrue(plain.all { edges(n, it).last() >= 5000 }, "${first(plain)}")
+        // con la deviazione minima del giudice (2 km): prima le lunghe; D2 ha l'89 % dei km di D1, Y è un altro corridoio
+        val ds = DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 2, rankMinM = 2_000.0)
+        assertEquals(listOf(d1, y), first(ds))
+        // con più posti: le lunghe, poi quella dello stesso corridoio rimandata, poi i giri (restano per le combinazioni)
+        val all = DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 30, rankMinM = 2_000.0)
+        assertEquals(listOf(d1, y, d2), first(all).take(3))
+        assertEquals(23, all.size)
+        assertTrue(first(all).drop(3).all { it >= 5000 })
+        // per punteggio D2 viene prima di Y: senza la varietà di corridoio Y resterebbe fuori
+        val dd1 = all[0]; val dd2 = all[2]; val dy = all[1]
+        assertTrue(dd2.score < dy.score && dd1.score < dd2.score)
+        assertEquals(listOf(Detour.RANK_LONG, Detour.RANK_LONG, Detour.RANK_SAME_CORRIDOR), all.take(3).map { it.rankClass })
+        assertTrue(all.drop(3).all { it.rankClass == Detour.RANK_SHORT })
+        // le prime 8 per le combinazioni nello stesso ordine (per solo punteggio sarebbero 8 giri)
+        val search = DetourSearch(n, trace, null as TurnCheck?)
+        assertEquals(listOf(d1, y, d2), first(search.comboTop(all.shuffled(java.util.Random(7)))).take(3))
+        assertTrue(first(all.sortedBy { it.score }.take(DetourSearch.COMBO_TOP)).all { it >= 5000 })
+        // la traccia non cambia le tenute e dice perché D2 è rimandata
+        val lines = ArrayList<String>()
+        val traced = DetourSearch(n, trace, null as TurnCheck?).detours(0, 2.0, perLeg = 2, rankMinM = 2_000.0, diag = DetourTrace({ lines += it }, { null }))
+        assertEquals(first(ds), first(traced))
+        assertTrue(lines.any { "oltre il tetto 21" in it }, lines.joinToString("\n"))
+    }
+
+    @Test
+    fun `combos never share a node in the same leg`() {
+        // due deviazioni disgiunte sul migliore che passano per lo stesso nodo 30: 1→30→3 e 4→30→6 (pesi
+        // scelti perché nessuna via per 30 sia più corta del migliore)
+        val more = listOf(Arc(1, 30, 600, 30.0), Arc(30, 3, 601, 1.0), Arc(4, 30, 602, 1.0), Arc(30, 6, 603, 30.0))
+        val all = arcs + more
+        val nodes = graphNodes + intArrayOf(30)
+        val idx = nodes.withIndex().associate { it.value to it.index }
+        val n = MotorwayNet.of(nodes, BooleanArray(nodes.size), IntArray(all.size) { idx.getValue(all[it].tail) }, IntArray(all.size) { idx.getValue(all[it].head) },
+            IntArray(all.size) { all[it].edge }, BooleanArray(all.size), DoubleArray(all.size) { all[it].w }, IntArray(all.size) { (all[it].w * 1000).toInt() },
+            FloatArray(all.size) { (all[it].w * 100).toFloat() }, Region(listOf(Ellipse(0.0, 0.0, 0.0, 0.1, 50_000.0))))
+        val search = DetourSearch(n, trace, null as TurnCheck?)
+        val ds = search.detours(0, 2.0, minPlateauShare = 0.0)
+        val a = ds.first { edges(n, it) == listOf(600, 601) }; val b = ds.first { edges(n, it) == listOf(602, 603) }
+        val a21 = ds.first { edges(n, it) == listOf(100, 101, 102) }; val a22 = ds.first { edges(n, it) == listOf(200, 201, 202) }
+        assertTrue(a.disjoint(b))
+        val cs = search.combos(listOf(a, b, a21, a22))
+        assertTrue(cs.none { c -> a in c && b in c }, "${cs.map { c -> c.map { edges(n, it) } }}")
+        // l'A21 e l'A22 (nodi diversi) restano combinabili, e ognuna delle due con quella senza nodi in comune
+        assertTrue(cs.any { c -> a21 in c && a22 in c })
+        assertTrue(cs.any { c -> a in c && a22 in c } && cs.any { c -> a21 in c && b in c })
+    }
+
     @Test
     fun `a node mask keeps the arcs with both ends allowed`() {
         val n = net()
@@ -315,6 +422,165 @@ class MotorwayNetTest {
         }
         println("rete grande dalla cache: $compared confronti, $masked con nodi esclusi")
         assertTrue(compared > 0 && masked > 0)
+    }
+
+    /** I cerchi d'accesso di raggio [r] attorno ai due capi del viaggio di [ctx], e i semi coi nodi del migliore dentro. */
+    private fun withAccess(ctx: VariantContext, seeds: IntArray, r: Double): Pair<List<Circle>, IntArray> {
+        val s = ctx.solved.snaps
+        val circles = listOf(Circle(s[0].snappedLat, s[0].snappedLon, r), Circle(s.last().snappedLat, s.last().snappedLon, r))
+        val extra = ctx.trace.node.filter { n -> n !in seeds && Circle.inAny(circles, g.graph.lat(n), g.graph.lon(n), MotorwayNet.KIND_MAIN) }.distinct()
+        return circles to (seeds + extra.toIntArray())
+    }
+
+    @Test
+    fun `access roads only inside the circles, main classes, one-ways respected, capped`() {
+        val (ctx, plainNet, seeds) = motorwayTrip()!!
+        val access = ctx.router.access(g.encoding.shared)
+        val (circles, seeds2) = withAccess(ctx, seeds, 3_000.0)
+        val net = MotorwayNet.build(access, seeds2, plainNet.region, access = circles)
+        println("rete d'accesso: ${net.arcCount} archi (${net.accessArcs} d'accesso), senza ${plainNet.arcCount}")
+        assertTrue(net.accessArcs > 0)
+        val it = g.graph.createEdgeIterator()
+        val keys = HashSet<Long>()
+        for (a in 0 until net.arcCount) {
+            val e = net.arcEdge[a]
+            it.setEdge(e, net.nodeGraph[net.arcTail[a]])
+            assertEquals(net.nodeGraph[net.arcHead[a]], it.adjNode)
+            assertEquals(access.weighting.edgeWeight(it, false), net.arcW[a])
+            assertTrue(net.arcW[a].isFinite())
+            assertTrue(keys.add(e.toLong() shl 1 or (if (net.arcRev[a]) 1L else 0L)), "arco diretto doppio")
+            val rc = it.get(g.encoding.shared.roadClass)
+            when (net.kind(a)) {
+                MotorwayNet.KIND_MAJOR -> assertTrue(ctx.info.isMotorwayOrTrunk(e), "arco $e")
+                MotorwayNet.KIND_MAIN -> assertTrue(rc == RoadClass.PRIMARY || rc == RoadClass.SECONDARY, "arco $e: $rc")
+                else -> assertEquals(RoadClass.TERTIARY, rc)
+            }
+            // i due capi di un arco d'accesso nei cerchi (le terziarie entro 0,4 del raggio)
+            if (net.kind(a) != MotorwayNet.KIND_MAJOR) for (n in listOf(net.arcTail[a], net.arcHead[a]))
+                assertTrue(Circle.inAny(circles, net.nodeLat[n], net.nodeLon[n], net.kind(a)), "arco $e fuori dai cerchi")
+        }
+        // la rete autostradale senza cerchi è tutta dentro
+        for (a in 0 until plainNet.arcCount) assertTrue((plainNet.arcEdge[a].toLong() shl 1 or (if (plainNet.arcRev[a]) 1L else 0L)) in keys)
+        // al tetto delle strade d'accesso: la rete autostradale resta
+        val capped = MotorwayNet.build(access, seeds2, plainNet.region, access = circles, maxAccessArcs = 5)
+        assertTrue(capped.accessCapped && !capped.truncated); assertEquals(5, capped.accessArcs)
+        // nella cache delle reti autostradali solo le reti senza strade d'accesso
+        assertTrue(plainNet.serves(plainNet.region)); assertTrue(!net.serves(plainNet.region))
+        // le stesse strade d'accesso sopra la rete autostradale: gli stessi archi, i suoi con gli stessi indici
+        val over = MotorwayNet.withAccess(access, plainNet, seeds2, plainNet.region, circles)
+        fun arcKeys(n: MotorwayNet) = (0 until n.arcCount).map { a -> listOf(n.arcEdge[a], if (n.arcRev[a]) 1 else 0, n.kind(a).toInt()) }.toSet()
+        assertEquals(arcKeys(net), arcKeys(over))
+        for (a in 0 until plainNet.arcCount) assertEquals(plainNet.arcEdge[a], over.arcEdge[a])
+        assertEquals(net.turnBans!!.size(), over.turnBans!!.size())
+        assertSame(plainNet, MotorwayNet.withAccess(access, plainNet, seeds2, plainNet.region, emptyList()))
+    }
+
+    @Test
+    fun `access circles cover by both radii`() {
+        val big = Circle(49.40, 8.70, 10_000.0)
+        // 4 km dal centro, raggio 2,5 km: dentro il raggio pieno, ma le sue terziarie (1 km) escono dai 4 km delle terziarie
+        val off = Circle(49.40 + 4_000.0 / 111_195.0, 8.70, 2_500.0)
+        assertTrue(!big.covers(off))
+        val near = Circle(49.40 + 1_000.0 / 111_195.0, 8.70, 2_500.0)
+        assertTrue(big.covers(near)); assertTrue(big.covers(big)); assertTrue(!near.covers(big))
+        // il riquadro non cambia il risultato
+        for (k in 0 until 200) {
+            val lat = 49.40 + (k % 20 - 10) * 0.012; val lon = 8.70 + (k / 20 - 5) * 0.03
+            val d = it.navmaster.engine.util.DistanceCalc.haversine(lat, lon, 49.40, 8.70)
+            assertEquals(d <= 10_000.0, big.contains(lat, lon, MotorwayNet.KIND_MAIN))
+            assertEquals(d <= 4_000.0, big.contains(lat, lon, MotorwayNet.KIND_TERTIARY))
+        }
+    }
+
+    @Test
+    fun `turn bans read once give the detours of the turn checks`() {
+        var compared = 0; var bans = 0
+        for (skip in 0 until 6) {
+            val (ctx, plainNet, seeds) = motorwayTrip(skip) ?: break
+            val access = ctx.router.access(g.encoding.shared)
+            val (circles, seeds2) = withAccess(ctx, seeds, 4_000.0)
+            val net = MotorwayNet.withAccess(access, plainNet, seeds2, plainNet.region, circles)
+            val saved = net.turnBans!!
+            bans += saved.size()
+            fun ds() = DetourSearch(net, ctx.trace, access.turnCosts).detours(0, 2.0, minPlateauShare = 0.1, perLeg = 200)
+                .map { d -> listOf(d.fromPos, d.toPos, Math.round(d.dW * 1000), d.dMs, d.arcs.map { net.arcEdge[it] }) }
+            val withBans = ds()
+            net.turnBans = null
+            val asked = ds()
+            net.turnBans = saved
+            assertEquals(asked, withBans, "viaggio $skip")
+            compared++
+        }
+        println("svolte vietate lette una volta: $bans in $compared reti")
+        assertTrue(compared > 0)
+    }
+
+    @Test
+    fun `a detour leaving the best route in its urban part is found`() {
+        var urban = 0; var trips = 0
+        for (skip in 0 until 12) {
+            val (ctx, plainNet, seeds) = motorwayTrip(skip) ?: break
+            val access = ctx.router.access(g.encoding.shared)
+            val (circles, seeds2) = withAccess(ctx, seeds, 4_000.0)
+            val net = MotorwayNet.build(access, seeds2, plainNet.region, access = circles)
+            val leg = ctx.solved.legs[0]
+            val ds = DetourSearch(net, ctx.trace, access.turnCosts).detours(0, 2.0, minPlateauShare = 0.1, perLeg = 100)
+            trips++
+            for (d in ds) {
+                // uscita o rientro su un nodo del migliore che la rete autostradale non ha (la parte urbana)
+                val out = ctx.trace.node[d.fromPos]; val back = ctx.trace.node[d.toPos]
+                if (plainNet.netNode(out) >= 0 && plainNet.netNode(back) >= 0) continue
+                val s = ctx.router.splice(leg, listOf(net.cut(d)), light = true)
+                assertTrue(ctx.router.isLegal(s), "viaggio $skip")
+                assertEquals(leg.weight + d.dW, s.weight, 1e-6 * leg.weight)
+                assertEquals(leg.millis + d.dMs, s.millis)
+                assertSame(leg.edges.first(), s.edges.first()); assertSame(leg.edges.last(), s.edges.last())
+                val nodes = s.edges.dropLast(1).map { it.adjNode }
+                assertEquals(nodes.size, nodes.toSet().size, "viaggio $skip: nodo ripetuto")
+                urban++
+            }
+        }
+        println("deviazioni dalla parte urbana su Heidelberg: $urban in $trips viaggi")
+        assertTrue(urban > 0, "nessuna deviazione dalla parte urbana")
+    }
+
+    @Test
+    fun `access roads go on top of the cached motorway net, like a fresh net`() {
+        var compared = 0
+        for (skip in 0 until 4) {
+            val (ctx, plainNet, seeds) = motorwayTrip(skip) ?: break
+            val access = ctx.router.access(g.encoding.shared)
+            val key = g.routerKey(ctx.solved.options)
+            val region = plainNet.region
+            val e = region.ellipses[0]
+            val cache = MotorwayNetCache(2)
+            var builds = 0; var overlays = 0
+            // la parte autostradale per una regione più grande, in cache
+            val bigRegion = Region(listOf(Ellipse(e.aLat, e.aLon, e.bLat, e.bLon, e.sumM * 1.5)))
+            val base = cache.get(key, bigRegion) { builds++; MotorwayNet.build(access, seeds, bigRegion) }
+            for (r in listOf(4_000.0, 2_000.0, 4_000.0)) {
+                val (circles, seeds2) = withAccess(ctx, seeds, r)
+                val b = cache.get(key, region, fits = { n -> seeds.all { n.netNode(it) >= 0 } }) { builds++; MotorwayNet.build(access, seeds, region) }
+                assertSame(base, b)
+                val net = cache.overlay(b, region, circles, fits = { n -> seeds2.all { n.netNode(it) >= 0 } }) { overlays++; MotorwayNet.withAccess(access, b, seeds2, region, circles) }
+                // le stesse deviazioni di una rete nuova coi cerchi, con la maschera della regione
+                val fresh = MotorwayNet.build(access, seeds2, region, access = circles)
+                fun ds(n: MotorwayNet, m: BooleanArray?) = DetourSearch(n, ctx.trace, access.turnCosts, m).detours(0, 2.0, minPlateauShare = 0.1, perLeg = 200)
+                    .map { d -> listOf(d.fromPos, d.toPos, Math.round(d.dW * 1000), d.dMs, d.arcs.map { n.arcEdge[it] }) }.toSet()
+                assertEquals(ds(fresh, null), ds(net, net.mask(region, seeds2)), "viaggio $skip, cerchi $r")
+                compared++
+            }
+            // una base, tre richieste: le strade d'accesso ricostruite al cambio dei cerchi, riprese per gli stessi
+            assertEquals(1, builds); assertEquals(3, overlays)
+            val (c4, s4) = withAccess(ctx, seeds, 4_000.0)
+            val again = cache.overlay(base, region, c4, fits = { n -> s4.all { n.netNode(it) >= 0 } }) { error("dalla cache") }
+            assertEquals(4_000.0, again.access[0].radiusM)
+            assertEquals(1, cache.overlaySize)
+            // la base fuori dalla cache: le sue strade d'accesso con lei
+            cache.get(key.copy(avoidPenalty = 2.0), region) { plainNet }; cache.get(key.copy(avoidPenalty = 3.0), region) { plainNet }
+            assertEquals(0, cache.overlaySize)
+        }
+        assertTrue(compared > 0)
     }
 
     @Test

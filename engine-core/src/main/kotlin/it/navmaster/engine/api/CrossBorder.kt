@@ -825,7 +825,8 @@ class CrossBorderDirections(
                             "signature" to sig.joinToString(" · ") { it.first }, "refs" to sigJson(sig), "new_refs" to newRefs,
                             "extra_s" to Math.round(extraS * 10) / 10.0, "extra_m" to Math.round(extraM * 10) / 10.0, "factor" to factor(r), "km_factor" to factor(rk),
                             "longer" to false, "detours" to emptyList<Any>(), "crossing" to linkedMapOf("lat" to t.lat, "lon" to t.lon))
-                        val score = 0.6 * r + 0.4 * rk - 0.04 * minOf(2, newRefs.size)
+                        // il bonus delle strade nuove come il giudice: solo le autostrade (una superstrada statale, SS o B, no)
+                        val score = 0.6 * r + 0.4 * rk - VariantRules.NEW_REF_BONUS * minOf(VariantRules.NEW_REF_MAX, newRefs.count { CorridorAnalyzer.isMotorwayRef(it) })
                         cands += CrossVariant(0, VariantSource.CROSSING, score, r, rk, edgesOf(alt.map { it.graph to it.solved.legs }), sig.map { it.first }, cands.size, json) {
                             merge(alt.map { featureOf(it) }, request)
                         }
