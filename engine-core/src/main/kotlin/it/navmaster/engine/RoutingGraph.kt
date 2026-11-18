@@ -35,6 +35,7 @@ import it.navmaster.engine.weighting.EdgePenaltyWeighting
 import it.navmaster.engine.weighting.TurnCostProvider
 import it.navmaster.engine.weighting.VehicleParameters
 import it.navmaster.engine.weighting.WeightingFactory
+import it.navmaster.engine.profile.PriorityModel
 import it.navmaster.engine.weighting.WeightingMethod
 import java.io.Closeable
 import java.io.File
@@ -441,7 +442,7 @@ class RoutingGraph private constructor(
             rg.speedModel = (profiles.firstOrNull { it.options.speedModel == SpeedModel.NAVMASTER } ?: profiles.first()).options.speedModel.id
             rg.country = profiles.firstNotNullOfOrNull { it.options.country }
             rg.flush()
-            GraphProperties(File(dir, "profiles")).apply { load(); set("speed_model", rg.speedModel); set("country", rg.country ?: ""); save() }
+            GraphProperties(File(dir, "profiles")).apply { load(); set("speed_model", rg.speedModel); set("country", rg.country ?: ""); set("priority_model", encoding.priorityModel.id); save() }
             rg.index = LocationIndex.build(graph)
             rg.index.save(gdir)
             return rg to stats
@@ -464,6 +465,8 @@ class RoutingGraph private constructor(
             rg.coreWide = props.get("core_kind") == "wide"
             rg.speedModel = props.get("speed_model")?.takeIf { it.isNotBlank() } ?: "ors"
             rg.country = props.get("country")?.takeIf { it.isNotBlank() }
+            // il peso con cui sono stati preparati CH, core e landmark: ORS per i grafi di prima (anche NAVMASTER)
+            encoding.priorityModel = PriorityModel.parse(props.get("priority_model"))
             rg.landmarkSetNames = (props.get("landmark_sets") ?: "").split(',').filter { it.isNotBlank() }
             for (key in (props.get("ch") ?: "").split(',').filter { it.isNotBlank() }) {
                 val st = CHStorage(gdir, key, graph.edgeCount, graph.nodeCount)

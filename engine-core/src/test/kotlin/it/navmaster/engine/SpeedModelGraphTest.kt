@@ -2,7 +2,9 @@ package it.navmaster.engine
 
 import it.navmaster.engine.profile.CarProfile
 import it.navmaster.engine.profile.HgvProfile
+import it.navmaster.engine.profile.PriorityModel
 import it.navmaster.engine.profile.SpeedModel
+import it.navmaster.engine.storage.GraphProperties
 import it.navmaster.engine.profile.VehicleProfileOptions
 import it.navmaster.engine.weighting.VehicleParameters
 import java.io.File
@@ -36,6 +38,8 @@ class SpeedModelGraphTest {
             assertEquals("ors", ors.speedModel); assertNull(ors.country)
             RoutingGraph.load(dir).use { rg ->
                 assertEquals("navmaster", rg.speedModel); assertEquals("DE", rg.country)
+                // CH, core e landmark preparati col peso consigliato di NAVMASTER, e il grafo lo ricorda
+                assertEquals(PriorityModel.NAVMASTER, rg.encoding.priorityModel); assertEquals(PriorityModel.ORS, ors.encoding.priorityModel)
                 for ((a, b) in pairs) {
                     val params = VehicleParameters(height = 4.0, weight = 12.0)
                     val core = rg.router(RouteOptions(profile = "driving-hgv", vehicleParameters = params))
@@ -58,5 +62,25 @@ class SpeedModelGraphTest {
                 }
             }
         }
+    }
+
+    @Test
+    fun `a navmaster graph prepared before the priority model opens with the ORS priority`() {
+        val dir = Files.createTempDirectory("nme-smg-old").toFile().also { it.deleteOnExit() }
+        val profiles = listOf(HgvProfile(VehicleProfileOptions(maximumGradeLevel = 1, useAcceleration = false, blockFords = false, speedModel = SpeedModel.NAVMASTER, country = "DE")))
+        RoutingGraph.build(File("../data/heidelberg.test.pbf"), dir, profiles).first.use { it.prepareCH(withCore = false, landmarkSets = emptyList()) }
+        assertEquals("navmaster", GraphProperties(File(dir, "profiles")).apply { load() }.get("priority_model"))
+        val (a, b) = pairs[0]
+        fun dijkstraWeight(rg: RoutingGraph): Double {
+            val plain = rg.router(RouteOptions(profile = "driving-hgv", turnCosts = false, allowCH = false))
+            return plain.route(plain.snap(a.first, a.second, 400.0, 0), plain.snap(b.first, b.second, 400.0, 1)).weight
+        }
+        val nav = RoutingGraph.load(dir).use { assertEquals(PriorityModel.NAVMASTER, it.encoding.priorityModel); dijkstraWeight(it) }
+        // i grafi NAVMASTER di prima non hanno la proprietà: la loro CH è col peso di ORS, e così si aprono
+        val text = File(dir, "profiles").readLines().filterNot { it.startsWith("priority_model") }
+        File(dir, "profiles").writeText(text.joinToString("\n", postfix = "\n"))
+        val old = RoutingGraph.load(dir).use { assertEquals(PriorityModel.ORS, it.encoding.priorityModel); dijkstraWeight(it) }
+        // premi di ORS più forti: lo stesso viaggio (urbano, pochi premi) pesa meno, e il modello letto arriva davvero al peso
+        assertTrue(old < nav - 1.0, "peso ORS $old, NAVMASTER $nav")
     }
 }

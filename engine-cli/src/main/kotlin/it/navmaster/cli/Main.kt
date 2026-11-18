@@ -167,6 +167,7 @@ private fun importGraph(args: List<String>) {
         if (!stats.hgvSlowSignedShare.isNaN())
             println("camion sotto 30 km/h su primary e secondary con cartello > 50: %.2f %% dei km".format(100 * stats.hgvSlowSignedShare))
         println("bbox: ${it.graph.bounds}")
+        println("priorità del peso consigliato: ${it.encoding.priorityModel.id}")
         val sets = opt(args, "landmark-sets")?.let { v -> if (v == "none") emptyList() else v.split(',').map { CoreLandmarks.parseSetName(it) }.filter { it != 0 } }
             ?: RoutingGraph.DEFAULT_LANDMARK_SETS
         if (!args.contains("--no-ch")) it.prepareCH(log = { msg -> println(msg) }, coreWide = opt(args, "core") != "narrow", landmarkSets = sets)
@@ -178,7 +179,7 @@ private fun info(args: List<String>) {
     RoutingGraph.load(File(args[0])).use { rg ->
         val graph = rg.graph
         println("profili: ${rg.profileNames}")
-        println("speed_model: ${rg.speedModel}, country: ${rg.country ?: "-"}")
+        println("speed_model: ${rg.speedModel}, priority_model: ${rg.encoding.priorityModel.id}, country: ${rg.country ?: "-"}")
         println("%,d nodi, %,d archi, %,d voci di costo di svolta, bbox ${graph.bounds}".format(graph.nodeCount, graph.edgeCount, rg.turnCosts.count))
         println("valori codificati (${graph.intsForFlags} int per arco): ${graph.encodedValues.all.joinToString { it.name }}")
         println("indice spaziale: ${rg.index.cells} celle, ${rg.index.entries} voci")

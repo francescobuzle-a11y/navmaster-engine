@@ -3,6 +3,7 @@ package it.navmaster.engine.api
 import it.navmaster.engine.RoutingGraph
 import it.navmaster.engine.routing.CancelToken
 import it.navmaster.engine.routing.RoutePath
+import it.navmaster.engine.profile.PriorityModel
 import it.navmaster.engine.routing.Router
 import it.navmaster.engine.storage.FetchMode
 import it.navmaster.engine.storage.PointList
@@ -438,6 +439,29 @@ class BrnoMikulovProbeTest {
         println("$tag: $slow archi col camion sotto 40 km/h e limite ≥ 70: %.2f km, camion %.1f min, auto %.1f min".format(slowM / 1000, slowS / 60, slowCarS / 60))
     }
 
+    /**
+     * Secondi e km del percorso per codice di priorità (0 pessimo … 4 neutro … 7 ottimo) e il peso che
+     * avrebbe con ogni [PriorityModel] (tempo con i ritardi × fattore della priorità, senza le penalità
+     * d'accesso): dice quale modello sceglie quale valico.
+     */
+    private fun byPriority(tag: String, pieces: List<Pair<RoutingGraph, RoutePath>>) {
+        val s = DoubleArray(8); val m = DoubleArray(8); var weight = 0.0
+        for ((rg, leg) in pieces) {
+            val hv = rg.encoding.profile("heavyvehicle")
+            val it = rg.graph.createEdgeIterator()
+            for (pe in leg.edges) {
+                it.setEdge(pe.edge, rg.graph.nodeA(pe.edge))
+                val c = Math.round(it.get(hv.priority) * 7).toInt().coerceIn(0, 7)
+                s[c] += pe.millis / 1000.0; m[c] += pe.distance
+            }
+            weight += leg.weight
+        }
+        val models = PriorityModel.entries
+        println("$tag: " + (7 downTo 0).filter { s[it] > 0 }.joinToString(", ") { c -> "codice $c %.1f min %.1f km".format(s[c] / 60, m[c] / 1000) } +
+            "; tempo %.1f min, peso del grafo %.0f; ".format(s.sum() / 60, weight) +
+            models.joinToString(", ") { md -> "peso ${md.id} %.0f".format((0..7).sumOf { c -> s[c] * md.factor(c / 7.0) }) })
+    }
+
     private fun mikulov(graphs: List<CountryGraph>, at: CountryGraph, cz: CountryGraph, transfers: (CountryGraph, CountryGraph) -> List<Transfer>,
                         pool: java.util.concurrent.ExecutorService, slots: SearchSlots) {
         val tag = "sonda B"
@@ -510,6 +534,8 @@ class BrnoMikulovProbeTest {
             (fMik.atLeg.distance + fMik.czLeg.distance) / 1000, (fMik.atLeg.millis + fMik.czLeg.millis) / 60000.0, fMik.weight,
             (fHate.atLeg.distance + fHate.czLeg.distance) / 1000, (fHate.atLeg.millis + fHate.czLeg.millis) / 60000.0, fHate.weight,
             (fMik.atLeg.millis + fMik.czLeg.millis).toDouble() / (fHate.atLeg.millis + fHate.czLeg.millis), fMik.weight / fHate.weight))
+        // il tempo per codice di priorità nei due percorsi obbligati e il peso che avrebbero con ciascun modello di priorità
+        for ((name, f) in listOf("Mikulov" to fMik, "Hatě" to fHate)) if (f != null) byPriority("$tag priorità per $name", listOf(at.graph to f.atLeg, cz.graph to f.czLeg))
         // le velocità del camion e dell'auto lungo la 52 (Cechia) e la A5/B7 (Austria) nei pezzi per Mikulov: il modello
         // d'accelerazione di ORS (velocità sulla linea d'aria della way OSM intera) sulle way corte della 52
         fMik?.let {

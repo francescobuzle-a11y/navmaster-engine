@@ -1,6 +1,6 @@
 package it.navmaster.engine.weighting
 
-import it.navmaster.engine.profile.PriorityCode
+import it.navmaster.engine.profile.PriorityModel
 import it.navmaster.engine.profile.RoadAccess
 import it.navmaster.engine.profile.RoadClass
 import it.navmaster.engine.storage.BaseGraph
@@ -73,26 +73,20 @@ class ShortestWeighting(private val p: ProfileEncoding) : Weighting {
 }
 
 /**
- * "recommended" (ORS `ORSPriorityWeighting`): il peso del [base] viene moltiplicato per
- * 2^((priorità·7 − 4) / (4 − 7)), così le strade preferite costano meno (scala di ORS 10).
+ * "recommended" (ORS `ORSPriorityWeighting`): il peso del [base] viene moltiplicato per il fattore
+ * della priorità dell'arco secondo [model] (ORS: 2^((priorità·7 − 4) / (4 − 7)), così le strade
+ * preferite costano meno, scala di ORS 10; NAVMASTER: premi più leggeri, vedi [PriorityModel]).
  * Come in ORS, `minWeight` è 0: l'euristica A* non è informativa con questo peso.
  */
-class PriorityWeighting(private val p: ProfileEncoding, private val base: Weighting) : Weighting {
+class PriorityWeighting(private val p: ProfileEncoding, private val base: Weighting, private val model: PriorityModel = PriorityModel.ORS) : Weighting {
     override val name = "recommended"
     override fun minWeight(distanceMeters: Double) = 0.0
     override fun edgeWeight(edge: BaseGraph.EdgeIterator, reverse: Boolean): Double {
         val w = base.edgeWeight(edge, reverse)
         if (w.isInfinite()) return w
-        val priority = edge.get(p.priority)
-        val normalized = priority * BEST - UNCHANGED
-        return w * 2.0.pow(normalized / (UNCHANGED - BEST))
+        return w * model.factor(edge.get(p.priority))
     }
     override fun edgeMillis(edge: BaseGraph.EdgeIterator, reverse: Boolean) = base.edgeMillis(edge, reverse)
-
-    companion object {
-        private val BEST = PriorityCode.BEST.value.toDouble()
-        private val UNCHANGED = PriorityCode.UNCHANGED.value.toDouble()
-    }
 }
 
 /**
@@ -136,7 +130,8 @@ enum class WeightingMethod { FASTEST, SHORTEST, RECOMMENDED }
 object WeightingFactory {
     /**
      * Costruisce la catena di pesi come ORS: per i profili auto "recommended" equivale a "fastest";
-     * per il camion "fastest" diventa "recommended". Sempre avvolto in [LimitedAccessWeighting].
+     * per il camion "fastest" diventa "recommended", con la priorità del modello del grafo
+     * ([GraphEncoding.priorityModel]). Sempre avvolto in [LimitedAccessWeighting].
      */
     fun create(encoding: GraphEncoding, profile: ProfileEncoding, method: WeightingMethod, maximumSpeed: Double = Double.POSITIVE_INFINITY): Weighting {
         val effective = when (profile.profile.name) {
@@ -146,7 +141,7 @@ object WeightingFactory {
         val base: Weighting = when (effective) {
             WeightingMethod.FASTEST -> FastestWeighting(profile, maximumSpeed)
             WeightingMethod.SHORTEST -> ShortestWeighting(profile)
-            WeightingMethod.RECOMMENDED -> PriorityWeighting(profile, FastestWeighting(profile, maximumSpeed))
+            WeightingMethod.RECOMMENDED -> PriorityWeighting(profile, FastestWeighting(profile, maximumSpeed), encoding.priorityModel)
         }
         return LimitedAccessWeighting(encoding, base)
     }

@@ -1,6 +1,7 @@
 package it.navmaster.engine.storage
 
 import it.navmaster.engine.profile.NodeDelays
+import it.navmaster.engine.profile.PriorityModel
 import it.navmaster.engine.profile.RoadAccess
 import it.navmaster.engine.profile.RoadClass
 import it.navmaster.engine.profile.Toll
@@ -125,6 +126,13 @@ class GraphEncoding(profiles: List<VehicleProfile>, withAdr: Boolean = true, val
     val shared = SharedEncoding(withAdr)
     val profiles: List<ProfileEncoding> = profiles.map { ProfileEncoding(it, withDelay) }
     val registry: EncodedValueRegistry
+
+    /**
+     * Come il peso «recommended» usa la priorità ([PriorityModel]): per un grafo nuovo dal modello di
+     * velocità dei profili; per uno letto dal disco quello con cui è stato preparato (RoutingGraph.load),
+     * perché CH, core e landmark hanno quel peso. Da fissare prima di preparare o interrogare il grafo.
+     */
+    @Volatile var priorityModel: PriorityModel = PriorityModel.forProfiles(profiles)
 
     init {
         require(profiles.isNotEmpty()) { "serve almeno un profilo" }
