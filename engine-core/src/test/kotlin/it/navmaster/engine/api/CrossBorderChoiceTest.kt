@@ -145,6 +145,64 @@ class CrossBorderChoiceTest {
         assertEquals(1, Transfers.places(all, ::detour, 1).size)
     }
 
+    /**
+     * Il migliore non cambia con le varianti: su quattro Paesi finti (a-b-c-d e a-b-d) la scelta con
+     * topK 4 e fattore 1,2 dà lo stesso peso e gli stessi valichi di topK 1, con e senza la memoria
+     * dei pesi rapidi e dopo clearCaches().
+     */
+    @Test
+    fun `the best is the same with topK 1 and 4, with and without the caches`() {
+        val g = Heidelberg.graph
+        val service = DirectionsService(g)
+        val graphs = listOf("a", "b", "c", "d").map { CountryGraph(it, service) }
+        val core = g.router(RouteOptions(profile = "driving-hgv"))
+        val bg = g.graph
+        val rnd = Random(31)
+        fun crossings(n: Int): List<Transfer> {
+            val out = ArrayList<Transfer>()
+            for (attempt in 0 until 4000) {
+                if (out.size >= n) break
+                val k = rnd.nextInt(bg.nodeCount)
+                val node = try { core.snap(bg.lat(k), bg.lon(k), 400.0, 0).closestNode } catch (e: PointNotFoundException) { continue }
+                if (out.any { t -> DistanceCalc.haversine(t.lat, t.lon, bg.lat(node), bg.lon(node)) < 5_500.0 }) continue
+                out += Transfer(bg.lat(node), bg.lon(node), 1 + out.size % 3)
+            }
+            return out
+        }
+        val pairs = mapOf(setOf("a", "b") to crossings(4), setOf("b", "c") to crossings(3), setOf("c", "d") to crossings(3), setOf("b", "d") to crossings(3))
+        val cb = CrossBorderDirections(graphs, { x, y -> pairs[setOf(x.id, y.id)] ?: emptyList() })
+        val opt = NavAlternativesOptions(count = 4, tier1Factor = 1.1, maxFactor = 1.2, sources = setOf(VariantSource.CROSSING), minDetourScale = 0.02)
+        var trips = 0; var withOthers = 0
+        for (seed in 1L..20L) {
+            val pts = Heidelberg.points(2, seed + 1200)
+            val body = Heidelberg.body(pts, ""","navmaster":{"roads":true}""")
+            service.clearCaches()
+            val r1 = runCatching { cb.handle(DirectionsRequest.fromJson("driving-hgv", body), listOf("a", "d"), RequestContext(useCache = false)) }
+            val w1 = cb.lastWeight; val x1 = cb.lastCrossings.map { it.lat to it.lon }
+            val s1 = cb.lastChains.map { it.countries }
+            // con le varianti (topK 4), la memoria piena dalla richiesta prima
+            val r2 = runCatching { cb.handle(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(opt), listOf("a", "d")) }
+            assertEquals(r1.isSuccess, r2.isSuccess, "esito diverso: ${r1.exceptionOrNull()} / ${r2.exceptionOrNull()}")
+            if (!r1.isSuccess) continue
+            trips++
+            assertTrue(close(w1, cb.lastWeight), "seme $seed: peso ${cb.lastWeight} con topK 4 invece di $w1")
+            assertEquals(x1, cb.lastCrossings.map { it.lat to it.lon }, "seme $seed: valichi diversi con topK 4")
+            assertEquals(s1.first(), cb.lastChains.first().countries)
+            if (cb.lastChains.size > 1) withOthers++
+            assertEquals(Json.stringify(summary(r1.getOrThrow())), Json.stringify(summary(r2.getOrThrow())))
+            // la memoria piena, topK 1: identico
+            cb.handle(DirectionsRequest.fromJson("driving-hgv", body), listOf("a", "d"))
+            assertTrue(close(w1, cb.lastWeight)); assertEquals(x1, cb.lastCrossings.map { it.lat to it.lon })
+            // dopo clearCaches
+            service.clearCaches()
+            cb.handle(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(opt), listOf("a", "d"))
+            assertTrue(close(w1, cb.lastWeight)); assertEquals(x1, cb.lastCrossings.map { it.lat to it.lon })
+            println("seme $seed: peso %.1f, ${s1.first().joinToString("-")} via $x1, catene ${cb.lastChains.size}".format(w1))
+        }
+        println("invarianza: $trips viaggi, con altre catene $withOthers")
+        assertTrue(trips >= 12, "viaggi: $trips")
+    }
+
     @Suppress("UNCHECKED_CAST")
     private fun summary(res: Map<String, Any?>) = ((res["features"] as List<Map<String, Any?>>)[0]["properties"] as Map<String, Any?>)["summary"]
 }

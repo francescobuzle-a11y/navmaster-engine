@@ -113,6 +113,52 @@ internal class LegCache(val maxEdges: Int = 60_000, val maxEntries: Int = 256, p
     val info: String get() = synchronized(lock) { "${map.size} tratti, $edges archi, colpi $hits/${hits + misses}" }
 }
 
+/**
+ * Una ricerca rapida della scelta dei valichi (`CrossBorderDirections.Ctx.weight`): le opzioni
+ * intere del router del grafo (avoid, penalità, velocità massima… decidono il peso), i due capi
+ * (bit dei Double) coi loro raggi di aggancio.
+ */
+internal data class QuickKey(val options: RouteOptions, val aLat: Long, val aLon: Long, val ra: Long, val bLat: Long, val bLon: Long, val rb: Long)
+
+/**
+ * I pesi delle ricerche rapide di un servizio, con il limite sotto cui sono stati cercati: un peso
+ * finito è esatto e si riusa sotto qualunque limite (+∞ se non sta sotto quello chiesto); «nessun
+ * percorso sotto l» vale solo per i limiti ≤ l. Vive quanto il servizio (grafo riaperto = memoria
+ * vuota), i meno usati di recente escono oltre [maxEntries] (≈ 80 B l'uno). Un lucchetto solo.
+ */
+internal class QuickWeightCache(val maxEntries: Int = 4096) {
+    private class Entry(var w: Double, var limit: Double)
+    private val map = object : LinkedHashMap<QuickKey, Entry>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<QuickKey, Entry>?) = size > maxEntries
+    }
+    private var hits = 0L
+    private var misses = 0L
+
+    /** Il peso sotto [limit] se la memoria lo sa (+∞: nessun percorso sotto [limit]); null se va cercato. */
+    @Synchronized fun get(key: QuickKey, limit: Double): Double? {
+        val e = map[key]
+        if (e == null || !(e.w.isFinite() || e.limit >= limit)) { misses++; return null }
+        hits++
+        return if (e.w < limit) e.w else Double.POSITIVE_INFINITY
+    }
+
+    /** Ricorda [w] cercato sotto [limit]: una voce peggiore (∞ con un limite più basso) non sostituisce mai una migliore. */
+    @Synchronized fun put(key: QuickKey, w: Double, limit: Double) {
+        val e = map[key]
+        if (e == null) { map[key] = Entry(w, limit); return }
+        if (e.w.isFinite()) return
+        if (w.isFinite() || limit > e.limit) { e.w = w; e.limit = limit }
+    }
+
+    @Synchronized fun clear() { map.clear() }
+
+    /** Per le prove: quante voci ci sono ora. */
+    val size: Int @Synchronized get() = map.size
+
+    /** Diagnostica: "118 pesi, colpi 118/236". */
+    val info: String @Synchronized get() = "${map.size} pesi, colpi $hits/${hits + misses}"
+}
+
 /** Un aggancio: le opzioni del router (`RoutingGraph.routerKey`), la coordinata, il raggio, il controllo delle reti isolate, la direzione. */
 internal data class SnapCacheKey(val options: RouteOptions, val latBits: Long, val lonBits: Long, val radius: Double, val checkNetwork: Boolean, val headingBits: Long)
 

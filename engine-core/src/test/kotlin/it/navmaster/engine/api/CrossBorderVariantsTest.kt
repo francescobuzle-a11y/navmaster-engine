@@ -121,4 +121,252 @@ class CrossBorderVariantsTest {
         assertTrue((bySource["crossing"] ?: 0) > 0, "nessuna variante da un altro valico: $bySource")
         assertTrue(bySource.keys.any { it != "crossing" }, "nessuna variante a valichi fissi: $bySource")
     }
+
+    // ------------------------------------------------------------------ cinque Paesi finti: a-b-c-d e a-b-e-d
+
+    /** Per ogni valico di [list] un altro punto della rete a 0,3-1,5 km: i valichi dell'altra sequenza, vicini (pesi simili). */
+    private fun nearby(list: List<Transfer>, seed: Long): List<Transfer> {
+        val core = g.router(RouteOptions(profile = "driving-hgv"))
+        val bg = g.graph
+        val rnd = Random(seed)
+        return list.map { t ->
+            for (attempt in 0 until 40000) {
+                val n0 = rnd.nextInt(bg.nodeCount)
+                if (DistanceCalc.haversine(t.lat, t.lon, bg.lat(n0), bg.lon(n0)) !in 300.0..1_500.0) continue
+                val node = try { core.snap(bg.lat(n0), bg.lon(n0), 400.0, 0).closestNode } catch (e: PointNotFoundException) { continue }
+                val d = DistanceCalc.haversine(t.lat, t.lon, bg.lat(node), bg.lon(node))
+                if (d in 300.0..1_500.0) return@map Transfer(bg.lat(node), bg.lon(node), t.rank)
+            }
+            error("nessun punto vicino al valico ${t.lat},${t.lon}")
+        }
+    }
+
+    /**
+     * Cinque Paesi sullo stesso grafo, valichi disgiunti per coppia a-b, b-c, c-d, b-e, e-d: due
+     * sequenze a → d con 3 confini, la seconda (per e) coi valichi a pochi km da quelli della prima
+     * (pesi simili: spesso entro il fattore delle varianti).
+     */
+    private class Five(service: DirectionsService, seed: Long = 0) {
+        val graphs = listOf("a", "b", "c", "d", "e").map { CountryGraph(it, service) }
+        val pairs: Map<Set<String>, List<Transfer>>
+        init {
+            val test = CrossBorderVariantsTest()
+            val bc = test.crossings(22 + seed * 10, 3); val cd = test.crossings(23 + seed * 10, 3)
+            pairs = mapOf(setOf("a", "b") to test.crossings(21 + seed * 10, 3), setOf("b", "c") to bc, setOf("c", "d") to cd,
+                setOf("b", "e") to test.nearby(bc, 24 + seed * 10), setOf("e", "d") to test.nearby(cd, 25 + seed * 10))
+        }
+        val transfers: (CountryGraph, CountryGraph) -> List<Transfer> = { x, y -> pairs[setOf(x.id, y.id)] ?: emptyList() }
+        fun cb(log: ((String) -> Unit)? = null, oneSearch: Boolean = true) = CrossBorderDirections(graphs, transfers, log, oneSearch)
+        /** Il motore ristretto ai grafi di [ids] (il riferimento del peso esatto di quella sequenza). */
+        fun only(ids: List<String>) = CrossBorderDirections(graphs.filter { it.id in ids }, transfers)
+    }
+
+    private fun variant(f: Map<*, *>) = ((f["properties"] as Map<*, *>)["navmaster"] as Map<*, *>)["variant"] as Map<*, *>
+    private fun countriesOf(v: Map<*, *>) = (v["countries"] as? List<*>)?.map { it as String }
+    private fun crossingsLine(rc: RequestContext) = rc.stats.crossings
+    /** «Q ricerche (H dalla memoria[, X per le varianti])» → (Q, H, X). */
+    private fun queries(line: String): Triple<Int, Int, Int> {
+        val m = Regex("""(\d+) ricerche \((\d+) dalla memoria(?:, (\d+) per le varianti)?\)""").find(line) ?: error("riga senza ricerche: $line")
+        return Triple(m.groupValues[1].toInt(), m.groupValues[2].toInt(), m.groupValues[3].ifEmpty { "0" }.toInt())
+    }
+    private fun searched(line: String): Int = Regex("""(\d+) cercati""").find(line)?.groupValues?.get(1)?.toInt() ?: 0
+    private fun legsOf(stats: RequestStats, names: Set<String>) = synchronized(stats.children) { stats.children.filter { it.first in names }.flatMap { (_, s) -> synchronized(s.legs) { s.legs.toList() } } }
+
+    @Test
+    fun `variants across borders - another country sequence`() {
+        val service = DirectionsService(g)
+        val logs = ArrayList<String>()
+        val opt = NavAlternativesOptions(count = 4, tier1Factor = 1.1, maxFactor = 1.2, sources = setOf(VariantSource.CROSSING), minDetourScale = 0.02)
+        var trips = 0; var others = 0; var withinRef = 0; var exactMatch = 0; var keptOther = 0; var reservedChecks = 0
+        for (seed in 1L..8L) {
+            // valichi diversi a ogni viaggio (con gli stessi una sequenza vincerebbe sempre)
+            val five = Five(service, seed)
+            val cb = five.cb(log = { logs += it })
+            val pts = Heidelberg.points(2, seed + 900)
+            val countries = listOf("a", "d")
+            val body = Heidelberg.body(pts, ""","navmaster":{"roads":true}""")
+            val plainDoc = try { cb.handle(DirectionsRequest.fromJson("driving-hgv", body), countries) } catch (e: ApiException) { continue }
+            trips++
+            val plain = features(plainDoc)[0]
+            val bestW = cb.lastWeight; val bestX = cb.lastCrossings.map { it.lat to it.lon }
+            val bestSeq = cb.lastChains.first().countries
+            assertEquals(listOf(bestSeq), cb.lastChains.map { it.countries }, "con topK 1 solo il migliore")
+            val otherSeq = if (bestSeq == listOf("a", "b", "c", "d")) listOf("a", "b", "e", "d") else listOf("a", "b", "c", "d")
+            assertTrue(bestSeq == listOf("a", "b", "c", "d") || bestSeq == listOf("a", "b", "e", "d"), "sequenza $bestSeq")
+            // il riferimento: lo stesso viaggio coi soli grafi dell'altra sequenza
+            val ref = five.only(otherSeq)
+            val refW = try { ref.handle(DirectionsRequest.fromJson("driving-hgv", body), countries); ref.lastWeight } catch (e: ApiException) { Double.POSITIVE_INFINITY }
+            val cap = bestW * opt.maxFactor
+            // la richiesta delle varianti (sola fonte V)
+            val rc = RequestContext()
+            val doc = cb.handle(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(opt), countries, rc)
+            val fs = features(doc)
+            // (1) il migliore identico con topK 1 e 4
+            assertEquals(withoutVariant(plain), withoutVariant(fs[0]))
+            assertEquals(bestW, cb.lastWeight, "peso con topK 4"); assertEquals(bestX, cb.lastCrossings.map { it.lat to it.lon }, "valichi con topK 4")
+            assertEquals(bestSeq, cb.lastChains.first().countries)
+            // (2) la catena dell'altra sequenza entro il fattore: c'è quando il riferimento sta sotto il tetto, mai se no
+            val otherChain = cb.lastChains.drop(1).firstOrNull { it.countries == otherSeq }
+            println("seme $seed: migliore ${bestSeq.joinToString("-")} peso %.0f; riferimento ${otherSeq.joinToString("-")} peso %.0f (tetto %.0f); catena trovata: %s".format(
+                bestW, refW, cap, otherChain?.let { "peso %.0f via %s".format(it.exact, it.via.joinToString { t -> "%.4f,%.4f".format(t.lat, t.lon) }) } ?: "nessuna"))
+            if (refW < cap * (1 - 1e-9)) {
+                withinRef++
+                assertTrue(otherChain != null, "seme $seed: il riferimento ${otherSeq.joinToString("-")} pesa $refW < $cap ma nessuna catena trovata")
+                assertTrue(otherChain.exact >= refW - 1e-6 && otherChain.exact < cap, "seme $seed: catena ${otherChain.exact} fuori da [$refW, $cap)")
+                if (Math.abs(otherChain.exact - refW) <= 1e-6 * refW) exactMatch++ else println("  combinazione a luogo diverso: ${otherChain.exact} invece di $refW")
+            } else assertTrue(otherChain == null, "seme $seed: catena ${otherChain?.exact} oltre il tetto $cap (riferimento $refW)")
+            // (3) ogni V: livello, fattore, valichi, way_points; titoli diversi
+            val labels = fs.map { variant(it)["label"] as String }
+            assertEquals(labels.size, labels.toSet().size, "titoli ripetuti: $labels")
+            val vs = fs.drop(1).map { variant(it) }
+            for ((i, f) in fs.withIndex()) {
+                assertEquals(2, ((f["properties"] as Map<*, *>)["way_points"] as List<*>).size)
+                if (i == 0) continue
+                val v = variant(f)
+                assertEquals("crossing", v["source"])
+                assertTrue((v["tier"] as Int) in 1..3, "livello ${v["tier"]}")
+                assertTrue((v["factor"] as Double) <= opt.maxFactor + 1e-3 && (v["km_factor"] as Double) <= opt.maxKmFactor + 1e-3, "fattori $v")
+                assertEquals(3, (v["crossings"] as List<*>).size, "valichi di $v")
+                val cs = countriesOf(v)!!
+                assertEquals(4, cs.size)
+                if (cs != bestSeq) { others++; assertTrue(v["label"].toString().contains(", per "), "titolo senza il Paese: ${v["label"]}") }
+            }
+            // (4) due V mai con tutti i valichi entro 5 km l'uno dall'altro
+            for (i in vs.indices) for (j in i + 1 until vs.size) {
+                val a = vs[i]["crossings"] as List<Map<*, *>>; val b = vs[j]["crossings"] as List<Map<*, *>>
+                val same = countriesOf(vs[i]) == countriesOf(vs[j]) && a.indices.all { k -> DistanceCalc.haversine(a[k]["lat"] as Double, a[k]["lon"] as Double, b[k]["lat"] as Double, b[k]["lon"] as Double) < Transfers.PLACE }
+                assertTrue(!same, "due V nello stesso luogo: ${vs[i]} / ${vs[j]}")
+            }
+            // (5) i tratti della fonte V tutti dalla cache dei tratti
+            val vStats = synchronized(rc.stats.children) { rc.stats.children.filter { it.first == "varianti valichi" }.map { it.second } }
+            val vLegs = vStats.flatMap { s -> synchronized(s.children) { s.children.flatMap { (_, c) -> synchronized(c.legs) { c.legs.toList() } } } }
+            assertTrue(vLegs.all { it.source == LegStats.Source.CACHE }, "tratti della fonte V cercati: ${vLegs.joinToString { it.source.name }}")
+            val meta = ((doc["metadata"] as Map<*, *>)["navmaster"] as Map<*, *>)["alternatives"] as Map<*, *>
+            println("  ${fs.size - 1} varianti: ${vs.joinToString { "${it["label"]} ${it["diff"]} livello ${it["tier"]}" }}; ${meta["candidates"]}; ${meta["note"]}")
+            // la scelta golosa: una V di livello 1 per altri Paesi è fra le tenute anche con le fonti M e P
+            if (vs.any { countriesOf(it) != bestSeq && it["tier"] == 1 }) {
+                reservedChecks++
+                val all = NavAlternativesOptions(count = 4, tier1Factor = 1.1, maxFactor = 1.2, sources = setOf(VariantSource.MOTORWAY, VariantSource.PENALTY, VariantSource.CROSSING), minDetourScale = 0.02)
+                val mixed = features(cb.handle(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(all), countries)).drop(1).map { variant(it) }
+                val kept = mixed.filter { it["source"] == "crossing" && countriesOf(it) != bestSeq }
+                println("  con M e P: ${mixed.joinToString { "${it["source"]} ${it["label"]} livello ${it["tier"]}" }}")
+                assertTrue(kept.isNotEmpty(), "la V per altri Paesi non è fra le tenute: ${mixed.map { "${it["source"]} ${it["label"]}" }}")
+                keptOther++
+            }
+            // (6) col tempo a 1 ms: nessuna eccezione, nota «budget», migliore invariato
+            val short = NavAlternativesOptions(count = 4, tier1Factor = 1.1, maxFactor = 1.2, budgetMs = 1, sources = opt.sources, minDetourScale = 0.02)
+            logs.clear()
+            val docShort = cb.handle(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(short), countries)
+            println("  tempo 1 ms: ${logs.filter { it.contains("varianti") }.joinToString(" / ")}")
+            assertEquals(withoutVariant(plain), withoutVariant(features(docShort)[0]))
+            assertEquals(bestW, cb.lastWeight)
+            val metaShort = ((docShort["metadata"] as Map<*, *>)["navmaster"] as Map<*, *>)["alternatives"] as Map<*, *>
+            // la nota «budget» (o, se tutto era in memoria e il passo 2 è finito entro il millisecondo, nessuna variante)
+            assertTrue(metaShort["note"] == "budget" || (metaShort["variants"] == 0 && logs.none { it.contains("tempo finito") }), "nota col tempo finito: $metaShort")
+        }
+        println("altra sequenza: $trips viaggi, riferimento entro il fattore in $withinRef (peso uguale in $exactMatch), $others varianti per altri Paesi, posto riservato $keptOther/$reservedChecks")
+        assertTrue(trips >= 4, "viaggi: $trips")
+        assertTrue(others > 0, "nessuna variante per un'altra sequenza di Paesi")
+    }
+
+    @Test
+    fun `the second request of the same trip reuses the quick weights`() {
+        val service = DirectionsService(g)
+        val five = Five(service)
+        val cb = five.cb()
+        val opt = NavAlternativesOptions(count = 4, tier1Factor = 1.1, maxFactor = 1.2, sources = setOf(VariantSource.MOTORWAY, VariantSource.PENALTY, VariantSource.CROSSING), minDetourScale = 0.02)
+        var trips = 0
+        for (seed in 1L..6L) {
+            val pts = Heidelberg.points(2, seed + 950)
+            val body = Heidelberg.body(pts, ""","navmaster":{"roads":true}""")
+            service.clearCaches()
+            val rc0 = RequestContext()
+            val plain = try { features(cb.handle(DirectionsRequest.fromJson("driving-hgv", body), listOf("a", "d"), rc0))[0] } catch (e: ApiException) { continue }
+            trips++
+            val (q0, h0, _) = queries(crossingsLine(rc0))
+            assertEquals(0, h0, "prima richiesta a memoria vuota: ${crossingsLine(rc0)}")
+            assertTrue(q0 > 0, crossingsLine(rc0))
+            // la seconda, identica: nessuna ricerca, i pezzi tutti dalla cache
+            val rc1 = RequestContext()
+            val doc1 = cb.handle(DirectionsRequest.fromJson("driving-hgv", body), listOf("a", "d"), rc1)
+            val line1 = crossingsLine(rc1)
+            val (q1, h1, _) = queries(line1)
+            assertEquals(withoutVariant(plain), withoutVariant(features(doc1)[0]))
+            assertEquals(0, q1, "ricerche rifatte: $line1")
+            assertEquals(0, searched(line1), "pezzi ricercati: $line1")
+            assertTrue(h1 >= q0 - searched(crossingsLine(rc0)), "colpi $h1, ricerche della prima $q0: $line1")
+            // la terza, con le varianti: la scelta del migliore senza ricerche, solo quelle del passo 2 (le altre catene)
+            val rc = RequestContext()
+            val doc = cb.handle(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(opt), listOf("a", "d"), rc)
+            val line = crossingsLine(rc)
+            val (q, h, x) = queries(line)
+            println("seme $seed: prima ${crossingsLine(rc0)} | seconda $line1 | con varianti $line")
+            assertEquals(withoutVariant(plain), withoutVariant(features(doc)[0]))
+            assertEquals(0, q - x, "ricerche della scelta rifatte: $line")
+            assertTrue(h >= h1, "colpi $h: $line")
+            assertTrue(legsOf(rc.stats, setOf("a", "b", "c", "d", "e")).all { it.source == LegStats.Source.CACHE }, rc.stats.line())
+            // senza cache: le ricerche come oggi, stesso risultato
+            val rcNo = RequestContext(useCache = false)
+            val docNo = cb.handle(DirectionsRequest.fromJson("driving-hgv", body), listOf("a", "d"), rcNo)
+            val (qNo, hNo, _) = queries(crossingsLine(rcNo))
+            assertEquals(0, hNo); assertTrue(qNo > 0)
+            assertEquals(withoutVariant(plain), withoutVariant(features(docNo)[0]))
+            // dopo clearCaches le ricerche si rifanno e il risultato è identico
+            service.clearCaches()
+            val rcC = RequestContext()
+            val docC = cb.handle(DirectionsRequest.fromJson("driving-hgv", body), listOf("a", "d"), rcC)
+            val (qC, hC, _) = queries(crossingsLine(rcC))
+            assertEquals(0, hC); assertEquals(q0, qC, "ricerche dopo clearCaches: ${crossingsLine(rcC)}")
+            assertEquals(withoutVariant(plain), withoutVariant(features(docC)[0]))
+        }
+        assertTrue(trips >= 3, "viaggi: $trips")
+    }
+
+    @Test
+    fun `a via point recomputes only its piece, the first border from the cache`() {
+        val service = DirectionsService(g)
+        val five = Five(service)
+        // un valico alla volta: anche fra due Paesi la scelta passa dalle ricerche rapide (quelle in memoria)
+        val cb = five.cb(oneSearch = false)
+        var trips = 0; var viaB = 0; var viaA = 0
+        for (seed in 1L..6L) {
+            val pts = Heidelberg.points(2, seed + 980)
+            service.clearCaches()
+            val rc0 = RequestContext()
+            try { cb.handle(DirectionsRequest.fromJson("driving-hgv", Heidelberg.body(pts, ""","navmaster":{"roads":true}""")), listOf("a", "d"), rc0) } catch (e: ApiException) { continue }
+            trips++
+            val chain = cb.lastChains.first()
+            // una tappa nel Paese b (a metà del tratto di b): il confine a/b si sceglie coi pesi in memoria
+            val pieceB = cb.lastPieces[1].second
+            val viaPoint = pieceB.coordinates[0].let { (la, lo) -> la + (pieceB.coordinates[1].first - la) * 0.5 to lo + (pieceB.coordinates[1].second - lo) * 0.5 }
+            fun body(mid: Pair<Double, Double>) = Heidelberg.body(listOf(pts[0], mid, pts[1]), ""","navmaster":{"roads":true}""")
+            val rcB = RequestContext()
+            val okB = runCatching { cb.handle(DirectionsRequest.fromJson("driving-hgv", body(viaPoint)), listOf("a", "b", "d"), rcB) }.isSuccess
+            if (okB) {
+                val (q, h, _) = queries(crossingsLine(rcB))
+                println("seme $seed, tappa in b: ${crossingsLine(rcB)}")
+                assertTrue(h > 0, "nessun peso dalla memoria con la tappa in b: ${crossingsLine(rcB)}")
+                assertTrue(q > 0 || h > 0)
+                viaB++
+                // la stessa via come la manda l'app in navigazione (pass_through e direzione): le opzioni del router
+                // cambiano (continue_straight), i pesi rapidi hanno una chiave propria: solo per il registro
+                val rcP = RequestContext()
+                val bodyP = Heidelberg.body(listOf(pts[0], viaPoint, pts[1]), ""","navmaster":{"roads":true,"pass_through":[false,true,false]},"bearings":[[],[90,45],[]]""")
+                runCatching { cb.handle(DirectionsRequest.fromJson("driving-hgv", bodyP), listOf("a", "b", "d"), rcP) }
+                println("seme $seed, via (pass_through) in b: ${crossingsLine(rcP)}")
+            }
+            // una via nel Paese a, vicino alla partenza: si ricalcola solo il primo pezzo
+            val viaA0 = pts[0].first + (chain.via[0].lat - pts[0].first) * 0.3 to pts[0].second + (chain.via[0].lon - pts[0].second) * 0.3
+            val rcA = RequestContext()
+            val okA = runCatching { cb.handle(DirectionsRequest.fromJson("driving-hgv", body(viaA0)), listOf("a", "a", "d"), rcA) }.isSuccess
+            if (okA) {
+                val line = crossingsLine(rcA)
+                println("seme $seed, via in a: $line; ${legsOf(rcA.stats, setOf("a", "b", "c", "d", "e")).joinToString { it.source.name.lowercase() }}")
+                assertTrue(queries(line).second > 0, "nessun peso dalla memoria con la via in a: $line")
+                viaA++
+            }
+        }
+        println("via: $trips viaggi, in b $viaB, in a $viaA")
+        assertTrue(trips >= 3 && viaB >= 2 && viaA >= 2, "viaggi $trips, via in b $viaB, in a $viaA")
+    }
 }

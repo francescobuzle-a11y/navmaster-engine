@@ -488,9 +488,11 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
     private val snapCache = SnapCache()
     /** Le reti autostradali delle varianti (fonte M), per opzioni del router e regione. */
     internal val netCache = it.navmaster.engine.routing.MotorwayNetCache()
+    /** I pesi delle ricerche rapide della scelta dei valichi (viaggi tra Paesi): la richiesta delle varianti non li rifà. */
+    internal val quickCache = QuickWeightCache()
 
-    /** Svuota le cache dei tratti, degli agganci e delle reti autostradali (poca memoria: `onTrimMemory` dell'app). */
-    fun clearCaches() { legCache.clear(); snapCache.clear(); netCache.clear() }
+    /** Svuota le cache dei tratti, degli agganci, delle reti autostradali e dei pesi rapidi (poca memoria: `onTrimMemory` dell'app). */
+    fun clearCaches() { legCache.clear(); snapCache.clear(); netCache.clear(); quickCache.clear() }
 
     /** Diagnostica e prove: lo stato della cache dei tratti. */
     internal val legCacheInfo: String get() = legCache.info

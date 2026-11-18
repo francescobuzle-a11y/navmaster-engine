@@ -45,7 +45,11 @@ import kotlin.test.assertTrue
  * (d) la prima feature è la risposta senza varianti; (e) le varianti subito dopo il migliore: 0
  * ricerche per il migliore; (f) esattezza delle penalità: core-ALT penalizzato = Dijkstra pieno
  * penalizzato su 20 coppie; (g) una via in più: ≤ 2 tratti calcolati (un Paese); (h) i titoli delle
- * varianti tutti diversi e mai il nome di una galleria o di un ponte.
+ * varianti tutti diversi e mai il nome di una galleria o di un ponte; (i) tra Paesi: la richiesta
+ * delle varianti rifà la scelta dei valichi senza ricerche («0 ricerche (N dalla memoria)», i pezzi
+ * tutti dalla cache); (j) tra Paesi: le varianti entro `NM_VARIANTS_MS` (12 000 ms, il proxy in CI dei
+ * 25 s del tablet). Per i viaggi tra Paesi stampa le sequenze, le catene esatte oltre il migliore
+ * (Paesi, valichi, peso) e i ms della fonte V.
  */
 class AlternativesRealDiagTest {
     private class Place(val name: String, val lat: Double, val lon: Double)
@@ -56,6 +60,9 @@ class AlternativesRealDiagTest {
         // Firenze: viale Guidoni (Novoli), la via di scorrimento fra l'uscita Firenze Nord dell'A1/A11 e la città, a ~4 km
         // dal Duomo; il centro (43.7696, 11.2558) è zona a traffico limitato, nessuna strada per il camion entro 400 m
         Place("Firenze", 43.7981, 11.2149),
+        // i viaggi tra Paesi (flusso «Valichi su grafi veri» con più Paesi)
+        Place("Canneto sull'Oglio", 45.1502, 10.3792), Place("Bielsko-Biała", 49.8224, 19.0444), Place("Soncino", 45.4103, 9.9428),
+        Place("Innsbruck", 47.2692, 11.4041), Place("Komjatice", 48.1536, 18.1872),
     )
 
     private fun placeOf(p: Pair<Double, Double>): String? = places.firstOrNull { DistanceCalc.haversine(it.lat, it.lon, p.first, p.second) < 3_000.0 }?.name
@@ -212,7 +219,8 @@ class AlternativesRealDiagTest {
         class Check(val name: String) { var n = 0; var fail = 0; val lines = ArrayList<String>() }
         val checks = linkedMapOf("a" to Check("(a) ≥ 3 percorsi"), "b" to Check("(b) firme attese"), "c" to Check("(c) fattori"), "d" to Check("(d) prima feature = migliore"),
             "e" to Check("(e) 0 ricerche per il migliore"), "f" to Check("(f) esattezza delle penalità"), "g" to Check("(g) via in più: ≤ 2 tratti"),
-            "h" to Check("(h) titoli diversi"))
+            "h" to Check("(h) titoli diversi"), "i" to Check("(i) tra Paesi: scelta dalla memoria"), "j" to Check("(j) tra Paesi: varianti entro il tempo"))
+        val variantsMs = System.getenv("NM_VARIANTS_MS")?.trim()?.toLongOrNull() ?: 12_000L
         fun check(key: String, ok: Boolean, what: String) {
             val c = checks.getValue(key); c.n++
             if (!ok) { c.fail++; c.lines += what; println("  FAIL ${c.name}: $what") }
@@ -224,7 +232,8 @@ class AlternativesRealDiagTest {
         /** Il percorso migliore di un viaggio: la geometria (lat, lon) per le vie; [multi]: in più Paesi (`metadata.countries`). */
         class Best(val geo: List<Pair<Double, Double>>, val multi: Boolean)
         @Suppress("UNCHECKED_CAST")
-        fun countries(doc: Map<String, Any?>) = ((doc["metadata"] as? Map<String, Any?>)?.get("countries") as? List<*>)?.size ?: 1
+        fun countriesOf(doc: Map<String, Any?>) = ((doc["metadata"] as? Map<String, Any?>)?.get("countries") as? List<*>)?.map { it.toString() }.orEmpty()
+        fun countries(doc: Map<String, Any?>) = countriesOf(doc).size.coerceAtLeast(1)
 
         /** Il migliore e le varianti di [pts]. */
         fun trip(pts: List<Pair<Double, Double>>, via: List<Boolean>, bearings: List<Double?>?, name: String): Best? {
@@ -284,7 +293,27 @@ class AlternativesRealDiagTest {
             check("e", legs.isNotEmpty() && legs.all { it.source == LegStats.Source.CACHE }, "$name: ${legs.joinToString { it.source.name.lowercase() }}")
             // (h) i titoli: tutti diversi, mai il nome di una galleria o di un ponte
             val titles = fs.mapNotNull { variant(it)?.get("label") as? String }
-            check("h", titles.size == titles.toSet().size && titles.none { VariantRules.isStructureName(it.removePrefix("via ")) }, "$name: ${titles.joinToString(" | ")}")
+            check("h", titles.size == titles.toSet().size && titles.none { VariantRules.isStructureName(it.removePrefix("via ").substringBefore(", per ")) }, "$name: ${titles.joinToString(" | ")}")
+            // tra Paesi: la scelta dei valichi dalla memoria (i), le catene oltre il migliore, i ms della fonte V, il tempo (j)
+            if (multi && cb != null) {
+                val line = rc.stats.crossings
+                val m = Regex("""(\d+) ricerche \((\d+) dalla memoria(?:, (\d+) per le varianti)?\)""").find(line)
+                val redone = m?.let { it.groupValues[1].toInt() - it.groupValues[3].ifEmpty { "0" }.toInt() } ?: -1
+                val searched = Regex("""(\d+) cercati""").find(line)?.groupValues?.get(1)?.toInt() ?: 0
+                println("  valichi (seconda richiesta): $line")
+                // (i) solo quando il migliore passa dalla programmazione dinamica (4 grafi): con 2 o 3 grafi i rami
+                // esatti (chooseExactTop, chooseTwo, chooseTransit) fanno percorsi mirati e ricerche molti a uno senza memoria
+                val nCountries = countries(plainDoc)
+                if (nCountries >= 4) check("i", redone == 0 && searched == 0, "$name: $redone ricerche rifatte, $searched pezzi ricercati: $line")
+                else println("  (i) non applicabile: $nCountries grafi (ramo esatto), $redone ricerche, $searched pezzi ricercati")
+                println("  catene: " + cb.lastChains.joinToString(" | ") { c -> "${c.countries.joinToString("-")} via ${c.via.joinToString(" ") { "%.4f,%.4f".format(it.lat, it.lon) }} peso %.0f".format(c.exact) }.ifEmpty { "nessuna" })
+                val vMs = Regex("""V \d+ \([^)]*\) in (\d+) ms""").find(meta?.get("candidates")?.toString().orEmpty())?.groupValues?.get(1)
+                println("  fonte V: ${vMs?.let { "$it ms" } ?: "non eseguita"}; varianti in tutto ${meta?.get("ms")} ms")
+                val others = fs.drop(1).mapNotNull { variant(it) }.filter { v -> (v["countries"] as? List<*>)?.let { cs -> cs != countriesOf(plainDoc) } == true }
+                println("  per altri Paesi: ${others.joinToString { "${it["label"]} (${it["countries"]})" }.ifEmpty { "nessuna" }}")
+                val total = (meta?.get("ms") as? Number)?.toLong() ?: ms
+                check("j", total <= variantsMs, "$name: varianti in $total ms (limite $variantsMs)")
+            }
             // (b) le firme attese
             val from = placeOf(pts.first()); val to = placeOf(pts.last())
             val vs = fs.map { variant(it) }

@@ -27,6 +27,12 @@ on:
       trace:
         description: "Traccia delle varianti (1 accesa, 0 spenta); vuoto: accesa solo con le sonde"
         default: ""
+      alt:
+        description: "Varianti: count,max_factor[,tier1_factor] (es. 4,1.2 o 6,1.5); vuoto: 4,1.2"
+        default: ""
+      sources:
+        description: "Fonti delle varianti (motorway,penalty,crossing); vuoto: tutte"
+        default: ""
   push:
     branches: [main]
     paths: [".github/workflows/valichi.yml"]
@@ -72,6 +78,8 @@ jobs:
           NM_WINDOW: ${{ inputs.window }}
           NM_PROBES: ${{ inputs.probes }}
           NM_TRACE: ${{ inputs.trace }}
+          NM_ALT: ${{ inputs.alt }}
+          NM_SOURCES: ${{ inputs.sources }}
         run: |
           chmod +x gradlew
           [ -n "$NM_TRIPS" ] || unset NM_TRIPS
@@ -79,6 +87,8 @@ jobs:
           [ -n "$NM_WINDOW" ] || unset NM_WINDOW
           [ -n "$NM_PROBES" ] || unset NM_PROBES
           [ -n "$NM_TRACE" ] || unset NM_TRACE
+          [ -n "$NM_ALT" ] || unset NM_ALT
+          [ -n "$NM_SOURCES" ] || unset NM_SOURCES
           ./gradlew --no-daemon :engine-core:test --tests "$TEST" -i 2>&1 | tee prova.log | grep -vE "^(> Task|Skipping|Caching|Resolving|Downloading|Download|Starting process|Successfully started|Finished generating)" | grep -E "^\s{4}|PASSED|FAILED|BUILD" || true
           grep -q "BUILD SUCCESSFUL" prova.log
       - name: Registro
