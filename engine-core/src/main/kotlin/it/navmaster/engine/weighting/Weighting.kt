@@ -28,6 +28,13 @@ interface Weighting {
 class FastestWeighting(private val p: ProfileEncoding, private val maximumSpeed: Double = Double.POSITIVE_INFINITY) : Weighting {
     override val name = "fastest"
     private val maxSpeed = minOf(p.profile.maxPossibleSpeed.toDouble(), maximumSpeed)
+    /** I secondi persi nei nodi (modello NAVMASTER), null nei grafi di prima; ≥ 0, quindi [minWeight] resta ammissibile. */
+    private val delay = p.delay
+
+    private fun delay(edge: BaseGraph.EdgeIterator, reverse: Boolean): Double {
+        val d = delay ?: return 0.0
+        return if (reverse) edge.getReverse(d) else edge.get(d)
+    }
 
     override fun minWeight(distanceMeters: Double) = distanceMeters / maxSpeed * SPEED_CONV
 
@@ -41,13 +48,13 @@ class FastestWeighting(private val p: ProfileEncoding, private val maximumSpeed:
         if (!access) return Double.POSITIVE_INFINITY
         val speed = speed(edge, reverse)
         if (speed == 0.0) return Double.POSITIVE_INFINITY
-        return edge.distance / speed * SPEED_CONV
+        return edge.distance / speed * SPEED_CONV + delay(edge, reverse)
     }
 
     override fun edgeMillis(edge: BaseGraph.EdgeIterator, reverse: Boolean): Long {
         val speed = speed(edge, reverse)
         if (speed == 0.0) return Long.MAX_VALUE
-        return (edge.distance / speed * 3600).toLong()
+        return (edge.distance / speed * 3600).toLong() + (delay(edge, reverse) * 1000).toLong()
     }
 
     companion object { const val SPEED_CONV = 3.6 }

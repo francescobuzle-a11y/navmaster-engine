@@ -1,6 +1,7 @@
 package it.navmaster.engine.profile
 
 import it.navmaster.engine.osm.OsmWay
+import kotlin.math.min
 
 /**
  * Profilo mezzi pesanti (ORS `HeavyVehicleFlagEncoder`, encoder `heavyvehicle`, profilo API `driving-hgv`).
@@ -26,6 +27,14 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
 
     private val hgvAccess = listOf("hgv", "goods", "bus", "agricultural", "forestry", "delivery")
 
+    // modello NAVMASTER: un autoarticolato da 40 t accelera e frena meno dell'auto, rotatorie e residenziali più piano
+    override val acceleration = 0.5
+    override val deceleration = 1.0
+    override val roundaboutCap = 25.0
+    override val roundaboutCapMultiLane = 30.0
+    override val miniRoundaboutCap = 15.0
+    override val residentialCap = 30.0
+
     init {
         intendedValues += listOf("designated", "agricultural", "forestry", "delivery", "bus", "hgv", "goods")
     }
@@ -39,6 +48,40 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
         val highway = highwayValue(way) ?: return generic
         val default = highwaySpeeds[highway] ?: return generic
         return if (default < generic) Double.NaN else generic
+    }
+
+    /**
+     * Il cartello che vale per il camion (modello NAVMASTER), nel primo caso che vale:
+     * `maxspeed:hgv[:forward|:backward]`; `maxspeed:hgv:conditional` per un mezzo pesante da 40 t con
+     * rimorchio (`V @ (weight>N)` con N < 40, `V @ (trailer)`, `V @ (articulated)`; gli orari si
+     * ignorano); il `maxspeed` generico (`XX:valore` vale il limite generale del Paese) — non più
+     * scartato sopra il default del tipo di strada: lo limita la legge; il limite implicito della zona
+     * se manca il `maxspeed`; altrimenti NaN.
+     */
+    fun hgvSigned(way: OsmWay, zone: ZoneInfo? = null): Double {
+        val hgv = lowestSigned(way, "maxspeed:hgv", "maxspeed:hgv:forward", "maxspeed:hgv:backward")
+        if (!hgv.isNaN()) return hgv
+        val cond = conditionalHgvSpeed(way.tag("maxspeed:hgv:conditional"))
+        if (!cond.isNaN()) return cond
+        val generic = lowestSigned(way, "maxspeed", "maxspeed:forward", "maxspeed:backward")
+        if (!generic.isNaN()) return generic
+        if (!way.hasTag("maxspeed")) zone?.implicitKmh?.takeIf { it > 0 }?.let { return it.toDouble() }
+        return Double.NaN
+    }
+
+    /**
+     * Velocità di marcia del camion nel modello NAVMASTER: min(cartello × 0,9, limite legale del Paese per
+     * il contesto × fattore), oppure min(default del tipo di strada, legale × fattore); poi il `tracktype`.
+     */
+    override fun navmasterSpeed(way: OsmWay, highway: String): Double {
+        val z = ZoneInfo.of(way, highway)
+        val signed = hgvSigned(way, z)
+        val ctx = RoadContext.of(highway, z?.context, signed)
+        val legal = HgvLegalSpeeds.limit(z?.country ?: options.country, ctx) * HgvLegalSpeeds.factor(ctx)
+        val default = (highwaySpeeds[highway] ?: error("$name: nessuna velocità per highway=$highway")).toDouble()
+        var v = if (!signed.isNaN()) min(signed * MAX_SPEED_FACTOR, legal) else min(default, legal)
+        v = trackTypeSpeed(way, highway, v)
+        return v
     }
 
     override fun access(way: OsmWay): Access {
@@ -103,6 +146,31 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
             else if (maxSpeed <= 50) candidates[110.0] = PriorityCode.UNCHANGED
         }
         return candidates[candidates.lastKey()]!!
+    }
+
+    companion object {
+        private val CONDITION = Regex("""^\s*([^@]+?)\s*@\s*\(?\s*(.+?)\s*\)?\s*$""")
+        private val WEIGHT = Regex("""^(weight|weightrating|maxweight)\s*>=?\s*([0-9]+(?:\.[0-9]+)?)\s*t?$""")
+
+        /** Il limite più basso di `maxspeed:hgv:conditional` che vale per un autoarticolato da 40 t, NaN se nessuno. */
+        fun conditionalHgvSpeed(raw: String?): Double {
+            if (raw.isNullOrBlank()) return Double.NaN
+            var best = Double.NaN
+            for (part in raw.split(';')) {
+                val m = CONDITION.find(part) ?: continue
+                val v = ZoneInfo.parseSigned(m.groupValues[1])
+                if (v.isNaN()) continue
+                val conditions = m.groupValues[2].lowercase().split(" and ").map { it.trim() }
+                val applies = conditions.all { c ->
+                    when {
+                        c == "trailer" || c == "articulated" -> true
+                        else -> WEIGHT.find(c)?.groupValues?.get(2)?.toDoubleOrNull()?.let { it < 40.0 } ?: false
+                    }
+                }
+                if (applies && (best.isNaN() || v < best)) best = v
+            }
+            return best
+        }
     }
 
     /** Info di destinazione sulle rampe (`destination=A;B`), come ORS `getWayInfo`. */

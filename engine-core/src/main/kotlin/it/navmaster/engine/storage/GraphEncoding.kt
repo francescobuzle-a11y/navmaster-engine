@@ -1,5 +1,6 @@
 package it.navmaster.engine.storage
 
+import it.navmaster.engine.profile.NodeDelays
 import it.navmaster.engine.profile.RoadAccess
 import it.navmaster.engine.profile.RoadClass
 import it.navmaster.engine.profile.Toll
@@ -10,7 +11,7 @@ import it.navmaster.engine.profile.WaySurface
 import it.navmaster.engine.profile.WayType
 
 /** Valori codificati di un profilo veicolo: accesso e velocità per direzione, priorità. */
-class ProfileEncoding(val profile: VehicleProfile) {
+class ProfileEncoding(val profile: VehicleProfile, withDelay: Boolean = true) {
     val access = BooleanEncodedValue("${profile.name}_access", twoDirections = true)
     /** 5 bit × 5 km/h come ORS (`speed_bits=5`, `speed_factor=5`): massimo 155 km/h. */
     val speed = DecimalEncodedValue("${profile.name}_speed", 5, 5.0, twoDirections = true)
@@ -18,7 +19,25 @@ class ProfileEncoding(val profile: VehicleProfile) {
     /** Il fattore di priorità (ORS: 4 bit a passi di 1/7, i valori di PriorityCode esatti). */
     val priority = DecimalEncodedValue("${profile.name}_priority", 4, 1.0 / 7)
 
+    /**
+     * I secondi persi nei nodi (modello NAVMASTER, [it.navmaster.engine.profile.NodeDelays]): 0–63 s a passi
+     * di 1 s, per senso; sommati al tempo dell'arco da [it.navmaster.engine.weighting.FastestWeighting].
+     * Null nei grafi costruiti prima (novembre 2026); 0 nei grafi del modello ORS.
+     */
+    val delay: DecimalEncodedValue? = if (withDelay) DecimalEncodedValue("${profile.name}_delay", 6, 1.0, twoDirections = true) else null
+
     internal fun register(b: EncodedValueRegistry.Builder) { b.add(access).add(speed).add(priority) }
+
+    /** Registrato dopo i valori ADR: così nei grafi vecchi tutti gli altri bit restano dove erano. */
+    internal fun registerDelay(b: EncodedValueRegistry.Builder) { delay?.let { b.add(it) } }
+
+    /** Scrive i secondi persi nei due sensi (arrotondati all'intero, al massimo 63). */
+    fun writeDelay(flags: IntArray, fwdSec: Double, bwdSec: Double) {
+        val d = delay ?: return
+        d.set(flags, false, clampDelay(fwdSec)); d.set(flags, true, clampDelay(bwdSec))
+    }
+
+    private fun clampDelay(s: Double): Double = if (s.isNaN() || s <= 0) 0.0 else Math.round(s).toDouble().coerceAtMost(NodeDelays.MAX_SECONDS.toDouble())
 
     fun write(flags: IntArray, r: WaySpeedAccess?) {
         if (r == null) {
@@ -98,10 +117,13 @@ class SharedEncoding(val withAdr: Boolean = true) {
 /**
  * Schema completo dei flag di un grafo: attributi condivisi più un blocco per ogni profilo.
  * L'ordine di registrazione è fisso e fa parte del formato su disco.
+ *
+ * @param withDelay i ritardi ai nodi (`<profilo>_delay`, novembre 2026); di default presenti solo con i valori
+ *   ADR, che sono più vecchi: uno schema senza ADR è quello dei grafi di prima di entrambi.
  */
-class GraphEncoding(profiles: List<VehicleProfile>, withAdr: Boolean = true) {
+class GraphEncoding(profiles: List<VehicleProfile>, withAdr: Boolean = true, val withDelay: Boolean = withAdr) {
     val shared = SharedEncoding(withAdr)
-    val profiles: List<ProfileEncoding> = profiles.map { ProfileEncoding(it) }
+    val profiles: List<ProfileEncoding> = profiles.map { ProfileEncoding(it, withDelay) }
     val registry: EncodedValueRegistry
 
     init {
@@ -111,19 +133,23 @@ class GraphEncoding(profiles: List<VehicleProfile>, withAdr: Boolean = true) {
         shared.register(b)
         this.profiles.forEach { it.register(b) }
         shared.registerAdr(b)
+        this.profiles.forEach { it.registerDelay(b) }
         registry = b.build()
     }
 
     companion object {
         /**
          * Lo schema di un grafo già costruito, dalla descrizione salvata nelle sue properties
-         * (`graph.encoded_values`): quello attuale o, per i grafi di prima, quello senza i valori ADR.
-         * Se nessuno dei due coincide restituisce l'attuale (il caricamento poi segnala la differenza).
+         * (`graph.encoded_values`): quello attuale (ADR e ritardi ai nodi) o, per i grafi di prima, quello
+         * senza i ritardi (ottobre–novembre 2026) o senza ADR né ritardi. Se nessuno coincide restituisce
+         * l'attuale (il caricamento poi segnala la differenza).
          */
         fun forExisting(profiles: List<VehicleProfile>, described: String?): GraphEncoding {
             val current = GraphEncoding(profiles)
             if (described == null || described == current.registry.describe()) return current
-            val old = GraphEncoding(profiles, withAdr = false)
+            val noDelay = GraphEncoding(profiles, withAdr = true, withDelay = false)
+            if (described == noDelay.registry.describe()) return noDelay
+            val old = GraphEncoding(profiles, withAdr = false, withDelay = false)
             return if (described == old.registry.describe()) old else current
         }
     }

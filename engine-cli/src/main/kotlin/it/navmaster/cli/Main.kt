@@ -11,6 +11,9 @@ import it.navmaster.engine.weighting.WeightingMethod
 import it.navmaster.engine.profile.CarProfile
 import it.navmaster.engine.profile.HgvProfile
 import it.navmaster.engine.profile.VehicleProfile
+import it.navmaster.engine.profile.VehicleProfileOptions
+import it.navmaster.engine.profile.SpeedModel
+import it.navmaster.engine.profile.HgvLegalSpeeds
 import it.navmaster.engine.storage.BaseGraph
 import it.navmaster.engine.storage.GraphDirectory
 import it.navmaster.engine.storage.GraphEncoding
@@ -22,9 +25,11 @@ import kotlin.system.exitProcess
 private const val USAGE = """
 navmaster-engine
 
-  import <file.osm.pbf> <cartella-grafo> [--profiles=car,hgv] [--no-ch] [--no-width-from-carriageway] [--no-toll-nodes] [--mmap] [--core=narrow] [--landmark-sets=tollways,highways]
+  import <file.osm.pbf> <cartella-grafo> [--profiles=car,hgv] [--speed-model=navmaster|ors] [--country=IT] [--no-ch] [--no-width-from-carriageway] [--no-toll-nodes] [--mmap] [--core=narrow] [--landmark-sets=tollways,highways]
                                          costruisce il grafo (--mmap: file su disco invece che in RAM; --core=narrow: core ridotto, senza autostrade e strade veloci;
-                                         --landmark-sets: gli insiemi di landmark in più, con quelle strade escluse, come gli `lmsets` di ORS; predefinito tollways, `none` per nessuno)
+                                         --landmark-sets: gli insiemi di landmark in più, con quelle strade escluse, come gli `lmsets` di ORS; predefinito tollways, `none` per nessuno;
+                                         --speed-model: navmaster (predefinito: cartello, legge del Paese, ritardi a semafori, stop, precedenze e rotatorie)
+                                         o ors (accelerazione per way di openrouteservice, per il confronto con ORS); --country: Paese ISO dei limiti legali del camion)
   info <cartella-grafo>                                          riepilogo del grafo
   route <cartella-grafo> <lat,lon> <lat,lon> [--profile=driving-hgv] [--weighting=fastest|shortest|recommended]
         [--avoid=highways,tollways,ferries,fords] [--height=4.0 --weight=40 --width=2.55 --length=18.75 --hazmat] [--no-turn-costs] [--no-ch]
@@ -119,10 +124,15 @@ private fun route(args: List<String>) {
 
 fun profilesFromArgs(args: List<String>): List<VehicleProfile> {
     val spec = args.firstOrNull { it.startsWith("--profiles=") }?.substringAfter('=') ?: "car,hgv"
+    val model = SpeedModel.parse(opt(args, "speed-model") ?: "navmaster")
+    val country = opt(args, "country")?.trim()?.uppercase()?.takeIf { it.isNotEmpty() }
+    if (country != null) require(country.length == 2 && country.all { it in 'A'..'Z' }) { "--country vuole un codice ISO di due lettere: $country" }
     return spec.split(',').map {
         when (it.trim()) {
-            "car", "driving-car" -> CarProfile()
-            "hgv", "driving-hgv", "truck" -> HgvProfile()
+            "car", "driving-car" -> if (model == SpeedModel.ORS) CarProfile()
+                else CarProfile(VehicleProfileOptions(useAcceleration = false, blockFords = false, speedModel = model, country = country))
+            "hgv", "driving-hgv", "truck" -> if (model == SpeedModel.ORS) HgvProfile()
+                else HgvProfile(VehicleProfileOptions(maximumGradeLevel = 1, useAcceleration = false, blockFords = false, speedModel = model, country = country))
             else -> error("profilo sconosciuto: $it")
         }
     }
@@ -135,12 +145,27 @@ private fun importGraph(args: List<String>) {
     val profiles = profilesFromArgs(args)
     val importOptions = it.navmaster.engine.osm.ImportOptions(widthFromCarriageway = !args.contains("--no-width-from-carriageway"), tollNodes = !args.contains("--no-toll-nodes"))
     println("${Engine.NAME}: import di $pbf → $dir, profili ${profiles.map { it.name }}" + if (!importOptions.widthFromCarriageway) " (tag width ignorato)" else "")
+    val model = profiles.first().options.speedModel
+    val country = profiles.first().options.country
+    println("modello delle velocità: ${model.id}" + (country?.let { ", Paese $it" + if (HgvLegalSpeeds.knows(it)) "" else " (limiti legali di riserva)" } ?: ""))
+    if (model == SpeedModel.NAVMASTER && country == null) println("nessun Paese: limiti legali di riserva")
     val (rg, stats) = RoutingGraph.build(pbf, dir, profiles, mmap = args.contains("--mmap"), importOptions = importOptions)
     rg.use {
         println("nodi OSM %,d, way %,d (accettate %,d)".format(stats.osmNodes, stats.osmWays, stats.acceptedWays))
         println("grafo: %,d nodi, %,d archi (%,d pillar, %,d archi barriera), divieti di svolta %,d applicati su %,d, %.1f s".format(
             stats.towers, stats.edges, stats.pillars, stats.barrierEdges, stats.turnRestrictions, stats.turnRestrictionRelations, stats.millis / 1000.0))
         if (importOptions.tollNodes) println("archi a pedaggio per un casello o un portale: %,d".format(stats.tollNodeEdges))
+        if (stats.delayEvents.isNotEmpty()) {
+            val names = mapOf("SIGNALS" to "semafori", "STOP" to "stop", "GIVE_WAY" to "precedenze scritte", "IMPLIED_GIVE_WAY" to "precedenze implicite",
+                "ROUNDABOUT_ENTRY" to "ingressi in rotatoria", "MINI_ROUNDABOUT" to "mini-rotatorie", "TOLL" to "caselli", "RAIL" to "passaggi a livello",
+                "CROSSING_SIGNALS" to "semafori pedonali")
+            println("ritardi ai nodi: " + stats.delayEvents.entries.joinToString(", ") { "${names[it.key] ?: it.key} %,d".format(it.value) })
+            println("archi con ritardo: %,d (%.1f %%)".format(stats.delayedEdges, 100.0 * stats.delayedEdges / maxOf(1, stats.edges)))
+        }
+        if (stats.hgvSpeedByClass.isNotEmpty())
+            println("camion, velocità media per classe (km/h, pesata per lunghezza): " + stats.hgvSpeedByClass.entries.joinToString(", ") { "%s %.1f".format(it.key, it.value) })
+        if (!stats.hgvSlowSignedShare.isNaN())
+            println("camion sotto 30 km/h su primary e secondary con cartello > 50: %.2f %% dei km".format(100 * stats.hgvSlowSignedShare))
         println("bbox: ${it.graph.bounds}")
         val sets = opt(args, "landmark-sets")?.let { v -> if (v == "none") emptyList() else v.split(',').map { CoreLandmarks.parseSetName(it) }.filter { it != 0 } }
             ?: RoutingGraph.DEFAULT_LANDMARK_SETS
@@ -153,6 +178,7 @@ private fun info(args: List<String>) {
     RoutingGraph.load(File(args[0])).use { rg ->
         val graph = rg.graph
         println("profili: ${rg.profileNames}")
+        println("speed_model: ${rg.speedModel}, country: ${rg.country ?: "-"}")
         println("%,d nodi, %,d archi, %,d voci di costo di svolta, bbox ${graph.bounds}".format(graph.nodeCount, graph.edgeCount, rg.turnCosts.count))
         println("valori codificati (${graph.intsForFlags} int per arco): ${graph.encodedValues.all.joinToString { it.name }}")
         println("indice spaziale: ${rg.index.cells} celle, ${rg.index.entries} voci")

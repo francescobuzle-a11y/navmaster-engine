@@ -13,6 +13,12 @@ on:
       core:
         description: "Core: wide (come ORS) o narrow (ridotto)"
         default: "wide"
+      speed_model:
+        description: "Modello delle velocità: navmaster (cartello, legge del Paese, ritardi ai nodi) o ors (accelerazione per way, come prima)"
+        default: "navmaster"
+      country:
+        description: "Paese ISO dei limiti legali del camion (vuoto: ricavato dalla regione)"
+        default: ""
 
 env:
   GEOFABRIK: https://download.geofabrik.de/europe
@@ -42,16 +48,27 @@ jobs:
           curl -fsSL -o region.osm.pbf "$GEOFABRIK/$REGION-latest.osm.pbf"
           osmium tags-filter region.osm.pbf w/highway=$VEHICLE_ROADS w/route=ferry,shuttle_train r/type=restriction -o roads.osm.pbf --overwrite
           rm region.osm.pbf; ls -la
-      - name: Grafo con il core scelto
+      - name: Grafo con il core e il modello delle velocità scelti
         working-directory: /mnt/w
         env:
           CORE: ${{ inputs.core || 'wide' }}
+          SM: ${{ inputs.speed_model || 'navmaster' }}
+          CC: ${{ inputs.country }}
+          REGION: ${{ inputs.region || 'italy' }}
         run: |
           MEM=$(( $(free -g | awk '/Mem:/{print $2}') - 3 ))
+          if [ -z "$CC" ]; then
+            case "$REGION" in
+              italy) CC=IT ;; austria) CC=AT ;; czech-republic) CC=CZ ;; germany) CC=DE ;; france) CC=FR ;;
+              poland) CC=PL ;; slovakia) CC=SK ;; spain) CC=ES ;; switzerland) CC=CH ;; *) CC="" ;;
+            esac
+          fi
+          COUNTRY=""; [ -n "$CC" ] && COUNTRY="--country=$CC"
+          echo "modello $SM, Paese ${CC:-nessuno}"
           date
-          JAVA_OPTS="-Xmx${MEM}g -XX:+UseParallelGC" $GITHUB_WORKSPACE/engine-cli/build/install/engine-cli/bin/engine-cli import roads.osm.pbf nm --mmap --core=$CORE 2>&1 | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' | tee import.log
+          JAVA_OPTS="-Xmx${MEM}g -XX:+UseParallelGC" $GITHUB_WORKSPACE/engine-cli/build/install/engine-cli/bin/engine-cli import roads.osm.pbf nm --mmap --core=$CORE --speed-model=$SM $COUNTRY 2>&1 | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' | tee import.log
           date
-          echo "== riassunto"; grep -E "^.*(CH |Core |Landmark |grafo:)" import.log
+          echo "== riassunto"; grep -E "^.*(CH |Core |Landmark |grafo:|modello delle|ritardi|archi con ritardo|camion, velocità|camion sotto)" import.log
           du -sh nm; ls -la nm | sort -k5 -n -r | head -20
       - name: Ricerche
         working-directory: /mnt/w
@@ -81,5 +98,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: misura-${{ inputs.region || 'italy' }}-${{ inputs.core || 'wide' }}
+          name: misura-${{ inputs.region || 'italy' }}-${{ inputs.core || 'wide' }}-${{ inputs.speed_model || 'navmaster' }}
           path: /mnt/w/import.log

@@ -18,16 +18,23 @@ interface OsmSink {
     fun relation(id: Long, tags: Map<String, String>, members: List<RelationMember>) {}
 }
 
+/** Una sorgente di dati OSM letta più volte, una per passata (un file PBF, o i dati in memoria delle prove). */
+interface OsmSource {
+    val nodeCount: Long
+    val wayCount: Long
+    fun read(sink: OsmSink, nodes: Boolean = true, ways: Boolean = true, relations: Boolean = true)
+}
+
 /**
  * Lettore di file `.osm.pbf`. Un file va letto più volte (una per passata): ogni chiamata a
  * [read] riparte dall'inizio. I tag inutili per il routing vengono scartati per risparmiare memoria.
  */
-class OsmPbfReader(private val file: File) {
-    var nodeCount = 0L; private set
-    var wayCount = 0L; private set
+class OsmPbfReader(private val file: File) : OsmSource {
+    override var nodeCount = 0L; private set
+    override var wayCount = 0L; private set
     var relationCount = 0L; private set
 
-    fun read(sink: OsmSink, nodes: Boolean = true, ways: Boolean = true, relations: Boolean = true) {
+    override fun read(sink: OsmSink, nodes: Boolean, ways: Boolean, relations: Boolean) {
         require(file.exists()) { "file OSM non trovato: $file" }
         nodeCount = 0; wayCount = 0; relationCount = 0
         BufferedInputStream(file.inputStream(), 1 shl 16).use { input ->
@@ -126,11 +133,13 @@ class OsmPbfReader(private val file: File) {
                 key == "motor_vehicle" || key == "motorcar" || key == "vehicle" || key == "hgv" || key == "goods" ||
                 key == "bus" || key == "delivery" || key == "agricultural" || key == "forestry" ||
                 key.startsWith("maxheight") || key.startsWith("maxwidth") || key.startsWith("maxweight") ||
-                key.startsWith("maxlength") || key.startsWith("maxaxleload") || key == "traffic_signals" || key == "crossing"
+                key.startsWith("maxlength") || key.startsWith("maxaxleload") ||
+                // i controlli dei nodi del modello NAVMASTER (NodeDelays): semafori, stop, passaggi a livello, attraversamenti
+                key.startsWith("traffic_signals") || key.startsWith("crossing") || key == "railway" || key == "stop"
 
         fun keepWayTag(key: String): Boolean =
             !(key == "created_by" || key.startsWith("addr:") || key.startsWith("TMC") || key.startsWith("tiger:") ||
-                key.startsWith("note") || key.startsWith("source") || key.startsWith("wikipedia") || key.startsWith("wikidata") ||
+                key.startsWith("note") || (key.startsWith("source") && key != "source:maxspeed") || key.startsWith("wikipedia") || key.startsWith("wikidata") ||
                 key.startsWith("description") || key.startsWith("old_name") || key.startsWith("alt_name") || key.startsWith("official_name"))
     }
 }

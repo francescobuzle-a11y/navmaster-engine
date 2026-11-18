@@ -1,0 +1,86 @@
+# La prova del modello delle velocità sui grafi veri: austria e czech-republic importati da Geofabrik
+# coi due modelli (navmaster: cartello, legge del Paese, ritardi a semafori, stop, precedenze e
+# rotatorie; ors: accelerazione per way, come prima), poi la sonda BrnoMikulovProbeTest sui grafi
+# navmaster e la prova SpeedModelRealTest (la statale 52 fra Mikulov e Pohořelice, Wien → Brno per
+# il valico di Mikulov, i tempi di una decina di viaggi coi due modelli). Niente viene pubblicato.
+name: Prova delle velocità
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe:
+        description: "Lancia anche la sonda BrnoMikulovProbeTest sui grafi navmaster (yes/no)"
+        default: "yes"
+      ors:
+        description: "Costruisce anche i grafi col modello ors per il confronto (yes/no)"
+        default: "yes"
+
+env:
+  GEOFABRIK: https://download.geofabrik.de/europe
+  VEHICLE_ROADS: motorway,motorway_link,trunk,trunk_link,primary,primary_link,secondary,secondary_link,tertiary,tertiary_link,unclassified,residential,living_street,service,road,track,busway
+
+jobs:
+  prova:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Spazio sul disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup /usr/share/swift || true
+          sudo mkdir -p /mnt/w && sudo chown $USER /mnt/w
+          df -h / /mnt; free -g
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: "17"}
+      - name: Compila il motore
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :engine-cli:installDist -q
+      - name: Grafi (austria, czech-republic; navmaster e ors)
+        working-directory: /mnt/w
+        env:
+          ORS: ${{ inputs.ors || 'yes' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool >/dev/null
+          CLI=$GITHUB_WORKSPACE/engine-cli/build/install/engine-cli/bin/engine-cli
+          MEM=$(( $(free -g | awk '/Mem:/{print $2}') - 3 ))
+          NAV=""; ORSG=""
+          for c in austria czech-republic; do
+            case "$c" in austria) CC=AT ;; czech-republic) CC=CZ ;; esac
+            curl -fsSL --retry 6 --retry-delay 20 -o region.osm.pbf "$GEOFABRIK/$c-latest.osm.pbf"
+            osmium tags-filter region.osm.pbf w/highway=$VEHICLE_ROADS w/route=ferry,shuttle_train r/type=restriction -o roads-$c.osm.pbf --overwrite
+            rm region.osm.pbf
+            echo "== $c navmaster ($CC)"
+            JAVA_OPTS="-Xmx${MEM}g -XX:+UseParallelGC" $CLI import roads-$c.osm.pbf nav/$c --mmap --speed-model=navmaster --country=$CC 2>&1 | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' | tee import-nav-$c.log
+            NAV="$NAV${NAV:+,}$c=/mnt/w/nav/$c"
+            if [ "$ORS" = "yes" ]; then
+              echo "== $c ors"
+              JAVA_OPTS="-Xmx${MEM}g -XX:+UseParallelGC" $CLI import roads-$c.osm.pbf ors/$c --mmap --speed-model=ors 2>&1 | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' | tee import-ors-$c.log
+              ORSG="$ORSG${ORSG:+,}$c=/mnt/w/ors/$c"
+            fi
+            rm roads-$c.osm.pbf
+          done
+          echo "NM_SPEED_NAV=$NAV" >> "$GITHUB_ENV"
+          echo "NM_SPEED_ORS=$ORSG" >> "$GITHUB_ENV"
+          echo "NM_CB=$NAV" >> "$GITHUB_ENV"
+          echo "== riassunto"
+          grep -HE "(grafo:|modello delle|ritardi|archi con ritardo|camion, velocità|camion sotto|Core .*nodi nel core)" import-*.log || true
+          du -sh nav/* ors/* 2>/dev/null || true; df -h /mnt
+      - name: Sonda Brno/Mikulov sui grafi navmaster
+        if: inputs.probe != 'no'
+        run: |
+          ./gradlew --no-daemon :engine-core:test --tests it.navmaster.engine.api.BrnoMikulovProbeTest -i 2>&1 | tee sonda.log | grep -E "^\s{4}sonda|PASSED|FAILED|BUILD" || true
+      - name: Prova del modello delle velocità
+        run: |
+          ./gradlew --no-daemon :engine-core:test --tests it.navmaster.engine.SpeedModelRealTest -i 2>&1 | tee prova.log | grep -E "^\s{4}velocità|PASSED|FAILED|BUILD|AssertionError" || true
+          grep -q "BUILD SUCCESSFUL" prova.log
+      - name: Registro
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prova-velocita
+          path: |
+            /mnt/w/import-*.log
+            sonda.log
+            prova.log

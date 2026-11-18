@@ -12,6 +12,7 @@ import it.navmaster.engine.osm.ImportStats
 import it.navmaster.engine.osm.OsmGraphImporter
 import it.navmaster.engine.profile.CarProfile
 import it.navmaster.engine.profile.HgvProfile
+import it.navmaster.engine.profile.SpeedModel
 import it.navmaster.engine.profile.VehicleProfile
 import it.navmaster.engine.routing.Router
 import it.navmaster.engine.storage.BaseGraph
@@ -131,6 +132,14 @@ class RoutingGraph private constructor(
 
     /** Gli insiemi di landmark con strade escluse preparati (nomi come `tollways`), letti dal file `profiles`. */
     var landmarkSetNames: List<String> = emptyList(); private set
+
+    /**
+     * Il modello delle velocità con cui è stato importato il grafo (`ors` o `navmaster`, proprietà
+     * `speed_model`; `ors` per i grafi di prima) e il Paese dei limiti legali (`country`, null se
+     * assente). Solo diagnostica: velocità e ritardi stanno già negli archi.
+     */
+    var speedModel: String = "ors"; private set
+    var country: String? = null; private set
 
     val profileNames: List<String> get() = encoding.profiles.map { it.profile.name }
 
@@ -429,7 +438,10 @@ class RoutingGraph private constructor(
             val points = if (importOptions.guidance) PointStore(gdir.create("points")) else null
             val rg = RoutingGraph(dir, encoding, graph, tc, guidance, points)
             val stats = OsmGraphImporter(graph, encoding, tc, importOptions, guidance, points).import(pbf)
+            rg.speedModel = (profiles.firstOrNull { it.options.speedModel == SpeedModel.NAVMASTER } ?: profiles.first()).options.speedModel.id
+            rg.country = profiles.firstNotNullOfOrNull { it.options.country }
             rg.flush()
+            GraphProperties(File(dir, "profiles")).apply { load(); set("speed_model", rg.speedModel); set("country", rg.country ?: ""); save() }
             rg.index = LocationIndex.build(graph)
             rg.index.save(gdir)
             return rg to stats
@@ -450,6 +462,8 @@ class RoutingGraph private constructor(
             val rg = RoutingGraph(dir, encoding, graph, tc, GuidanceStore.load(gdir, graph.names), PointStore.load(gdir))
             rg.coreVersion = props.get("core_version")?.toIntOrNull() ?: 1
             rg.coreWide = props.get("core_kind") == "wide"
+            rg.speedModel = props.get("speed_model")?.takeIf { it.isNotBlank() } ?: "ors"
+            rg.country = props.get("country")?.takeIf { it.isNotBlank() }
             rg.landmarkSetNames = (props.get("landmark_sets") ?: "").split(',').filter { it.isNotBlank() }
             for (key in (props.get("ch") ?: "").split(',').filter { it.isNotBlank() }) {
                 val st = CHStorage(gdir, key, graph.edgeCount, graph.nodeCount)

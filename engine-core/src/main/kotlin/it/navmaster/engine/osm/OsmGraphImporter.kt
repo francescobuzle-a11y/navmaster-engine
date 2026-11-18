@@ -7,6 +7,10 @@ import it.navmaster.engine.profile.GuidanceParser
 import it.navmaster.engine.storage.GuidanceStore
 import it.navmaster.engine.storage.PointStore
 import it.navmaster.engine.profile.Access
+import it.navmaster.engine.profile.NodeDelays
+import it.navmaster.engine.profile.SpeedModel
+import it.navmaster.engine.profile.WaySpeedAccess
+import it.navmaster.engine.profile.ZoneInfo
 import it.navmaster.engine.profile.WayAttributeParser
 import it.navmaster.engine.profile.Toll
 import it.navmaster.engine.storage.BaseGraph
@@ -29,6 +33,16 @@ data class ImportStats(
     val millis: Long,
     /** Archi messi a pedaggio da un casello o da un portale ([ImportOptions.tollNodes]). */
     val tollNodeEdges: Int = 0,
+    /** Il modello delle velocità dei profili ([SpeedModel]). */
+    val speedModel: SpeedModel = SpeedModel.ORS,
+    /** Eventi di ritardo ai nodi per tipo (nome di [NodeDelays.Control]); vuoto col modello ORS. */
+    val delayEvents: Map<String, Int> = emptyMap(),
+    /** Archi con un ritardo > 0 in almeno un senso e un profilo. */
+    val delayedEdges: Int = 0,
+    /** Velocità media del camion (km/h, pesata per lunghezza) per classe di strada. */
+    val hgvSpeedByClass: Map<String, Double> = emptyMap(),
+    /** Quota dei km di primary e secondary con cartello > 50 dove il camion va sotto 30 km/h (NaN se nessuno). */
+    val hgvSlowSignedShare: Double = Double.NaN,
 )
 
 /** Le strade su cui un casello o un portale fa pedaggio (non i parcheggi né le strade di servizio). */
@@ -91,13 +105,37 @@ class OsmGraphImporter(
     private var barrierEdges = 0
     private var tollNodeEdges = 0
     private val wayAccess = Array(profiles.size) { Access.CAN_SKIP }
+    private val wayResults = arrayOfNulls<WaySpeedAccess>(profiles.size)
 
-    fun import(pbf: File): ImportStats {
+    /** Le perdite ai nodi del modello NAVMASTER ([NodeDelays], [JunctionDelayPass]): attive se un profilo usa quel modello. */
+    private val nodeDelays = profiles.any { it.profile.options.speedModel == SpeedModel.NAVMASTER }
+    private val controlNodes = LongIntHashMap()  // id OSM → codice di NodeDelays.classify
+    /** Sensi d'arco (arco·2 + 0 avanti, + 1 indietro) con uno stop, una precedenza o un semaforo entro 30 m dal capo d'arrivo. */
+    private val nearEnd = java.util.BitSet()
+    private val delayEvents = IntArray(NodeDelays.Control.entries.size)
+    private val hgvIndex = profiles.indexOfFirst { it.profile.name == "heavyvehicle" }
+    private val classLength = DoubleArray(it.navmaster.engine.profile.RoadClass.entries.size)
+    private val classSpeedLength = DoubleArray(it.navmaster.engine.profile.RoadClass.entries.size)
+    private var signedKm = 0.0
+    private var slowSignedKm = 0.0
+
+    fun import(pbf: File): ImportStats = import(OsmPbfReader(pbf))
+
+    fun import(reader: OsmSource): ImportStats {
         val start = System.currentTimeMillis()
-        val reader = OsmPbfReader(pbf)
         reader.read(Pass1(), nodes = false)
         reader.read(Pass2Nodes(), ways = false, relations = false)
         reader.read(Pass2Ways(), nodes = false, relations = false)
+        var delayedEdges = 0
+        if (nodeDelays) {
+            // i controlli sulle torri (capi d'arco): semafori e stop agli incroci, precedenze implicite, rotatorie
+            val towerControls = com.carrotsearch.hppc.IntIntHashMap()
+            for (c in controlNodes) { val t = towers.getOrDefault(c.key, -1); if (t >= 0) towerControls.put(t, c.value) }
+            val pass = JunctionDelayPass(graph, encoding, towerControls, nearEnd)
+            pass.run()
+            for (i in delayEvents.indices) delayEvents[i] += pass.events[i]
+            delayedEdges = pass.delayedEdges
+        }
         // autovelox e Tutor delle relazioni enforcement (il nodo device con highway=speed_camera è già scritto)
         if (points != null) for (e in enforcements) {
             fun at(id: Long): DoubleArray? = if (id < 0) null else neededNodes.get(id)?.takeIf { it.size == 2 }
@@ -116,7 +154,13 @@ class OsmGraphImporter(
             appliedRestrictions = applier.applied
         }
         graph.freeze()
-        return ImportStats(reader.nodeCount, reader.wayCount, acceptedWays, graph.nodeCount, pillarCount, graph.edgeCount, barrierEdges, appliedRestrictions, turnRestrictions.size, System.currentTimeMillis() - start, tollNodeEdges)
+        val byClass = LinkedHashMap<String, Double>()
+        for (rc in it.navmaster.engine.profile.RoadClass.entries) if (classLength[rc.ordinal] > 0) byClass[rc.osm] = classSpeedLength[rc.ordinal] / classLength[rc.ordinal]
+        return ImportStats(reader.nodeCount, reader.wayCount, acceptedWays, graph.nodeCount, pillarCount, graph.edgeCount, barrierEdges, appliedRestrictions, turnRestrictions.size, System.currentTimeMillis() - start, tollNodeEdges,
+            speedModel = if (nodeDelays) SpeedModel.NAVMASTER else SpeedModel.ORS,
+            delayEvents = if (nodeDelays) NodeDelays.Control.entries.filter { it != NodeDelays.Control.NONE }.associate { it.name to delayEvents[it.ordinal] } else emptyMap(),
+            delayedEdges = delayedEdges, hgvSpeedByClass = byClass,
+            hgvSlowSignedShare = if (signedKm > 0) slowSignedKm / signedKm else Double.NaN)
     }
 
     /** Vero se almeno un profilo può percorrere la way; riempie [wayAccess]. */
@@ -192,6 +236,7 @@ class OsmGraphImporter(
             }
             val use = nodeUse.getOrDefault(id, 0)
             if (use == 0) return
+            if (nodeDelays && tags != null) NodeDelays.classify(tags).let { if (it != 0) controlNodes.put(id, it) }
             var isBarrier = false
             if (tags != null && options.tollNodes) {
                 if (tags["barrier"] == "toll_booth") tollBooths.add(id)
@@ -321,6 +366,63 @@ class OsmGraphImporter(
             }
         }
 
+        private val delayFwd = DoubleArray(profiles.size)
+        private val delayBwd = DoubleArray(profiles.size)
+        private var cum = DoubleArray(64)
+
+        /**
+         * I controlli sui nodi interni dell'arco (pillar: semafori, stop, precedenze, caselli, passaggi a
+         * livello, semafori pedonali): i secondi persi per senso e profilo, sommati e scritti nei flag. Le
+         * torri (capi d'arco) le tratta [JunctionDelayPass]. L'arco segue l'ordine della way: «avanti» è
+         * il senso della way. Senza direzione, uno stop o una precedenza vale verso il capo più vicino, e
+         * così un semaforo entro [NodeDelays.SIGNAL_APPROACH_M] da un capo (il semaforo di un accesso);
+         * due semafori a meno di 40 m nello stesso senso contano una volta.
+         */
+        private fun interiorDelays(edge: Int, n: Int, flags: IntArray) {
+            if (controlNodes.isEmpty || n < 3 || segIds.size() != n) return
+            var any = false
+            for (k in 1 until n - 1) if (controlNodes.containsKey(segIds.get(k))) { any = true; break }
+            if (!any) return
+            if (cum.size < n) cum = DoubleArray(n * 2)
+            cum[0] = 0.0
+            for (k in 1 until n) cum[k] = cum[k - 1] + DistanceCalc.haversine(lats[k - 1], lons[k - 1], lats[k], lons[k])
+            val total = cum[n - 1]
+            delayFwd.fill(0.0); delayBwd.fill(0.0)
+            var lastSignalF = Double.NEGATIVE_INFINITY; var lastSignalB = Double.NEGATIVE_INFINITY
+            for (k in 1 until n - 1) {
+                val code = controlNodes.getOrDefault(segIds.get(k), 0)
+                if (code == 0) continue
+                val c = NodeDelays.control(code)
+                var dir = NodeDelays.direction(code)
+                if (dir == NodeDelays.DIR_BOTH && (c == NodeDelays.Control.STOP || c == NodeDelays.Control.GIVE_WAY))
+                    dir = if (total - cum[k] < cum[k]) NodeDelays.DIR_FORWARD else NodeDelays.DIR_BACKWARD
+                // il semaforo di un accesso (senza direzione, appena prima di un capo): vale solo verso quel capo,
+                // altrimenti chi attraversa l'incrocio pagherebbe anche il semaforo dell'accesso opposto, in uscita
+                else if (dir == NodeDelays.DIR_BOTH && c == NodeDelays.Control.SIGNALS && minOf(cum[k], total - cum[k]) <= NodeDelays.SIGNAL_APPROACH_M)
+                    dir = if (total - cum[k] < cum[k]) NodeDelays.DIR_FORWARD else NodeDelays.DIR_BACKWARD
+                var fwd = dir != NodeDelays.DIR_BACKWARD
+                var bwd = dir != NodeDelays.DIR_FORWARD
+                if (c == NodeDelays.Control.SIGNALS) {
+                    if (fwd) { if (cum[k] - lastSignalF < 40) fwd = false else lastSignalF = cum[k] }
+                    if (bwd) { if (cum[k] - lastSignalB < 40) bwd = false else lastSignalB = cum[k] }
+                }
+                if (!fwd && !bwd) continue
+                // uno stop, una precedenza o un semaforo appena prima del capo: lì la precedenza implicita non serve
+                if (c == NodeDelays.Control.STOP || c == NodeDelays.Control.GIVE_WAY || c == NodeDelays.Control.SIGNALS) {
+                    if (fwd && total - cum[k] <= 30) nearEnd.set(edge * 2)
+                    if (bwd && cum[k] <= 30) nearEnd.set(edge * 2 + 1)
+                }
+                delayEvents[c.ordinal]++
+                for (i in profiles.indices) {
+                    val r = wayResults[i] ?: continue
+                    val p = profiles[i].profile
+                    if (fwd && r.forward) delayFwd[i] += NodeDelays.seconds(c, r.speedKmh, p.acceleration, p.deceleration)
+                    if (bwd && r.backward) delayBwd[i] += NodeDelays.seconds(c, r.speedKmh, p.acceleration, p.deceleration)
+                }
+            }
+            for (i in profiles.indices) if (wayResults[i] != null) profiles[i].writeDelay(flags, delayFwd[i], delayBwd[i])
+        }
+
         private fun addEdge(way: OsmWay, from: Int, to: Int) {
             val n = lats.size
             if (from == to) {
@@ -351,8 +453,12 @@ class OsmGraphImporter(
             val ferryDuration = if (isFerry) OsmValues.parseDurationSeconds(way.tag("duration")) else -1L
             for (i in profiles.indices) {
                 // i traghetti: la velocità dalla durata e dalla lunghezza del tratto; le strade: la linea d'aria della way (ORS)
-                profiles[i].write(flags, profiles[i].profile.analyse(way, wayAccess[i], if (isFerry) dist else wayBeeline, ferryDuration))
+                val r = profiles[i].profile.analyse(way, wayAccess[i], if (isFerry) dist else wayBeeline, ferryDuration)
+                wayResults[i] = r
+                profiles[i].write(flags, r)
             }
+            if (nodeDelays) interiorDelays(edge, n, flags)
+            speedStats(way, dist)
             graph.setFlags(edge, flags)
             val name = wayName(way)
             if (name.isNotEmpty()) graph.setName(edge, name)
@@ -372,6 +478,26 @@ class OsmGraphImporter(
                 val sA = if (rs != null && segIds.size() == n) rs.firstOrNull { it.first == segIds.get(0) }?.second else null
                 val sB = if (rs != null && segIds.size() == n) rs.firstOrNull { it.first == segIds.get(n - 1) }?.second else null
                 g.set(edge, GuidanceParser.parse(way), jA, jB, special?.toString(), sA, sB)
+            }
+        }
+    }
+
+    /** Le statistiche delle velocità del camion (ImportStats). */
+    private fun speedStats(way: OsmWay, dist: Double) {
+        if (hgvIndex < 0) return
+        val r = wayResults[hgvIndex] ?: return
+        if (!r.forward && !r.backward) return
+        val rc = WayAttributeParser.roadClass(way)
+        classLength[rc.ordinal] += dist; classSpeedLength[rc.ordinal] += dist * r.speedKmh
+        val h = way.tag("highway")
+        if (h == "primary" || h == "secondary") {
+            var signed = Double.NaN
+            for (k in arrayOf("maxspeed", "maxspeed:forward", "maxspeed:backward")) {
+                val v = ZoneInfo.parseSigned(way.tag(k)); if (!v.isNaN() && (signed.isNaN() || v < signed)) signed = v
+            }
+            if (!signed.isNaN() && signed > 50) {
+                signedKm += dist / 1000
+                if (r.speedKmh < 30) slowSignedKm += dist / 1000
             }
         }
     }

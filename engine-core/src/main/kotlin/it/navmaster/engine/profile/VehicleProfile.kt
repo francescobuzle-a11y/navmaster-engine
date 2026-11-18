@@ -26,6 +26,10 @@ data class VehicleProfileOptions(
     val maximumGradeLevel: Int = 3,
     /** Passo della velocità memorizzata (km/h); è anche la velocità minima. */
     val speedFactor: Double = 5.0,
+    /** Il modello delle velocità ([SpeedModel]): ORS di default, NAVMASTER per i pacchetti dell'app. */
+    val speedModel: SpeedModel = SpeedModel.ORS,
+    /** Paese del grafo (ISO alpha-2 maiuscolo) per i limiti legali del modello NAVMASTER; null = riga di riserva. */
+    val country: String? = null,
 )
 
 /**
@@ -57,6 +61,16 @@ abstract class VehicleProfile(
 
     val minSpeed: Double get() = options.speedFactor
 
+    /** Accelerazione e decelerazione tipiche (m/s²) per le perdite ai nodi del modello NAVMASTER ([NodeDelays]). */
+    open val acceleration: Double = 1.5
+    open val deceleration: Double = 2.0
+
+    /** Tetti di velocità per tipo del modello NAVMASTER (km/h). */
+    protected open val roundaboutCap: Double = 30.0
+    protected open val roundaboutCapMultiLane: Double = 40.0
+    protected open val miniRoundaboutCap: Double = 25.0
+    protected open val residentialCap: Double = 40.0
+
     abstract fun access(way: OsmWay): Access
 
     /** Priorità della way per questo profilo; default neutro. */
@@ -74,6 +88,7 @@ abstract class VehicleProfile(
             return WaySpeedAccess(access, forward = true, backward = true, speedKmh = clampSpeed(speed), priority = priority(way).factor)
         }
         val highway = highwayValue(way) ?: return null
+        if (options.speedModel == SpeedModel.NAVMASTER) return analyseNavmaster(way, access, highway)
         var speed = baseSpeed(way, highway).toDouble()
         speed = applyMaxSpeed(way, speed)
         speed = applySurface(way, speed)
@@ -97,6 +112,63 @@ abstract class VehicleProfile(
             fwd = true; bwd = true
         }
         return WaySpeedAccess(access, fwd, bwd, clampSpeed(speed), priority(way).factor)
+    }
+
+    /**
+     * Modello NAVMASTER: cartello, legge e massimo del mezzo ([navmasterSpeed]), superficie, tetti per
+     * tipo (rotatorie, residenziali); niente accelerazione per way né penalità residenziale (il tempo
+     * perso si paga nei nodi, vedi [NodeDelays]).
+     */
+    private fun analyseNavmaster(way: OsmWay, access: Access, highway: String): WaySpeedAccess {
+        var speed = navmasterSpeed(way, highway)
+        speed = applySurface(way, speed)
+        val roundabout = way.hasTag("junction", "roundabout")
+        if (roundabout) {
+            val lanes = way.tag("lanes")?.toIntOrNull() ?: 1
+            speed = min(speed, if (lanes >= 2) roundaboutCapMultiLane else roundaboutCap)
+        }
+        if (way.hasTag("highway", "mini_roundabout")) speed = min(speed, miniRoundaboutCap)
+        if (highway == "residential") speed = min(speed, residentialCap)
+        val fwd: Boolean
+        val bwd: Boolean
+        if (isOneway(way) || roundabout) {
+            fwd = isForwardOneway(way)
+            bwd = isBackwardOneway(way)
+        } else {
+            fwd = true; bwd = true
+        }
+        return WaySpeedAccess(access, fwd, bwd, clampSpeed(speed), priority(way).factor)
+    }
+
+    /**
+     * Velocità di marcia del modello NAVMASTER prima di superficie e tetti. Per l'auto: il cartello
+     * (`maxspeed`, o il limite generale di `XX:valore`, o quello della zona) × 0,9, altrimenti la
+     * velocità del tipo di strada; i cartelli e le zone sono già la legge, come in ORS.
+     */
+    open fun navmasterSpeed(way: OsmWay, highway: String): Double {
+        var signed = lowestSigned(way, "maxspeed", "maxspeed:forward", "maxspeed:backward")
+        if (signed.isNaN()) ZoneInfo.of(way, highway)?.implicitKmh?.takeIf { it > 0 }?.let { signed = it.toDouble() }
+        var v = if (!signed.isNaN()) signed * MAX_SPEED_FACTOR
+            else (highwaySpeeds[highway] ?: error("$name: nessuna velocità per highway=$highway")).toDouble()
+        v = trackTypeSpeed(way, highway, v)
+        return v
+    }
+
+    /** Come [lowestOf], ma `XX:valore` vale il limite generale del Paese ([ZoneInfo.parseSigned]). */
+    protected fun lowestSigned(way: OsmWay, vararg keys: String): Double {
+        var result = Double.NaN
+        for (k in keys) {
+            val v = ZoneInfo.parseSigned(way.tag(k))
+            if (!v.isNaN() && (result.isNaN() || v < result)) result = v
+        }
+        return result
+    }
+
+    /** `highway=track`: la velocità del `tracktype`, come in [baseSpeed]. */
+    protected fun trackTypeSpeed(way: OsmWay, highway: String, speed: Double): Double {
+        if (highway != "track") return speed
+        val tt = way.tag("tracktype") ?: return speed
+        return trackTypeSpeeds[tt]?.takeIf { it != -1 }?.toDouble() ?: speed
     }
 
     /** `highway=*`, ma `motorroad=yes` su strade non autostradali viene trattato come "motorroad". */
