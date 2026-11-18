@@ -525,7 +525,10 @@ class BrnoMikulovProbeTest {
         for (f in forced) println("$tag Wien → %.5f,%.5f r${f.t.rank} → Brno: %.1f km, %.1f min, peso %.0f (austria %.0f + cechia %.0f)%s".format(f.t.lat, f.t.lon,
             (f.atLeg.distance + f.czLeg.distance) / 1000, (f.atLeg.millis + f.czLeg.millis) / 60000.0, f.weight, f.atLeg.weight, f.czLeg.weight,
             fBest?.let { b -> ", fattore %.3f sul più leggero".format(f.weight / b) } ?: ""))
-        val fMik = forced.minByOrNull { DistanceCalc.haversine(it.t.lat, it.t.lon, mik.first, mik.second) }
+        // il valico principale della E461 (B7 → I/52), non la stradina più vicina al centro di Mikulov
+        val mikMain = 48.78889 to 16.63681
+        val fMik = forced.minByOrNull { DistanceCalc.haversine(it.t.lat, it.t.lon, mikMain.first, mikMain.second) }
+        println("$tag valico principale di Mikulov: " + (fMik?.let { "%.5f,%.5f r${it.t.rank}, a %.0f m dalla E461".format(it.t.lat, it.t.lon, DistanceCalc.haversine(it.t.lat, it.t.lon, mikMain.first, mikMain.second)) } ?: "nessun percorso"))
         val fHate = forced.minByOrNull { DistanceCalc.haversine(it.t.lat, it.t.lon, hate.first, hate.second) }
         fMik?.let { printRoute("$tag Wien → Mikulov (pezzo austriaco)", at.graph, listOf(it.atLeg), full = false); printRoute("$tag Mikulov → Brno (pezzo ceco)", cz.graph, listOf(it.czLeg), full = false) }
         fHate?.let { printRoute("$tag Wien → Hatě (pezzo austriaco)", at.graph, listOf(it.atLeg), full = false); printRoute("$tag Hatě → Brno (pezzo ceco)", cz.graph, listOf(it.czLeg), full = false) }
@@ -545,6 +548,11 @@ class BrnoMikulovProbeTest {
         }
         fHate?.let { speedsAlong("$tag velocità nel pezzo ceco per Hatě (tutto)", cz.graph, listOf(it.czLeg), emptySet(), perEdge = false) }
 
+        // da sud, come il pezzo austriaco e ceco di Canneto → Bielsko-Biała (Tarvisio → … → Ostrava): il valico scelto
+        for ((name, from, to) in listOf(Triple("Graz → Brno", 47.0707 to 15.4395, brno), Triple("Arnoldstein → Olomouc", 46.5490 to 13.7080, 49.5938 to 17.2509),
+                                         Triple("Wien → Olomouc", wien, 49.5938 to 17.2509))) {
+            crossTrip("$tag $name migliore", cb, request(listOf(from, to), car = false), ctx())
+        }
         // il viaggio intero Canneto → Bielsko-Biała: migliore, obbligato per Mikulov e per Hatě (punti di passaggio 2 km prima e
         // dopo il valico sulle strade dei pezzi qui sopra, e sulla D1 a est di Brno)
         val canneto = 45.1502 to 10.3792; val bielsko = 49.8224 to 19.0444

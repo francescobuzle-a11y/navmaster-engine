@@ -104,7 +104,7 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
         for (v in restrictionValues) {
             if (v.isEmpty()) continue
             // TODO restrizioni condizionali (access:conditional): per ora trattate come assolute
-            if (v in restrictedValues) return Access.CAN_SKIP
+            if (v in restrictedValues) return if (privateMainRoad(way)) Access.WAY else Access.CAN_SKIP
             if (v in intendedValues) return Access.WAY
         }
         val carsAllowed = way.hasTag(restrictions, intendedValues)
@@ -115,7 +115,26 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
         return Access.WAY
     }
 
+    /**
+     * Modello NAVMASTER: un `private` per il camion su una strada principale (autostrada, superstrada,
+     * statale e rampe) è quasi sempre una corsia di dogana, di casello o di cantiere segnata così, non
+     * una strada privata: al valico di Mikulov (E461) la deviazione per il cantiere dello svincolo D52
+     * passa dalle corsie della vecchia dogana, `hgv=private`, e il valico era chiuso ai camion nei due
+     * sensi. Lì il camion passa, con la priorità di chi deve solo arrivare ([PriorityCode.REACH_DEST]):
+     * la usa quando non c'è di meglio. `no`, `restricted` e `military` restano divieti; ORS non cambia.
+     */
+    fun privateMainRoad(way: OsmWay): Boolean {
+        if (options.speedModel != SpeedModel.NAVMASTER || highwayValue(way) !in MAIN_ROADS) return false
+        for (v in way.firstPriorityTagValues(restrictions)) {
+            if (v.isEmpty()) continue
+            if (v in restrictedValues) return v == "private"
+            if (v in intendedValues) return false
+        }
+        return false
+    }
+
     override fun priority(way: OsmWay): PriorityCode {
+        if (privateMainRoad(way)) return PriorityCode.REACH_DEST
         if (way.hasTag("hgv", "designated") ||
             (way.hasTag("access", "designated") && (way.hasTag("goods", "yes") || way.hasTag("hgv", "yes") ||
                 way.hasTag("bus", "yes") || way.hasTag("agricultural", "yes") || way.hasTag("forestry", "yes")))
@@ -149,6 +168,8 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
     }
 
     companion object {
+        /** Le strade principali su cui un `private` per il camion si legge come corsia riservata ([privateMainRoad]). */
+        private val MAIN_ROADS = setOf("motorway", "motorway_link", "motorroad", "trunk", "trunk_link", "primary", "primary_link")
         private val CONDITION = Regex("""^\s*([^@]+?)\s*@\s*\(?\s*(.+?)\s*\)?\s*$""")
         private val WEIGHT = Regex("""^(weight|weightrating|maxweight)\s*>=?\s*([0-9]+(?:\.[0-9]+)?)\s*t?$""")
 
