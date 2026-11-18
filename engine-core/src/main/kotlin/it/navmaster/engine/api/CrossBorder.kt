@@ -242,6 +242,14 @@ class CrossBorderDirections(
      */
     internal var parallelSequences = true
     /**
+     * I limiti inferiori della scelta dei valichi comprendono i tratti fissi dei capi ([pieceBase]): con una
+     * tappa prima del confine (Canneto → Drasenhofen «passa di qui» → Bielsko-Biała) il tratto Tarvisio →
+     * Drasenhofen, che il tetto (il peso della catena intera) contiene, mancava ai limiti, e il transito
+     * austria-czech-poland esaminava 169 uscite (472 ricerche, 519 tratti, 20 s in CI, 202 s sul tablet).
+     * false: come prima (prove). Il migliore non cambia (sono limiti inferiori), cambia solo il lavoro.
+     */
+    internal var prefixBase = true
+    /**
      * I grafi del passo 1 di [chain] (il migliore): quelli che l'app aprirebbe per il percorso a schermo
      * (null: tutti). Gli altri grafi aperti servono solo alle sequenze in più del passo 2 (fonte V), così
      * aprirne di più per la richiesta delle varianti non cambia il migliore.
@@ -1629,6 +1637,14 @@ class CrossBorderDirections(
         // nella sequenza italy-austria-hungary-croatia, non in quella del migliore). La sequenza del migliore no: la
         // memoria ha solo il peso e la sequenza, i valichi si ritrovano con le sue ricerche (sul tablet, memoria dei
         // pesi o dei tratti svuotata in parte: ricerche vere per ricostruire il migliore, contate come tali)
+        // i tratti fissi dei capi per la programmazione dinamica ([dpChain]): una volta, col contesto del thread che li chiede per primo
+        val baseMemo = AtomicReference<DoubleArray?>(null)
+        val bases = { c: Ctx -> baseMemo.get() ?: synchronized(baseMemo) {
+            baseMemo.get() ?: doubleArrayOf(startBase(c, prefix), endBase(c, suffix, radius, gb)).also {
+                baseMemo.set(it)
+                if (it[0] > 0 || it[1] > 0) log?.invoke("  tratti fissi dei capi: %.0f prima del primo confine, %.0f dopo l'ultimo".format(it[0], it[1]))
+            }
+        } }
         val q1 = ctx.queries; val x1 = ctx.extraQueries; val xs1 = ctx.extraSearched
         // le ricerche per le varianti del passo 1 (con la memoria: tutte quelle delle altre sequenze) e quelle della sequenza del migliore
         val forVq = java.util.concurrent.atomic.AtomicInteger(); val knownSeqQ = java.util.concurrent.atomic.AtomicInteger()
@@ -1646,7 +1662,7 @@ class CrossBorderDirections(
             try {
                 dpChain(c, prefix, suffix, radius, p, rp, q, rq, path, { ceiling(i) },
                     { w, via -> seqChain.set(i, via.mapIndexed { k, tr -> tr to path[k + 1] }); seqBest.set(i, w.toRawBits()) }, f, together = together,
-                    exactTopLimit = { ceilingBefore(i) }, memoLimit = { memoCeiling(i) })
+                    exactTopLimit = { ceilingBefore(i) }, memoLimit = { memoCeiling(i) }, bases = bases)
             } finally { c.extraPhase = wasExtra; onSequence?.invoke(i, false) }
             val dq = c.queries - sq0; val dx = c.extraQueries - sx0
             forVq.addAndGet(if (vSeq) dq else dx)
@@ -1715,7 +1731,7 @@ class CrossBorderDirections(
                 c.extraPhase = true
                 val done = try {
                     dpChain(c, prefix, suffix, radius, p, rp, q, rq, path, { cap }, { _, _ -> }, into,
-                        layerSize = LAYER_EXTRA, onePerPlace = true, token = c.topBudget, maxExact = maxExact, together = false, skip = bestChoice)
+                        layerSize = LAYER_EXTRA, onePerPlace = true, token = c.topBudget, maxExact = maxExact, together = false, skip = bestChoice, bases = bases)
                 } catch (e: SearchCancelledException) {
                     if (e.reason != SearchCancelledException.Reason.DEADLINE || c.rc.cancel.isCancelled) throw e
                     c.topStopped = true; false
@@ -1835,7 +1851,12 @@ class CrossBorderDirections(
                         layerSize: Int = LAYER, onePerPlace: Boolean = false, token: CancelToken? = null, maxExact: Int = Int.MAX_VALUE,
                         together: Boolean = false, skip: ChainChoice? = null, exactTopLimit: () -> Double = limit,
                         /** Il tetto per la memoria dei transiti ([chooseTwo]): con la memoria del passo 1 quello che avrà alla fine. */
-                        memoLimit: () -> Double = limit): Boolean {
+                        memoLimit: () -> Double = limit,
+                        /**
+                         * I tratti fissi dei capi ([startBase], [endBase]) col contesto del thread, calcolati una volta per [chain]
+                         * e solo se servono (non per i rami esatti di due e tre grafi, che li hanno da [ends]); null: 0 e 0.
+                         */
+                        bases: ((Ctx) -> DoubleArray)? = null): Boolean {
         fun stopped(): Boolean { if (token == null || !token.isCancelled) return false; ctx.rc.cancel.check(); ctx.topStopped = true; return true }
         var exacts = 0
         // un giro per un Paese vicino (A-B-A): si rientra a un altro valico (allo stesso sarebbe il percorso del Paese)
@@ -1865,6 +1886,9 @@ class CrossBorderDirections(
         }
         // programmazione dinamica sui confini: il peso migliore fino a ogni passaggio
         var layer: List<Triple<Transfer, Double, List<Transfer>>> = emptyList()
+        // i tratti fissi dei capi: la tappa prima del primo confine (s0, in ogni peso del primo strato: il tetto, peso
+        // della catena intera, la contiene) e i tratti fra i punti dopo l'ultimo (e0, nei limiti fino all'arrivo)
+        var s0 = 0.0; var e0 = 0.0
         for (k in 1 until path.size) {
             val from = path[k - 1]; val to = path[k]
             val places = candidates(transfers(from, to), p, q, path.size > 2)
@@ -1903,8 +1927,9 @@ class CrossBorderDirections(
                     return true
                 }
             }
+            if (k == 1 && bases != null) bases(ctx).let { s0 = it[0]; e0 = it[1] }
             // due thread su sequenze dallo stesso primo confine: il primo strato diviso fra loro (gli stessi pesi)
-            if (k == 1 && path.size > 2 && token == null) ctx.warm(from, p, rp, cands.map { LL(it.lat, it.lon) }, TRANSFER_RADIUS, limit)
+            if (k == 1 && path.size > 2 && token == null) ctx.warm(from, p, rp, cands.map { LL(it.lat, it.lon) }, TRANSFER_RADIUS) { limit() - s0 }
             val next = ArrayList<Triple<Transfer, Double, List<Transfer>>>()
             for (t in cands) {
                 val tl = LL(t.lat, t.lon)
@@ -1912,12 +1937,12 @@ class CrossBorderDirections(
                 if (k == 1) {
                     // each search only as far as the best whole trip found so far: it cannot win beyond
                     if (stopped()) return false
-                    w = ctx.weight(from, p, rp, tl, TRANSFER_RADIUS, limit()); via = listOf(t)
+                    w = s0 + ctx.weight(from, p, rp, tl, TRANSFER_RADIUS, limit() - s0); via = listOf(t)
                     // two countries: the whole trip through this crossing at once, so that the
                     // next crossings are looked for under its weight
                     if (path.size == 2 && w.isFinite()) {
                         // the weights of the search are a lower bound: the whole trip weighed as the final pieces
-                        val total = w + ctx.weight(path[1], tl, TRANSFER_RADIUS, q, rq, limit() - w)
+                        val total = w + e0 + ctx.weight(path[1], tl, TRANSFER_RADIUS, q, rq, limit() - w - e0)
                         if (total < limit()) exact(listOf(t)) ?: return false
                         continue
                     }
@@ -1951,7 +1976,7 @@ class CrossBorderDirections(
             if (exacts >= maxExact) break
             if (known(via)) continue
             if (stopped()) return false
-            val total = w + ctx.weight(last, LL(t.lat, t.lon), TRANSFER_RADIUS, q, rq, limit() - w)
+            val total = w + e0 + ctx.weight(last, LL(t.lat, t.lon), TRANSFER_RADIUS, q, rq, limit() - w - e0)
             if (total >= limit()) continue
             // come sopra: il viaggio pesato come i pezzi finali
             exact(via) ?: return false
@@ -2035,6 +2060,9 @@ class CrossBorderDirections(
         // senza coppie e senza nessuno scarto per il tetto: nessuna coppia del tutto (la memoria lo vale per ogni tetto)
         noneBelow[0] = Double.POSITIVE_INFINITY
         val m0 = r0.base; val m2 = r2.base
+        // i tratti fissi dei capi (la tappa prima del confine, [Ends.startBase]): nelle chiavi e nei limiti, non nelle
+        // radici del Paese di mezzo (la finestra di [advanceAround] resta quella di sempre)
+        val s0 = ends.startBase; val e0 = ends.endBase
         m0.advanceAround(startWindowFactor, startWindowSlack)
         val m0Window = m0.stats
         // le radici coi limiti inferiori (i pesi, dove definitivi): i limiti restano tali
@@ -2056,7 +2084,7 @@ class CrossBorderDirections(
         while (true) {
             var ky = -1; var key = Double.POSITIVE_INFINITY
             for (y in c12.indices) if (!done[y]) {
-                val k = b1[y] + (if (w2[y].isNaN()) r2.lowerBound(y) else w2[y])
+                val k = s0 + b1[y] + (if (w2[y].isNaN()) e0 + r2.lowerBound(y) else w2[y])
                 if (k < key) { key = k; ky = y }
             }
             val cut = cap()
@@ -2064,15 +2092,16 @@ class CrossBorderDirections(
             if (key >= cut) { capped(cut); break }
             if (!mm.isFinal(ky)) {
                 // il limite vero dalle X a questo Y (la finestra fissa lasciava ai lontani il limite della frontiera)
-                val rest = if (w2[ky].isNaN()) r2.lowerBound(ky) else w2[ky]
-                mm.advance { mm.isFinal(ky) || mm.lowerBound(ky) + rest >= cut }
+                val rest = if (w2[ky].isNaN()) e0 + r2.lowerBound(ky) else w2[ky]
+                mm.advance { mm.isFinal(ky) || s0 + mm.lowerBound(ky) + rest >= cut }
                 b1[ky] = maxOf(b1[ky], mm.lowerBound(ky))
                 continue
             }
             // definitivo per un altro Y (la ricerca va avanti per tutti): il limite vero, poi di nuovo in ordine
             if (b1[ky] < mm.weight(ky)) { b1[ky] = mm.weight(ky); continue }
             if (w2[ky].isNaN()) {
-                if (!r2.isFinal(ky)) { r2.advanceFor(ky, cut - b1[ky]) { lb -> b1[ky] + lb > key }; continue }
+                // la condizione sommata come la chiave (stesso ordine: in virgola mobile un altro ordine può dare «oltre» senza avanzare, e il ciclo non finisce)
+                if (!r2.isFinal(ky)) { r2.advanceFor(ky, cut - s0 - b1[ky] - e0) { lb -> (s0 + b1[ky]) + (e0 + lb) > key }; continue }
                 // il peso di ricerca è quello del pezzo quando niente lo distingue (vedi Ends); se no il pezzo
                 w2[ky] = if (ends.endExact) ends.endInner + r2.weight(ky) else { evaluated++; ctx.pieceWeight(gEnd, pieceEnd(c12[ky])) }
                 continue
@@ -2083,10 +2112,10 @@ class CrossBorderDirections(
             val order = c01.indices.filter { r0.lowerBound(it).isFinite() && my.lowerBound(it).isFinite() }.sortedBy { r0.lowerBound(it) + my.lowerBound(it) }
             for (x in order) {
                 val c = cap()
-                if (r0.lowerBound(x) + my.lowerBound(x) + w2[ky] >= c) { capped(c); continue }
+                if (s0 + r0.lowerBound(x) + my.lowerBound(x) + w2[ky] >= c) { capped(c); continue }
                 if (w0[x].isNaN()) {
                     // prima il peso vero del capo dalla sua ricerca (o da una mirata, se lontano), poi, se serve, il pezzo
-                    if (!r0.isFinal(x)) r0.advanceFor(x, c - my.lowerBound(x) - w2[ky]) { lb -> lb + my.lowerBound(x) + w2[ky] >= c }
+                    if (!r0.isFinal(x)) r0.advanceFor(x, c - s0 - my.lowerBound(x) - w2[ky]) { lb -> s0 + lb + my.lowerBound(x) + w2[ky] >= c }
                     if (!r0.isFinal(x)) { capped(c); continue }
                     w0[x] = if (ends.startExact) ends.startInner + r0.weight(x) else { evaluated++; ctx.pieceWeight(ga, pieceA(c01[x])) }
                 }
@@ -2104,7 +2133,7 @@ class CrossBorderDirections(
         val l = limit()
         if (limited) noneBelow[0] = l
         log?.invoke("    due valichi insieme, transito (${ga.id}→${gMid.id}→${gEnd.id}): ${if (bx < 0) "nessuno" else "%.5f,%.5f e %.5f,%.5f peso %.0f".format(c01[bx].lat, c01[bx].lon, c12[by].lat, c12[by].lon, best)}" +
-            "${if (l.isFinite()) " (tetto %.0f)".format(l) else ""} fra ${c01.size}×${c12.size} coppie, ${done.count { it }} uscite esaminate, $searches ricerche, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms; " +
+            "${if (l.isFinite()) " (tetto %.0f)".format(l) else ""}${if (s0 > 0 || e0 > 0) " (tratti fissi dei capi %.0f + %.0f)".format(s0, e0) else ""} fra ${c01.size}×${c12.size} coppie, ${done.count { it }} uscite esaminate, $searches ricerche, $evaluated pezzi, ${System.currentTimeMillis() - t0} ms; " +
             "${ga.id} ${r0.stats} (finestra: $m0Window); ${gMid.id} ${mm.stats}; ${gEnd.id} ${r2.stats}")
         return if (bx < 0) none else Triple(c01[bx], c12[by], best)
     }
@@ -2214,7 +2243,68 @@ class CrossBorderDirections(
      * pesa la ricerca più le tappe interne del capo ([startInner]/[endInner], pesate una volta).
      * Se no la ricerca resta un limite inferiore e il pezzo si calcola.
      */
-    private class Ends(val startExact: Boolean, val startInner: Double, val endExact: Boolean, val endInner: Double)
+    private class Ends(val startExact: Boolean, val startInner: Double, val endExact: Boolean, val endInner: Double,
+                       /**
+                        * I tratti fissi dei capi ([pieceBase]): dentro ogni pezzo del primo capo i tratti fra i punti di [prefix]
+                        * (la tappa prima del confine), dentro ogni pezzo dell'ultimo quelli fra i punti di suffix. Da sommare ai
+                        * limiti delle ricerche dai capi (che partono dall'ultimo punto del prefisso e arrivano al primo del suffisso).
+                        */
+                       val startBase: Double = 0.0, val endBase: Double = 0.0)
+
+    /** La richiesta dei soli punti di [prefix] (i tratti fra loro, come dentro ogni pezzo del primo capo). */
+    private fun prefixRequest(request: DirectionsRequest, prefix: Piece): DirectionsRequest =
+        request.withPoints(prefix.points, prefix.radiuses.toDoubleArray(), prefix.exact.toBooleanArray(), prefix.bearings, prefix.passThrough.toBooleanArray())
+
+    /** La richiesta dei soli punti [suffix] (i tratti fra loro, come dentro ogni pezzo dell'ultimo capo). */
+    private fun suffixRequest(request: DirectionsRequest, suffix: IntRange, radius: (Int) -> Double): DirectionsRequest =
+        request.withPoints(suffix.map { request.coordinates[it] }, suffix.map { radius(it) }.toDoubleArray(), suffix.map { false }.toBooleanArray(),
+            suffix.map { request.bearings?.getOrNull(it) }, suffix.map { request.passThroughAt(it) }.toBooleanArray())
+
+    /**
+     * Vero se il peso della richiesta [r] dei soli punti di un capo è un limite inferiore della loro parte in
+     * ogni pezzo che li contiene: con `maximum_speed` un pezzo lungo in linea d'aria la conta sui soli tempi
+     * ([DirectionsService.fastMaximumSpeed]: pesi più leggeri), allora la richiesta corta deve già farlo.
+     */
+    private fun baseAllowed(ctx: Ctx, g: CountryGraph, r: DirectionsRequest): Boolean {
+        if (!prefixBase || r.coordinates.size < 2) return false
+        val o = try { g.service.routeOptions(ctx.inGraph(g, r)) } catch (e: ApiException) { return false }
+        var beeline = 0.0
+        for (i in 1 until r.coordinates.size) beeline += DistanceCalc.haversine(r.coordinates[i - 1].first, r.coordinates[i - 1].second, r.coordinates[i].first, r.coordinates[i].second)
+        return !g.service.fastMaximumSpeed(o, Double.MAX_VALUE) || g.service.fastMaximumSpeed(o, beeline)
+    }
+
+    /**
+     * I tratti fissi di un capo: il peso della richiesta [r] dei soli suoi punti in [g] quando è un limite
+     * inferiore della loro parte in ogni pezzo ([baseAllowed]); 0 se no (o senza percorso: allora lo dicono i pezzi).
+     *
+     * Il primo capo ([prefixRequest]): in un pezzo «punti del prefisso + valico X» i tratti fra i punti del
+     * prefisso sono gli stessi per ogni X ([DirectionsService.legsOf]: un tratto dipende solo dal precedente, la
+     * direzione d'arrivo vale solo per l'ultimo tratto), quindi pezzo(X) = base + tratto(ultimo punto → X) ≥
+     * base + limite di ricerca. Non con la direzione (`bearings`) all'ultimo punto del prefisso: da solo sarebbe
+     * la direzione d'arrivo del suo ultimo tratto.
+     *
+     * L'ultimo capo ([suffixRequest]): in un pezzo «valico Y + punti del suffisso» i tratti dopo il primo punto
+     * sono quelli della richiesta del suffisso, salvo il primo, che col passaggio senza fermarsi (pass_through)
+     * al primo punto riparte nel verso d'arrivo (più pesante o uguale); con pass_through anche a un punto di
+     * mezzo del suffisso i tratti dopo cambiano con quel verso, allora niente base.
+     */
+    private fun pieceBase(ctx: Ctx, g: CountryGraph, r: DirectionsRequest): Double {
+        if (!baseAllowed(ctx, g, r)) return 0.0
+        val w = ctx.pieceWeight(g, r)
+        return if (w.isFinite()) w else 0.0
+    }
+
+    /** I tratti fissi del primo capo ([pieceBase]) per un viaggio da [prefix]. */
+    private fun startBase(ctx: Ctx, prefix: Piece): Double =
+        if (prefix.points.size < 2 || prefix.bearings.last() != null) 0.0 else pieceBase(ctx, prefix.graph, prefixRequest(ctx.request, prefix))
+
+    /** I tratti fissi dell'ultimo capo ([pieceBase]) per un viaggio verso i punti [suffix] in [gEnd]. */
+    private fun endBase(ctx: Ctx, suffix: IntRange, radius: (Int) -> Double, gEnd: CountryGraph): Double {
+        val request = ctx.request
+        if (suffix.count() < 2) return 0.0
+        if (request.passThroughAt(suffix.first) && (suffix.first + 1 until suffix.last).any { request.passThroughAt(it) }) return 0.0
+        return pieceBase(ctx, gEnd, suffixRequest(request, suffix, radius))
+    }
 
     /** Gli [Ends] di un viaggio da [prefix] (grafo di partenza) ai punti [suffix] in [gEnd]; null quando un capo con più tappe non ha percorso. */
     private fun ends(ctx: Ctx, prefix: Piece, suffix: IntRange, radius: (Int) -> Double, gEnd: CountryGraph): Ends? {
@@ -2224,15 +2314,17 @@ class CrossBorderDirections(
         val startPt = prefix.points.size > 1 && prefix.passThrough.last() && prefix.points.last().let { pl ->
             ctx.snap(prefix.graph, LL(pl.first, pl.second), prefix.radiuses.last(), prefix.exact.last(), prefix.bearings.last() ?: Double.NaN)?.let { ctx.pt(prefix.graph, true, it) } ?: true }
         val startExact = ctx.router(prefix.graph).searchesExact && prefix.bearings.last() == null && !startPt
-        val startInner = if (!startExact || prefix.points.size == 1) 0.0 else ctx.pieceWeight(prefix.graph, request.withPoints(prefix.points, prefix.radiuses.toDoubleArray(), prefix.exact.toBooleanArray(), prefix.bearings, prefix.passThrough.toBooleanArray()))
+        val startInner = if (!startExact || prefix.points.size == 1) 0.0 else ctx.pieceWeight(prefix.graph, prefixRequest(request, prefix))
         val suffixPts = suffix.map { request.coordinates[it] }
         val endPt = suffixPts.size > 1 && request.passThroughAt(suffix.first) && suffixPts[0].let { q ->
             ctx.snap(gEnd, LL(q.first, q.second), radius(suffix.first), false, request.bearings?.getOrNull(suffix.first) ?: Double.NaN)?.let { ctx.pt(gEnd, true, it) } ?: true }
         val endExact = ctx.router(gEnd).searchesExact && request.bearings?.getOrNull(suffix.first) == null && !endPt
-        val endInner = if (!endExact || suffixPts.size == 1) 0.0 else ctx.pieceWeight(gEnd, request.withPoints(suffixPts, suffix.map { radius(it) }.toDoubleArray(), suffix.map { false }.toBooleanArray(), suffix.map { request.bearings?.getOrNull(it) },
-            suffix.map { request.passThroughAt(it) }.toBooleanArray()))
+        val endInner = if (!endExact || suffixPts.size == 1) 0.0 else ctx.pieceWeight(gEnd, suffixRequest(request, suffix, radius))
         if (startInner.isInfinite() || endInner.isInfinite()) return null
-        return Ends(startExact, startInner, endExact, endInner)
+        // i tratti fissi dei capi: quando il capo è esatto sono i suoi tratti interni (la stessa richiesta, già pesata)
+        val sBase = if (prefix.points.size > 1 && startExact && baseAllowed(ctx, prefix.graph, prefixRequest(request, prefix))) startInner else startBase(ctx, prefix)
+        val eBase = if (suffixPts.size > 1 && endExact && baseAllowed(ctx, gEnd, suffixRequest(request, suffix, radius))) endInner else endBase(ctx, suffix, radius, gEnd)
+        return Ends(startExact, startInner, endExact, endInner, sBase, eBase)
     }
 
     /**
@@ -2415,6 +2507,8 @@ class CrossBorderDirections(
             }
         }
         ctx.queries += 4
+        // i tratti fissi dei capi ([Ends.startBase]): nei limiti dei pezzi ai capi non ancora pesati
+        val s0 = ends.startBase; val e0 = ends.endBase
         val w0 = DoubleArray(c01.size) { Double.NaN }; val w2 = DoubleArray(c12.size) { Double.NaN }
         val w1 = Array(c01.size) { DoubleArray(c12.size) { Double.NaN } }
         var best = Double.POSITIVE_INFINITY; var bx = -1; var by = -1; var evaluated = 0
@@ -2424,11 +2518,11 @@ class CrossBorderDirections(
             // la coppia col limite più basso del viaggio intero fra quelle non ancora pesate del tutto
             var kx = -1; var ky = -1; var key = Double.POSITIVE_INFINITY
             for (x in c01.indices) {
-                val a = if (w0[x].isNaN()) r0.lowerBound(x) else w0[x]
+                val a = if (w0[x].isNaN()) s0 + r0.lowerBound(x) else w0[x]
                 if (a >= cut) continue
                 for (y in c12.indices) {
                     if (!w0[x].isNaN() && !w2[y].isNaN() && !w1[x][y].isNaN()) continue
-                    val k = a + (if (w1[x][y].isNaN()) lb1(x, y) else w1[x][y]) + (if (w2[y].isNaN()) r2.lowerBound(y) else w2[y])
+                    val k = a + (if (w1[x][y].isNaN()) lb1(x, y) else w1[x][y]) + (if (w2[y].isNaN()) e0 + r2.lowerBound(y) else w2[y])
                     if (k < key) { key = k; kx = x; ky = y }
                 }
             }
@@ -2437,9 +2531,9 @@ class CrossBorderDirections(
             val rest1 = if (w1[kx][ky].isNaN()) lb1(kx, ky) else w1[kx][ky]
             when {
                 // prima il limite vero del capo (la sua ricerca va avanti solo fin lì), poi il pezzo
-                !r0.isFinal(kx) && w0[kx].isNaN() -> { val rest2 = if (w2[ky].isNaN()) r2.lowerBound(ky) else w2[ky]; r0.advanceFor(kx, cut - rest1 - rest2) { lb -> lb + rest1 + rest2 > key + slack(key) } }
+                !r0.isFinal(kx) && w0[kx].isNaN() -> { val rest2 = if (w2[ky].isNaN()) e0 + r2.lowerBound(ky) else w2[ky]; r0.advanceFor(kx, cut - s0 - rest1 - rest2) { lb -> s0 + lb + rest1 + rest2 > key + slack(key) } }
                 w0[kx].isNaN() -> w0[kx] = if (ends.startExact) ends.startInner + r0.weight(kx) else { evaluated++; ctx.pieceWeight(ga, pieceA(c01[kx])) }
-                !r2.isFinal(ky) && w2[ky].isNaN() -> r2.advanceFor(ky, cut - w0[kx] - rest1) { lb -> w0[kx] + rest1 + lb > key + slack(key) }
+                !r2.isFinal(ky) && w2[ky].isNaN() -> r2.advanceFor(ky, cut - w0[kx] - rest1 - e0) { lb -> w0[kx] + rest1 + e0 + lb > key + slack(key) }
                 w2[ky].isNaN() -> w2[ky] = if (ends.endExact) ends.endInner + r2.weight(ky) else { evaluated++; ctx.pieceWeight(gEnd, pieceEnd(c12[ky])) }
                 else -> {
                     w1[kx][ky] = midWeight?.invoke(kx, ky) ?: run { evaluated++; ctx.pieceWeight(gMid, pieceMid(c01[kx], c12[ky])) }
@@ -2567,8 +2661,14 @@ class CrossBorderDirections(
         val ends = try { ends(ctx, prefix, suffix, radius, gb) ?: return none } catch (e: SearchCancelledException) { if (deadline(e)) return onlyKnown("capi"); throw e }
         val nearExact = if (shortIsB) ends.endExact else ends.startExact; val nearInner = if (shortIsB) ends.endInner else ends.startInner
         val farExact = if (shortIsB) ends.startExact else ends.endExact; val farInner = if (shortIsB) ends.startInner else ends.endInner
+        // i tratti fissi dei capi ([Ends.startBase]) nei limiti dei due lati
+        val nearBase = if (shortIsB) ends.endBase else ends.startBase; val farBase = if (shortIsB) ends.startBase else ends.endBase
         val nearWeight = DoubleArray(cands.size) { Double.NaN }
         val farWeight = DoubleArray(cands.size) { Double.NaN }
+        // i limiti dei due lati, sempre sommati nello stesso ordine (la chiave e le condizioni d'arresto delle ricerche:
+        // in virgola mobile un altro ordine può dare «oltre la chiave» senza avanzare, e il ciclo non finisce)
+        fun farLb(j: Int) = farBase + rFar.lowerBound(j)
+        fun nearLb(j: Int) = if (nearWeight[j].isNaN()) nearBase + mNear.lowerBound(j) else nearWeight[j]
         var best = limit; var bestI = -1; var nearCount = 0; var farCount = 0; var farMs = 0L
         // il migliore dalla memoria (k > 1): il suo peso, nessun pezzo da pesare per lui; tutto il resto è per la fonte V
         known?.let { e -> val j = cands.indexOfFirst { it.lat == e.x!!.lat && it.lon == e.x.lon }; best = e.w; bestI = j; nearWeight[j] = 0.0; farWeight[j] = e.w }
@@ -2601,7 +2701,7 @@ class CrossBorderDirections(
             // il passaggio col limite più basso del viaggio intero, non ancora pesato dal lato lontano
             var i = -1; var key = Double.POSITIVE_INFINITY
             for (j in cands.indices) if (farWeight[j].isNaN() && !skip[j]) {
-                val lb = rFar.lowerBound(j) + if (nearWeight[j].isNaN()) mNear.lowerBound(j) else nearWeight[j]
+                val lb = farLb(j) + nearLb(j)
                 if (lb < key) { key = lb; i = j }
             }
             if (i < 0 || key >= cut()) break
@@ -2613,7 +2713,7 @@ class CrossBorderDirections(
             if (k > 1 && key >= best && cands.indices.any { j -> !farWeight[j].isNaN() && total(j) <= key && samePlace(i, j) }) { skip[i] = true; continue }
             if (nearWeight[i].isNaN()) {
                 // prima il limite vero del lato vicino (la sua ricerca va avanti solo fin lì), poi il pezzo
-                if (!mNear.isFinal(i)) { mNear.advance { mNear.isFinal(i) || rFar.lowerBound(i) + mNear.lowerBound(i) > key }; continue }
+                if (!mNear.isFinal(i)) { mNear.advance { mNear.isFinal(i) || farLb(i) + nearLb(i) > key }; continue }
                 nearWeight[i] = if (nearExact) nearInner + mNear.weight(i) else { nearCount++; piece(extra, near, nearPiece(cands[i]), bounded) ?: run { stopped = true; Double.NaN } }
                 if (stopped) break
                 continue
@@ -2622,7 +2722,7 @@ class CrossBorderDirections(
             // i pezzi lontani costano (evita pedaggi: secondi) e così ne serve di solito uno
             // il tetto del percorso mirato: per il migliore quello di sempre (k = 1: la richiesta del migliore ha
             // fatto gli stessi percorsi, ora dalla memoria); oltre il migliore (solo fonte V) quello delle varianti
-            if (!rFar.isFinal(i)) { rFar.advanceFor(i, (if (extra) cut() else best) - nearWeight[i], extra) { lb -> nearWeight[i] + lb > key }; continue }
+            if (!rFar.isFinal(i)) { rFar.advanceFor(i, (if (extra) cut() else best) - nearWeight[i] - farBase, extra) { lb -> (farBase + lb) + nearWeight[i] > key }; continue }
             val t1 = System.currentTimeMillis()
             farWeight[i] = if (farExact) farInner + rFar.weight(i) else { farCount++; piece(extra, far, farPiece(cands[i]), bounded) ?: run { stopped = true; Double.NaN } }
             farMs += System.currentTimeMillis() - t1
@@ -2635,8 +2735,8 @@ class CrossBorderDirections(
             "lato vicino ${near.id} ${mNear.stats}, $nearCount pezzi; lato lontano ${far.id} ${rFar.stats}, $farCount pezzi in $farMs ms; in tutto ${System.currentTimeMillis() - t0} ms" +
             if (vOnly) " (il migliore dalla memoria: tutto per la fonte V, $vMs ms nel suo tempo${if (stopped) ", fermato" else ""})" else "")
         fun w(x: Double) = if (x.isFinite()) "%.0f".format(x) else "∞"
-        for ((j, t) in cands.withIndex()) if (!nearWeight[j].isNaN() || !farWeight[j].isNaN() || mNear.lowerBound(j) + rFar.lowerBound(j) < best + 600)
-            log?.invoke("      %.5f,%.5f r${t.rank}: ${near.id} ${if (nearWeight[j].isNaN()) "≥" + w(mNear.lowerBound(j)) else w(nearWeight[j])}, ${far.id} ${if (farWeight[j].isNaN()) "≥" + w(rFar.lowerBound(j)) else w(farWeight[j])}".format(t.lat, t.lon))
+        for ((j, t) in cands.withIndex()) if (!nearWeight[j].isNaN() || !farWeight[j].isNaN() || nearBase + mNear.lowerBound(j) + farBase + rFar.lowerBound(j) < best + 600)
+            log?.invoke("      %.5f,%.5f r${t.rank}: ${near.id} ${if (nearWeight[j].isNaN()) "≥" + w(nearBase + mNear.lowerBound(j)) else w(nearWeight[j])}, ${far.id} ${if (farWeight[j].isNaN()) "≥" + w(farBase + rFar.lowerBound(j)) else w(farWeight[j])}".format(t.lat, t.lon))
         // il migliore nella memoria del servizio: esatto se sta sotto il tetto, se no «nessuno sotto il tetto»
         if (tKey != null && known == null && !forV) {
             if (bestI >= 0 && best < limit) cache.put(tKey, cands[bestI], null, best, limit) else cache.put(tKey, null, null, Double.POSITIVE_INFINITY, limit)

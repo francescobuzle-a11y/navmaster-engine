@@ -24,7 +24,9 @@ import kotlin.test.Test
  *    sulle rampe dello svincolo.
  * B) il valico di Mikulov/Drasenhofen (A5 → strada 52 → D52 → Brno) contro quello di Hatě/Kleinhaugsdorf
  *    (S3, Znojmo): i passaggi di [Transfers] vicini, gli archi delle due strade, Wien → Brno per ciascun
- *    passaggio e il viaggio intero obbligato per Mikulov e per Hatě contro il migliore.
+ *    passaggio (due pezzi come quelli del motore: Wien → passaggio nel grafo austriaco, passaggio → Brno in quello
+ *    ceco), il confronto Mikulov/Hatě, le velocità del camion e dell'auto lungo la 52 e la A5/B7, e il viaggio
+ *    intero obbligato per Mikulov e per Hatě contro il migliore.
  * C) la tappa in Austria (Drasenhofen, Wien) come «passa di qui»: tempi e ricerche per sequenza, con le
  *    righe del registro del motore (sul tablet 202 s).
  *
@@ -402,6 +404,40 @@ class BrnoMikulovProbeTest {
         return TripResult(d, l, cb.lastWeight, countries)
     }
 
+    /**
+     * Le velocità del camion e dell'auto arco per arco lungo [legs] (solo gli archi coi ref [refs]; vuoto: tutti):
+     * velocità del grafo nel verso percorso, limite OSM, tempo del percorso; poi i totali (tempo alle velocità del
+     * camion e a quelle dell'auto) e gli archi dove il camion va sotto 40 km/h con un limite di almeno 70.
+     */
+    private fun speedsAlong(tag: String, rg: RoutingGraph, legs: List<RoutePath>, refs: Set<String>, perEdge: Boolean = true) {
+        val hv = runCatching { rg.encoding.profile("heavyvehicle") }.getOrNull()
+        val cp = runCatching { rg.encoding.profile("car-ors") }.getOrNull()
+        if (hv == null) { println("$tag: il grafo non ha il profilo del camion"); return }
+        val gd = rg.guidance
+        val it = rg.graph.createEdgeIterator()
+        var m = 0.0; var sTruck = 0.0; var sCar = 0.0; var sRoute = 0.0; var n = 0
+        var slow = 0; var slowM = 0.0; var slowS = 0.0; var slowCarS = 0.0
+        for (pe in legs.flatMap { l -> l.edges }) {
+            val ref = refOf(rg, pe.edge)
+            if (refs.isNotEmpty() && ref.split(';', ',').map { x -> x.replace(" ", "").uppercase() }.none { x -> x in refs }) continue
+            it.setEdge(pe.edge, rg.graph.nodeA(pe.edge))
+            val vT = if (pe.reverse) it.getReverse(hv.speed) else it.get(hv.speed)
+            val vC = cp?.let { c -> if (pe.reverse) it.getReverse(c.speed) else it.get(c.speed) } ?: Double.NaN
+            val lim = gd?.maxSpeed(pe.edge, pe.reverse) ?: 0
+            val d = pe.distance
+            val tT = if (vT > 0) d / (vT / 3.6) else Double.POSITIVE_INFINITY
+            val tC = if (vC > 0) d / (vC / 3.6) else Double.NaN
+            n++; m += d; sTruck += tT; if (!tC.isNaN()) sCar += tC; sRoute += pe.millis / 1000.0
+            if (vT < 40 && lim >= 70) { slow++; slowM += d; slowS += tT; if (!tC.isNaN()) slowCarS += tC }
+            if (perEdge) println("$tag   arco ${pe.edge} ${if (pe.reverse) "B→A" else "A→B"} «$ref» ${it.get(rg.encoding.shared.roadClass).osm} %.0f m (arco %.0f m): camion %.0f km/h, auto %.0f km/h, limite %d; nel percorso %.1f s%s".format(
+                d, rg.graph.distance(pe.edge), vT, vC, lim, pe.millis / 1000.0, if (vT < 40 && lim >= 70) " ← camion lento" else ""))
+        }
+        if (n == 0) { println("$tag: nessun arco${if (refs.isEmpty()) "" else " con ref ${refs.joinToString("/")}"}"); return }
+        println("$tag: $n archi, %.2f km; alle velocità del camion %.1f min (media %.0f km/h), dell'auto %.1f min (media %.0f km/h), nel percorso del camion %.1f min".format(
+            m / 1000, sTruck / 60, m / sTruck * 3.6, sCar / 60, if (sCar > 0) m / sCar * 3.6 else Double.NaN, sRoute / 60))
+        println("$tag: $slow archi col camion sotto 40 km/h e limite ≥ 70: %.2f km, camion %.1f min, auto %.1f min".format(slowM / 1000, slowS / 60, slowCarS / 60))
+    }
+
     private fun mikulov(graphs: List<CountryGraph>, at: CountryGraph, cz: CountryGraph, transfers: (CountryGraph, CountryGraph) -> List<Transfer>,
                         pool: java.util.concurrent.ExecutorService, slots: SearchSlots) {
         val tag = "sonda B"
@@ -440,13 +476,26 @@ class BrnoMikulovProbeTest {
         crossTrip("$tag Wien → Brno migliore", cb, truckReq, ctx())
         class Forced(val t: Transfer, val atLeg: RoutePath, val czLeg: RoutePath) { val weight get() = atLeg.weight + czLeg.weight }
         val forced = ArrayList<Forced>()
-        val sWien = atRouter.snap(wien.first, wien.second, 400.0, 0); val sBrno = czRouter.snap(brno.first, brno.second, 400.0, 1)
+        // due pezzi come quelli del motore ([CrossBorderDirections]: la richiesta dell'app coi punti del pezzo, il passaggio
+        // agganciato esatto con raggio TRANSFER_RADIUS): Wien → passaggio nel grafo austriaco, passaggio → Brno in quello ceco.
+        // Prima un percorso del router fra due agganci a mano dava sempre «nessun percorso»
+        fun piece(g: CountryGraph, pts: List<Pair<Double, Double>>, transferFirst: Boolean): RoutePath {
+            val r = g.service.maximumSnappingRadius; val tr = CrossBorderDirections.TRANSFER_RADIUS
+            val req = truckReq.withPoints(pts, if (transferFirst) doubleArrayOf(tr, r) else doubleArrayOf(r, tr), if (transferFirst) booleanArrayOf(true, false) else booleanArrayOf(false, true))
+            return g.service.solveAsHandled(req, RequestContext()).legs.single()
+        }
+        var noRoute = 0
         for (t in near) {
-            val a = runCatching { atRouter.route(sWien, atRouter.snap(t.lat, t.lon, CrossBorderDirections.TRANSFER_RADIUS, 1, checkNetwork = false)) }
-            val c = runCatching { czRouter.route(czRouter.snap(t.lat, t.lon, CrossBorderDirections.TRANSFER_RADIUS, 0, checkNetwork = false), sBrno) }
-            if (a.isFailure || c.isFailure) { println("$tag Wien → %.5f,%.5f → Brno: nessun percorso (${(a.exceptionOrNull() ?: c.exceptionOrNull())?.message})".format(t.lat, t.lon)); continue }
+            val a = runCatching { piece(at, listOf(wien, t.lat to t.lon), transferFirst = false) }
+            val c = if (a.isFailure) null else runCatching { piece(cz, listOf(t.lat to t.lon, brno), transferFirst = true) }
+            if (a.isFailure || c == null || c.isFailure) {
+                noRoute++
+                println("$tag Wien → %.5f,%.5f → Brno: nessun percorso (${if (a.isFailure) "austria" else "czech-republic"}: ${(a.exceptionOrNull() ?: c?.exceptionOrNull())?.message})".format(t.lat, t.lon))
+                continue
+            }
             forced += Forced(t, a.getOrThrow(), c.getOrThrow())
         }
+        println("$tag Wien → passaggio → Brno: ${forced.size} passaggi con percorso, $noRoute senza")
         forced.sortBy { it.weight }
         val fBest = forced.firstOrNull()?.weight
         for (f in forced) println("$tag Wien → %.5f,%.5f r${f.t.rank} → Brno: %.1f km, %.1f min, peso %.0f (austria %.0f + cechia %.0f)%s".format(f.t.lat, f.t.lon,
@@ -456,6 +505,19 @@ class BrnoMikulovProbeTest {
         val fHate = forced.minByOrNull { DistanceCalc.haversine(it.t.lat, it.t.lon, hate.first, hate.second) }
         fMik?.let { printRoute("$tag Wien → Mikulov (pezzo austriaco)", at.graph, listOf(it.atLeg), full = false); printRoute("$tag Mikulov → Brno (pezzo ceco)", cz.graph, listOf(it.czLeg), full = false) }
         fHate?.let { printRoute("$tag Wien → Hatě (pezzo austriaco)", at.graph, listOf(it.atLeg), full = false); printRoute("$tag Hatě → Brno (pezzo ceco)", cz.graph, listOf(it.czLeg), full = false) }
+        // Mikulov contro Hatě: i due pezzi obbligati e il migliore
+        if (fMik != null && fHate != null) println("$tag confronto Mikulov/Hatě: Mikulov %.1f km, %.1f min, peso %.0f; Hatě %.1f km, %.1f min, peso %.0f; Mikulov/Hatě tempo %.3f, peso %.3f".format(
+            (fMik.atLeg.distance + fMik.czLeg.distance) / 1000, (fMik.atLeg.millis + fMik.czLeg.millis) / 60000.0, fMik.weight,
+            (fHate.atLeg.distance + fHate.czLeg.distance) / 1000, (fHate.atLeg.millis + fHate.czLeg.millis) / 60000.0, fHate.weight,
+            (fMik.atLeg.millis + fMik.czLeg.millis).toDouble() / (fHate.atLeg.millis + fHate.czLeg.millis), fMik.weight / fHate.weight))
+        // le velocità del camion e dell'auto lungo la 52 (Cechia) e la A5/B7 (Austria) nei pezzi per Mikulov: il modello
+        // d'accelerazione di ORS (velocità sulla linea d'aria della way OSM intera) sulle way corte della 52
+        fMik?.let {
+            speedsAlong("$tag velocità lungo la 52 (Mikulov → Brno)", cz.graph, listOf(it.czLeg), setOf("52", "I/52", "D52", "E461"))
+            speedsAlong("$tag velocità lungo A5/B7 (Wien → Mikulov)", at.graph, listOf(it.atLeg), setOf("A5", "B7", "E461"))
+            speedsAlong("$tag velocità nel pezzo ceco per Mikulov (tutto)", cz.graph, listOf(it.czLeg), emptySet(), perEdge = false)
+        }
+        fHate?.let { speedsAlong("$tag velocità nel pezzo ceco per Hatě (tutto)", cz.graph, listOf(it.czLeg), emptySet(), perEdge = false) }
 
         // il viaggio intero Canneto → Bielsko-Biała: migliore, obbligato per Mikulov e per Hatě (punti di passaggio 2 km prima e
         // dopo il valico sulle strade dei pezzi qui sopra, e sulla D1 a est di Brno)
