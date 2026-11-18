@@ -1,6 +1,8 @@
 package it.navmaster.engine.api
 
 import it.navmaster.engine.RouteOptions
+import it.navmaster.engine.routing.CorridorAnalyzer
+import it.navmaster.engine.routing.EdgeInfo
 import it.navmaster.engine.routing.PointNotFoundException
 import it.navmaster.engine.util.DistanceCalc
 import java.util.Random
@@ -162,6 +164,65 @@ class CrossBorderVariantsTest {
     }
 
     private fun variant(f: Map<*, *>) = ((f["properties"] as Map<*, *>)["navmaster"] as Map<*, *>)["variant"] as Map<*, *>
+
+    /** Le strade nominate da un titolo «via X + Y, per …» (vuota per «altro valico …»). */
+    private fun titleRefs(label: String): List<String> =
+        if (!label.startsWith("via ")) emptyList() else label.removePrefix("via ").substringBefore(", ").split(" + ")
+
+    /**
+     * Per ogni ref (normalizzato) della feature [f] i metri e la quota di autostrada o superstrada,
+     * dai fatti sulle strade (`navmaster.roads`, classe e ref per arco) e dalla geometria.
+     */
+    private fun refMeters(f: Map<*, *>): Map<String, Pair<Double, Double>> {
+        val coords = ((f["geometry"] as Map<*, *>)["coordinates"] as List<*>).map { c ->
+            when (c) { is DoubleArray -> c[1] to c[0]; is List<*> -> (c[1] as Number).toDouble() to (c[0] as Number).toDouble(); else -> error("coordinata $c") }
+        }
+        val roads = ((f["properties"] as Map<*, *>)["navmaster"] as Map<*, *>)["roads"] as List<*>
+        val m = HashMap<String, Double>(); val mw = HashMap<String, Double>()
+        for (r in roads) {
+            r as Map<*, *>
+            val ref = (r["ref"] as? String)?.let { EdgeInfo.normalizeRef(it) } ?: continue
+            val from = r["from"] as Int; val to = r["to"] as Int
+            var d = 0.0
+            for (i in from until minOf(to, coords.size - 1)) d += DistanceCalc.haversine(coords[i].first, coords[i].second, coords[i + 1].first, coords[i + 1].second)
+            m.merge(ref, d, Double::plus)
+            if (r["class"] == "motorway" || r["class"] == "trunk") mw.merge(ref, d, Double::plus)
+        }
+        return m.mapValues { (ref, d) -> d to (if (d > 0) (mw[ref] ?: 0.0) / d else 0.0) }
+    }
+
+    /**
+     * Il titolo di una V per altri Paesi: nomina le autostrade nuove più lunghe, non le prime strade
+     * nuove nell'ordine della strada (una statale corta). Le strade nominate sono nuove, autostrade
+     * (ref da autostrada o metà dei km su archi di autostrada o superstrada), al più due nell'ordine
+     * della strada, e nessuna autostrada nuova non nominata è più lunga di una nominata; senza
+     * autostrade nuove «altro valico». Le quote vicine a 0,5 (metri dalla geometria) non si giudicano.
+     * Vero se il titolo nomina strade.
+     */
+    private fun checkOtherTitle(f: Map<*, *>, v: Map<*, *>): Boolean {
+        val label = v["label"] as String
+        val named = titleRefs(label)
+        val newRefs = (v["new_refs"] as List<*>).map { it as String }
+        val rm = refMeters(f)
+        fun km(r: String) = rm[r]?.first ?: 0.0
+        fun share(r: String) = rm[r]?.second ?: 0.0
+        fun surelyMw(r: String) = CorridorAnalyzer.isMotorwayRef(r) || share(r) >= 0.55
+        fun maybeMw(r: String) = CorridorAnalyzer.isMotorwayRef(r) || share(r) >= 0.45
+        val old = newRefs.take(2)
+        println("  titolo per altri Paesi: «$label»; strade nuove ${newRefs.joinToString { "%s %.1f km (%.0f %%)".format(it, km(it) / 1000, share(it) * 100) }}; con le prime strade nuove sarebbe ${if (old.isEmpty()) "altro valico" else "via " + old.joinToString(" + ")}")
+        assertTrue(named.size <= 2, "più di due strade: $label")
+        for (r in named) {
+            assertTrue(r in newRefs, "«$label»: $r non è una strada nuova ($newRefs)")
+            assertTrue(maybeMw(r), "«$label»: $r non è un'autostrada (quota ${share(r)})")
+        }
+        assertEquals(named, newRefs.filter { it in named }, "«$label»: strade fuori dall'ordine della strada ($newRefs)")
+        val shortest = named.minOfOrNull { km(it) } ?: 0.0
+        for (r in newRefs) if (r !in named && surelyMw(r)) {
+            assertTrue(named.size == 2 && km(r) <= shortest * 1.02 + 50.0, "«$label»: l'autostrada nuova $r (%.1f km) è più lunga di una nominata o manca".format(km(r) / 1000))
+        }
+        if (named.isEmpty()) assertTrue(label.startsWith("altro valico"), "titolo senza strade: $label")
+        return named.isNotEmpty()
+    }
     private fun countriesOf(v: Map<*, *>) = (v["countries"] as? List<*>)?.map { it as String }
     private fun crossingsLine(rc: RequestContext) = rc.stats.crossings
     /** «Q ricerche (H dalla memoria[, X per le varianti])» → (Q, H, X). */
@@ -177,7 +238,7 @@ class CrossBorderVariantsTest {
         val service = DirectionsService(g)
         val logs = ArrayList<String>()
         val opt = NavAlternativesOptions(count = 4, tier1Factor = 1.1, maxFactor = 1.2, sources = setOf(VariantSource.CROSSING), minDetourScale = 0.02)
-        var trips = 0; var others = 0; var withinRef = 0; var exactMatch = 0; var keptOther = 0; var reservedChecks = 0
+        var trips = 0; var others = 0; var withinRef = 0; var exactMatch = 0; var keptOther = 0; var reservedChecks = 0; var namedTitles = 0
         for (seed in 1L..8L) {
             // valichi diversi a ogni viaggio (con gli stessi una sequenza vincerebbe sempre)
             val five = Five(service, seed)
@@ -229,7 +290,10 @@ class CrossBorderVariantsTest {
                 assertEquals(3, (v["crossings"] as List<*>).size, "valichi di $v")
                 val cs = countriesOf(v)!!
                 assertEquals(4, cs.size)
-                if (cs != bestSeq) { others++; assertTrue(v["label"].toString().contains(", per "), "titolo senza il Paese: ${v["label"]}") }
+                if (cs != bestSeq) {
+                    others++; assertTrue(v["label"].toString().contains(", per "), "titolo senza il Paese: ${v["label"]}")
+                    if (checkOtherTitle(f, v)) namedTitles++
+                }
             }
             // (4) due V mai con tutti i valichi entro 5 km l'uno dall'altro
             for (i in vs.indices) for (j in i + 1 until vs.size) {
@@ -264,7 +328,7 @@ class CrossBorderVariantsTest {
             // la nota «budget» (o, se tutto era in memoria e il passo 2 è finito entro il millisecondo, nessuna variante)
             assertTrue(metaShort["note"] == "budget" || (metaShort["variants"] == 0 && logs.none { it.contains("tempo finito") }), "nota col tempo finito: $metaShort")
         }
-        println("altra sequenza: $trips viaggi, riferimento entro il fattore in $withinRef (peso uguale in $exactMatch), $others varianti per altri Paesi, posto riservato $keptOther/$reservedChecks")
+        println("altra sequenza: $trips viaggi, riferimento entro il fattore in $withinRef (peso uguale in $exactMatch), $others varianti per altri Paesi ($namedTitles titoli con strade), posto riservato $keptOther/$reservedChecks")
         assertTrue(trips >= 4, "viaggi: $trips")
         assertTrue(others > 0, "nessuna variante per un'altra sequenza di Paesi")
     }
@@ -348,12 +412,13 @@ class CrossBorderVariantsTest {
                 assertTrue(h > 0, "nessun peso dalla memoria con la tappa in b: ${crossingsLine(rcB)}")
                 assertTrue(q > 0 || h > 0)
                 viaB++
-                // la stessa via come la manda l'app in navigazione (pass_through e direzione): le opzioni del router
-                // cambiano (continue_straight), i pesi rapidi hanno una chiave propria: solo per il registro
+                // la stessa via come la manda l'app in navigazione (pass_through e direzione): continue_straight
+                // non cambia il router col core preparato, quindi la chiave dei pesi rapidi (routerKey) è la stessa
                 val rcP = RequestContext()
                 val bodyP = Heidelberg.body(listOf(pts[0], viaPoint, pts[1]), ""","navmaster":{"roads":true,"pass_through":[false,true,false]},"bearings":[[],[90,45],[]]""")
-                runCatching { cb.handle(DirectionsRequest.fromJson("driving-hgv", bodyP), listOf("a", "b", "d"), rcP) }
+                val okP = runCatching { cb.handle(DirectionsRequest.fromJson("driving-hgv", bodyP), listOf("a", "b", "d"), rcP) }.isSuccess
                 println("seme $seed, via (pass_through) in b: ${crossingsLine(rcP)}")
+                if (okP) assertTrue(queries(crossingsLine(rcP)).second > 0, "nessun peso dalla memoria con la via pass_through in b: ${crossingsLine(rcP)}")
             }
             // una via nel Paese a, vicino alla partenza: si ricalcola solo il primo pezzo
             val viaA0 = pts[0].first + (chain.via[0].lat - pts[0].first) * 0.3 to pts[0].second + (chain.via[0].lon - pts[0].second) * 0.3
@@ -368,5 +433,173 @@ class CrossBorderVariantsTest {
         }
         println("via: $trips viaggi, in b $viaB, in a $viaA")
         assertTrue(trips >= 3 && viaB >= 2 && viaA >= 2, "viaggi $trips, via in b $viaB, in a $viaA")
+    }
+
+    /**
+     * Le strade del titolo di una V per altri Paesi ([CrossBorderDirections.otherCountriesTitleRefs])
+     * sui dati veri di Canneto sull'Oglio → Bielsko-Biała (CI): la variante per la Cechia comincia con
+     * SS11 e SR450 (statali del Garda, 14 e 13 km) e poi prende A22, A1 austriaca e le D ceche; il
+     * titolo nomina le due autostrade nuove più lunghe nell'ordine della strada, non le statali.
+     */
+    @Test
+    fun `the title of a variant through other countries names its longest new motorways`() {
+        // le strade nuove nell'ordine della strada, km e quota di autostrada o superstrada (D1: già nel migliore, la slovacca)
+        val roads = listOf("SS11" to 14.0, "SR450" to 13.0, "A22" to 205.0, "A13" to 34.0, "A12" to 69.0, "B173" to 10.0, "B178" to 17.0, "B164" to 36.0,
+            "B311" to 58.0, "A10" to 42.0, "A1" to 241.0, "S33" to 27.0, "S5" to 35.0, "S3" to 35.0, "B303" to 10.0, "D52" to 17.0, "D48" to 33.0, "S52" to 32.0)
+        val refM = roads.associate { it.first to it.second * 1000 }
+        val mwShare = roads.associate { (r, _) -> r to if (r.startsWith("D") || CorridorAnalyzer.isMotorwayRef(r)) 1.0 else 0.0 }
+        assertEquals(listOf("A22", "A1"), CrossBorderDirections.otherCountriesTitleRefs(roads.map { it.first }, refM, mwShare))
+        // la via di Tarvisio → Mikulov → Brno → Ostrava: le D ceche dagli archi (nessun prefisso da autostrada)
+        val tarvisio = listOf("SS11" to 14.0, "A5" to 60.0, "D52" to 40.0, "D2" to 30.0, "D1" to 150.0, "D48" to 33.0, "I/11" to 20.0)
+        val tm = tarvisio.associate { it.first to it.second * 1000 }
+        val tw = tarvisio.associate { (r, _) -> r to if (r.startsWith("D")) 0.9 else 0.0 }
+        assertEquals(listOf("A5", "D1"), CrossBorderDirections.otherCountriesTitleRefs(tarvisio.map { it.first }, tm, tw))
+        // una sola autostrada nuova: solo quella; nessuna: nessuna strada («altro valico, per la Cechia»)
+        assertEquals(listOf("D1"), CrossBorderDirections.otherCountriesTitleRefs(listOf("SS11", "SR450", "D1"), mapOf("SS11" to 14e3, "SR450" to 13e3, "D1" to 9e3), mapOf("D1" to 0.8)))
+        assertEquals(emptyList<String>(), CrossBorderDirections.otherCountriesTitleRefs(listOf("SS11", "SR450", "B37"), mapOf("SS11" to 14e3, "SR450" to 13e3, "B37" to 30e3), mapOf("B37" to 0.3)))
+    }
+
+    /**
+     * Il titolo di una V per altri Paesi su Heidelberg: quattro Paesi finti sullo stesso grafo, a-c-d
+     * coi valichi sul percorso migliore (a un terzo e a due terzi) e a-e-d coi valichi su una via più
+     * lenta (+12 %) che prende prima la L596 (8 km, una statale) e poi la A5 (6 km): con le prime strade nuove
+     * il titolo sarebbe «via L596 + A5»; deve nominare solo l'autostrada nuova, «via A5, per e».
+     */
+    @Test
+    fun `on Heidelberg the title of a variant through other countries names the new motorway, not a short state road`() {
+        val service = DirectionsService(g)
+        val core = g.router(RouteOptions(profile = "driving-hgv"))
+        val s = 49.4604735 to 8.8199303; val t = 49.384662 to 8.6202951
+        val w1 = 49.4637988 to 8.7620039; val w2 = 49.3697004 to 8.6326278
+        // i valichi a-c e c-d sul percorso migliore (i nodi a un terzo e a due terzi della strada)
+        val best = core.route(core.snap(s.first, s.second, 400.0, 0), core.snap(t.first, t.second, 400.0, 1))
+        fun nodeAt(share: Double): Transfer {
+            var m = 0.0
+            for (e in best.edges) { m += e.distance; if (m >= share * best.distance) return Transfer(g.graph.lat(e.adjNode), g.graph.lon(e.adjNode), 3) }
+            error("percorso corto")
+        }
+        val pairs = mapOf(setOf("a", "c") to listOf(nodeAt(1 / 3.0)), setOf("c", "d") to listOf(nodeAt(2 / 3.0)),
+            setOf("a", "e") to listOf(Transfer(w1.first, w1.second, 3)), setOf("e", "d") to listOf(Transfer(w2.first, w2.second, 3)))
+        val graphs = listOf("a", "c", "d", "e").map { CountryGraph(it, service) }
+        val logs = ArrayList<String>()
+        val cb = CrossBorderDirections(graphs, { x, y -> pairs[setOf(x.id, y.id)] ?: emptyList() }, { logs += it })
+        val body = Heidelberg.body(listOf(s, t), ""","navmaster":{"roads":true}""")
+        val opt = NavAlternativesOptions(count = 3, maxFactor = 1.2, sources = setOf(VariantSource.CROSSING), minDetourScale = 0.02)
+        val fs = features(cb.handle(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(opt), listOf("a", "d")))
+        assertEquals(listOf("a", "c", "d"), cb.lastChains.first().countries, "il migliore per c: ${cb.lastChains.map { it.countries }}")
+        val labels = fs.map { variant(it)["label"] as String }
+        println("titoli: $labels; catene ${cb.lastChains.joinToString { "${it.countries.joinToString("-")} %.0f".format(it.exact) }}")
+        logs.filter { "varianti" in it }.forEach { println("  $it") }
+        val other = fs.drop(1).firstOrNull { countriesOf(variant(it)) == listOf("a", "e", "d") }
+        assertTrue(other != null, "nessuna V per e: $labels")
+        val v = variant(other)
+        val label = v["label"] as String
+        val newRefs = (v["new_refs"] as List<*>).map { it as String }
+        // la variante che serve: con le prime strade nuove il titolo nominerebbe la L596
+        assertEquals("L596", newRefs.firstOrNull(), "strade nuove: $newRefs")
+        assertTrue("A5" in newRefs, "strade nuove: $newRefs")
+        assertTrue(checkOtherTitle(other, v), "titolo senza strade: $label")
+        assertTrue(label.startsWith("via ") && "A5" in titleRefs(label) && "L596" !in titleRefs(label), "titolo: $label")
+        assertTrue(label.endsWith(", per e"), "titolo: $label")
+        assertEquals(labels.size, labels.toSet().size, "titoli ripetuti: $labels")
+    }
+
+    /**
+     * Il caso Tarvisio: il primo valico è condiviso fra le due sequenze di Paesi e il suo luogo ha
+     * per primo punto ([Transfers.places]: rank, poi deviazione) un punto più caro di quello che usa
+     * il migliore. Nella struttura [Five] al valico a/b del migliore X2 si aggiunge nello stesso luogo
+     * un punto X1 di rank 1 a 1,5-4 km (X2 almeno rank 2: X1 è il primo del luogo), raggiungibile ma
+     * più caro (la catena dell'altra sequenza per X1 almeno l'1 % sopra quella per X2). Semi validi:
+     * il migliore passa da X2, la sua sequenza è la prima esaminata (il passo 1 non pesa l'altra
+     * sequenza sotto un tetto più alto), la catena dell'altra sequenza (per X2) fra 1,0× e 1,1× del
+     * migliore. Con le varianti (sola fonte V, count 4, max 1,2): il migliore identico a topK 1 e fra
+     * le catene quella dell'altra sequenza col primo valico entro [Transfers.PLACE] da X2 e il peso del
+     * riferimento (lo stesso viaggio coi soli grafi di quella sequenza). Col passo 2 che pesava solo
+     * il primo punto di ogni luogo la catena passava da X1: peso più alto, o nessuna catena.
+     */
+    @Test
+    fun `step 2 weighs every point of a place, the first crossing shared by two sequences`() {
+        val service = DirectionsService(g)
+        val core = g.router(RouteOptions(profile = "driving-hgv"))
+        val bg = g.graph
+        val opt = NavAlternativesOptions(count = 4, maxFactor = 1.2, sources = setOf(VariantSource.CROSSING))
+        val seqs = listOf(listOf("a", "b", "c", "d"), listOf("a", "b", "e", "d"))
+        var valid = 0; var tried = 0
+        for (seed in 1L..80L) {
+            if (valid >= 4) break
+            val five = Five(service, seed)
+            val pts = Heidelberg.points(2, seed + 1700)
+            val body = Heidelberg.body(pts, ""","navmaster":{"roads":true}""")
+            val countries = listOf("a", "d")
+            val cb0 = five.cb()
+            try { cb0.handle(DirectionsRequest.fromJson("driving-hgv", body), countries) } catch (e: ApiException) { continue }
+            val ab = five.pairs.getValue(setOf("a", "b"))
+            val x2 = cb0.lastCrossings.firstOrNull() ?: continue
+            if (ab.none { it.lat == x2.lat && it.lon == x2.lon }) continue
+            // X1: un punto della rete a 1,5-4 km da X2, lontano dagli altri valichi a/b (nello stesso luogo solo con X2)
+            val rnd = Random(seed * 31 + 7)
+            var near: Transfer? = null
+            for (attempt in 0 until 40000) {
+                val n0 = rnd.nextInt(bg.nodeCount)
+                if (DistanceCalc.haversine(x2.lat, x2.lon, bg.lat(n0), bg.lon(n0)) !in 1_500.0..4_000.0) continue
+                val node = try { core.snap(bg.lat(n0), bg.lon(n0), 400.0, 0).closestNode } catch (e: PointNotFoundException) { continue }
+                val la = bg.lat(node); val lo = bg.lon(node)
+                if (DistanceCalc.haversine(x2.lat, x2.lon, la, lo) !in 1_500.0..4_000.0) continue
+                if (ab.any { it !== x2 && DistanceCalc.haversine(it.lat, it.lon, la, lo) < Transfers.PLACE + 500.0 }) continue
+                near = Transfer(la, lo, 1); break
+            }
+            val x1 = near ?: continue
+            val ab2 = ab.map { if (it === x2) Transfer(it.lat, it.lon, maxOf(2, it.rank)) else it } + x1
+            fun pairsWith(abList: List<Transfer>) = five.pairs + (setOf("a", "b") to abList)
+            fun engine(ids: List<String>, abList: List<Transfer>, log: ((String) -> Unit)? = null): CrossBorderDirections {
+                val pairs = pairsWith(abList)
+                return CrossBorderDirections(five.graphs.filter { it.id in ids }, { x, y -> pairs[setOf(x.id, y.id)] ?: emptyList() }, log)
+            }
+            tried++
+            val logs = ArrayList<String>()
+            val cb = engine(listOf("a", "b", "c", "d", "e"), ab2) { logs += it }
+            val plain = try { features(cb.handle(DirectionsRequest.fromJson("driving-hgv", body), countries))[0] } catch (e: ApiException) { continue }
+            val bestW = cb.lastWeight; val bestX = cb.lastCrossings.map { it.lat to it.lon }
+            val bestSeq = cb.lastChains.first().countries
+            if (bestSeq !in seqs) continue
+            val otherSeq = seqs.first { it != bestSeq }
+            // le sequenze nell'ordine d'esame: quella del migliore prima
+            val order = logs.firstOrNull { it.startsWith("sequenze ") }?.substringAfter(": ")?.split(" | ")?.map { it.split("-") }.orEmpty()
+            val why = when {
+                bestX.first() != (x2.lat to x2.lon) -> "il migliore non passa da X2"
+                order.firstOrNull() != bestSeq -> "la sequenza del migliore non è la prima (${order})"
+                else -> null
+            }
+            // il riferimento: l'altra sequenza da sola, per X2; poi con X1 come unico valico a/b (più caro di almeno l'1 %)
+            val ref = engine(otherSeq, ab2)
+            val refW = try { ref.handle(DirectionsRequest.fromJson("driving-hgv", body), countries); ref.lastWeight } catch (e: ApiException) { Double.POSITIVE_INFINITY }
+            val refX = ref.lastCrossings.firstOrNull()
+            val ref1 = engine(otherSeq, listOf(x1))
+            val refW1 = try { ref1.handle(DirectionsRequest.fromJson("driving-hgv", body), countries); ref1.lastWeight } catch (e: ApiException) { Double.POSITIVE_INFINITY }
+            val why2 = why ?: when {
+                !refW.isFinite() || refX == null || refX.lat != x2.lat || refX.lon != x2.lon -> "il riferimento non passa da X2"
+                refW < bestW || refW > 1.1 * bestW -> "riferimento %.3f× del migliore".format(refW / bestW)
+                !refW1.isFinite() -> "X1 non raggiungibile"
+                refW1 < 1.01 * refW -> "X1 non abbastanza più caro (%.4f×)".format(refW1 / refW)
+                else -> null
+            }
+            println("seme $seed: migliore ${bestSeq.joinToString("-")} peso %.0f, altra ${otherSeq.joinToString("-")} per X2 %.0f (%.3f×), per X1 %.0f (%.3f×): %s".format(
+                bestW, refW, refW / bestW, refW1, refW1 / refW, why2 ?: "valido"))
+            if (why2 != null) continue
+            valid++
+            // la richiesta con le varianti: il migliore identico, la catena dell'altra sequenza per X2 col peso del riferimento
+            val doc = cb.handle(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(opt), countries)
+            assertEquals(withoutVariant(plain), withoutVariant(features(doc)[0]), "seme $seed: migliore diverso con le varianti")
+            assertEquals(bestW, cb.lastWeight, "seme $seed: peso con topK 4")
+            assertEquals(bestX, cb.lastCrossings.map { it.lat to it.lon }, "seme $seed: valichi con topK 4")
+            val chains = cb.lastChains.joinToString(" | ") { c -> "${c.countries.joinToString("-")} via ${c.via.joinToString { "%.4f,%.4f".format(it.lat, it.lon) }} peso %.0f".format(c.exact) }
+            println("  catene: $chains")
+            val other = cb.lastChains.drop(1).firstOrNull { it.countries == otherSeq }
+            assertTrue(other != null, "seme $seed: nessuna catena per ${otherSeq.joinToString("-")} (riferimento $refW, tetto ${bestW * opt.maxFactor}): $chains")
+            assertTrue(DistanceCalc.haversine(other.via[0].lat, other.via[0].lon, x2.lat, x2.lon) < Transfers.PLACE, "seme $seed: primo valico lontano da X2: $chains")
+            assertTrue(Math.abs(other.exact - refW) <= 1e-6 * refW, "seme $seed: catena ${other.exact} invece del riferimento $refW (per X1 $refW1): $chains")
+        }
+        println("valico condiviso col primo punto del luogo più caro: $valid semi validi su $tried provati")
+        assertTrue(valid >= 2, "semi validi: $valid su $tried")
     }
 }

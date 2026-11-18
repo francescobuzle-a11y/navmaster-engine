@@ -203,6 +203,68 @@ class CrossBorderChoiceTest {
         assertTrue(trips >= 12, "viaggi: $trips")
     }
 
+    /**
+     * Ai confini di mezzo una ricerca sola all'indietro da ogni candidato verso tutto lo strato
+     * ([CrossBorderDirections.layerManyToOne]) contro una ricerca per coppia: stesso peso, stessi
+     * valichi, stessa sequenza, e meno ricerche.
+     */
+    @Test
+    fun `one search per candidate from the whole layer gives the same chain`() {
+        val g = Heidelberg.graph
+        val service = DirectionsService(g)
+        val graphs = listOf("a", "b", "c", "d").map { CountryGraph(it, service) }
+        val core = g.router(RouteOptions(profile = "driving-hgv"))
+        val bg = g.graph
+        val rnd = Random(57)
+        fun crossings(n: Int): List<Transfer> {
+            val out = ArrayList<Transfer>()
+            for (attempt in 0 until 4000) {
+                if (out.size >= n) break
+                val k = rnd.nextInt(bg.nodeCount)
+                val node = try { core.snap(bg.lat(k), bg.lon(k), 400.0, 0).closestNode } catch (e: PointNotFoundException) { continue }
+                if (out.any { t -> DistanceCalc.haversine(t.lat, t.lon, bg.lat(node), bg.lon(node)) < 4_000.0 }) continue
+                out += Transfer(bg.lat(node), bg.lon(node), 1 + out.size % 3)
+            }
+            return out
+        }
+        // a-b-c-d: due confini di mezzo con strati di più voci
+        val pairs = mapOf(setOf("a", "b") to crossings(6), setOf("b", "c") to crossings(5), setOf("c", "d") to crossings(5))
+        val logs = ArrayList<String>()
+        val cb = CrossBorderDirections(graphs, { x, y -> pairs[setOf(x.id, y.id)] ?: emptyList() }, { logs += it })
+        fun queries() = Regex("(\\d+) ricerche").find(logs.last { it.startsWith("viaggio tra Paesi") })!!.groupValues[1].toInt()
+        var trips = 0; var qOne = 0; var qPairs = 0; var msOne = 0L; var msPairs = 0L
+        for (seed in 1L..16L) {
+            val pts = Heidelberg.points(2, seed + 1500)
+            val body = Heidelberg.body(pts, ""","navmaster":{"roads":true}""")
+            cb.layerManyToOne = false
+            service.clearCaches(); logs.clear()
+            val t0 = System.nanoTime()
+            val r0 = runCatching { cb.handle(DirectionsRequest.fromJson("driving-hgv", body), listOf("a", "d"), RequestContext(useCache = false)) }
+            val w0 = cb.lastWeight; val x0 = cb.lastCrossings.map { it.lat to it.lon }; val s0 = cb.lastChains.firstOrNull()?.countries
+            val ms0 = (System.nanoTime() - t0) / 1_000_000
+            val q0 = if (r0.isSuccess) queries() else 0
+            cb.layerManyToOne = true
+            service.clearCaches(); logs.clear()
+            val t1 = System.nanoTime()
+            val r1 = runCatching { cb.handle(DirectionsRequest.fromJson("driving-hgv", body), listOf("a", "d"), RequestContext(useCache = false)) }
+            val ms1 = (System.nanoTime() - t1) / 1_000_000
+            assertEquals(r0.isSuccess, r1.isSuccess, "esito diverso: ${r0.exceptionOrNull()} / ${r1.exceptionOrNull()}")
+            if (!r1.isSuccess) continue
+            trips++
+            val q1 = queries()
+            assertTrue(close(w0, cb.lastWeight), "seme $seed: peso ${cb.lastWeight} invece di $w0")
+            assertEquals(x0, cb.lastCrossings.map { it.lat to it.lon }, "seme $seed: valichi diversi")
+            assertEquals(s0, cb.lastChains.first().countries)
+            assertEquals(Json.stringify(summary(r0.getOrThrow())), Json.stringify(summary(r1.getOrThrow())))
+            qOne += q1; qPairs += q0; if (trips > 1) { msOne += ms1; msPairs += ms0 }
+            println("seme $seed: peso %.1f via $x0, ricerche $q1 invece di $q0, $ms1 ms invece di $ms0".format(w0))
+        }
+        println("strato con una ricerca sola: $trips viaggi, ricerche $qOne invece di $qPairs, $msOne ms invece di $msPairs (senza il primo)")
+        assertTrue(trips >= 8, "viaggi: $trips")
+        assertTrue(qOne < qPairs, "ricerche $qOne, una per coppia $qPairs")
+        cb.layerManyToOne = true
+    }
+
     @Suppress("UNCHECKED_CAST")
     private fun summary(res: Map<String, Any?>) = ((res["features"] as List<Map<String, Any?>>)[0]["properties"] as Map<String, Any?>)["summary"]
 }

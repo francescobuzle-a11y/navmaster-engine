@@ -47,7 +47,7 @@ import kotlin.test.assertTrue
  * penalizzato su 20 coppie; (g) una via in più: ≤ 2 tratti calcolati (un Paese); (h) i titoli delle
  * varianti tutti diversi e mai il nome di una galleria o di un ponte; (i) tra Paesi: la richiesta
  * delle varianti rifà la scelta dei valichi senza ricerche («0 ricerche (N dalla memoria)», i pezzi
- * tutti dalla cache); (j) tra Paesi: le varianti entro `NM_VARIANTS_MS` (12 000 ms, il proxy in CI dei
+ * del migliore tutti dalla cache: i «cercati» meno quelli «per le varianti», le catene del passo 2); (j) tra Paesi: le varianti entro `NM_VARIANTS_MS` (12 000 ms, il proxy in CI dei
  * 25 s del tablet). Per i viaggi tra Paesi stampa le sequenze, le catene esatte oltre il migliore
  * (Paesi, valichi, peso) e i ms della fonte V.
  */
@@ -299,13 +299,17 @@ class AlternativesRealDiagTest {
                 val line = rc.stats.crossings
                 val m = Regex("""(\d+) ricerche \((\d+) dalla memoria(?:, (\d+) per le varianti)?\)""").find(line)
                 val redone = m?.let { it.groupValues[1].toInt() - it.groupValues[3].ifEmpty { "0" }.toInt() } ?: -1
-                val searched = Regex("""(\d+) cercati""").find(line)?.groupValues?.get(1)?.toInt() ?: 0
+                // i pezzi del migliore: i cercati meno quelli per le varianti (le catene del passo 2, nuove per costruzione)
+                val sm = Regex("""(\d+) cercati(?: \((\d+) per le varianti\))?""").find(line)
+                val searchedAll = sm?.groupValues?.get(1)?.toInt() ?: 0
+                val searchedV = sm?.groupValues?.get(2)?.ifEmpty { null }?.toInt() ?: 0
+                val searched = searchedAll - searchedV
                 println("  valichi (seconda richiesta): $line")
                 // (i) solo quando il migliore passa dalla programmazione dinamica (4 grafi): con 2 o 3 grafi i rami
                 // esatti (chooseExactTop, chooseTwo, chooseTransit) fanno percorsi mirati e ricerche molti a uno senza memoria
                 val nCountries = countries(plainDoc)
-                if (nCountries >= 4) check("i", redone == 0 && searched == 0, "$name: $redone ricerche rifatte, $searched pezzi ricercati: $line")
-                else println("  (i) non applicabile: $nCountries grafi (ramo esatto), $redone ricerche, $searched pezzi ricercati")
+                if (nCountries >= 4) check("i", redone == 0 && searched == 0, "$name: $redone ricerche rifatte, $searched pezzi del migliore ricercati ($searchedV per le varianti): $line")
+                else println("  (i) non applicabile: $nCountries grafi (ramo esatto), $redone ricerche, $searched pezzi del migliore ricercati ($searchedV per le varianti)")
                 println("  catene: " + cb.lastChains.joinToString(" | ") { c -> "${c.countries.joinToString("-")} via ${c.via.joinToString(" ") { "%.4f,%.4f".format(it.lat, it.lon) }} peso %.0f".format(c.exact) }.ifEmpty { "nessuna" })
                 val vMs = Regex("""V \d+ \([^)]*\) in (\d+) ms""").find(meta?.get("candidates")?.toString().orEmpty())?.groupValues?.get(1)
                 println("  fonte V: ${vMs?.let { "$it ms" } ?: "non eseguita"}; varianti in tutto ${meta?.get("ms")} ms")
