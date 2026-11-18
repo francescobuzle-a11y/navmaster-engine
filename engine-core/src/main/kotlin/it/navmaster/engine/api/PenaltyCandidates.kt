@@ -54,7 +54,7 @@ internal class PenaltyCandidates(private val service: DirectionsService, private
     private val runs: List<CorridorRun> by lazy { ctx.corridors.runs(solved.legs, tripMeters) }
     private val info get() = ctx.info
 
-    /** Quanti candidati al più: 7 col core, 2 con la ricerca piena (lenta). */
+    /** Quanti candidati al più: [MAX_CANDIDATES] col core, 2 con la ricerca piena (lenta). */
     var maxCandidates = MAX_CANDIDATES; private set
     private var step = 0
     private var c1: Ar? = null
@@ -91,7 +91,7 @@ internal class PenaltyCandidates(private val service: DirectionsService, private
      * (nessun arco esposto) e quelli che darebbero un percorso già trovato (vedi [covered]).
      */
     fun next(kept: List<Draft>, rejected: List<Draft>): Candidate? {
-        while (step < 7) {
+        while (step < STEPS) {
             val s = step++
             val c = when (s) {
                 0 -> pickRun(kept, null)?.let { a -> c1 = a; ar(Kind.AR, a) }
@@ -100,7 +100,14 @@ internal class PenaltyCandidates(private val service: DirectionsService, private
                 3 -> sp(kept + rejected, 2.0)
                 4 -> grow()
                 5 -> { val a = c1; val b = c3; if (a != null && b != null) Candidate(Kind.COMBO, arPenalties(a).times(arPenalties(b)), "AR ${a.label} + ${b.label}") else null }
-                else -> sp(kept + rejected, 3.0)
+                6 -> sp(kept + rejected, 3.0)
+                // ancora senza tutte le varianti (il motore le chiede solo finché il pool non è pieno): tutti gli
+                // archi dei percorsi trovati, non solo i tratti principali. Un viaggio corto su statali e
+                // provinciali (evita pedaggi o autostrade, una tappa: Canneto → Cremona → Piacenza) ha un tratto
+                // principale solo in un pezzo, e le varianti cambiavano sempre lo stesso pezzo (2 su 3)
+                7 -> sp(kept + rejected, 1.6, whole = true)
+                8 -> sp(kept + rejected, 2.5, whole = true)
+                else -> sp(kept + rejected, 4.0, whole = true)
             } ?: continue
             if (c.penalties.size == 0) continue
             if (covered(c)) { log("varianti: P ${c.label} saltato: darebbe un percorso già trovato"); continue }
@@ -214,15 +221,18 @@ internal class PenaltyCandidates(private val service: DirectionsService, private
         return p
     }
 
-    /** ×[f] sugli archi esposti dei tratti principali di [paths] (≥ 25 % del viaggio o ≥ 60 km; senza, tutto il percorso). */
-    private fun sp(paths: List<Draft>, f: Double): Candidate? {
+    /**
+     * ×[f] sugli archi esposti dei tratti principali di [paths] (≥ 25 % del viaggio o ≥ 60 km; senza, tutto il
+     * percorso); con [whole] su tutti i loro archi.
+     */
+    private fun sp(paths: List<Draft>, f: Double, whole: Boolean = false): Candidate? {
         val p = EdgePenalties(4096)
         val seen = IntHashSet()
-        for (d in paths) for (range in mainStretches(d)) for (i in range) {
+        for (d in paths) for (range in if (whole) listOf(d.edgeIds.indices) else mainStretches(d)) for (i in range) {
             val e = d.edgeIds[i]
             if (seen.add(e) && expo.isCoreExposed(e)) p.multiply(e, f)
         }
-        return Candidate(Kind.SP, p, "SP×$f (${paths.size} percorsi)", spFactor = f)
+        return Candidate(Kind.SP, p, "SP×$f (${paths.size} percorsi${if (whole) ", tutti gli archi" else ""})", spFactor = f)
     }
 
     /** I pezzi di [d] con lo stesso ref (gli archi senza ref non li interrompono) lunghi almeno il 25 % del viaggio o 60 km. */
@@ -286,7 +296,9 @@ internal class PenaltyCandidates(private val service: DirectionsService, private
     }
 
     companion object {
-        const val MAX_CANDIDATES = 7
+        /** I passi del calendario ([next]). */
+        const val STEPS = 10
+        const val MAX_CANDIDATES = STEPS
         const val AR_FACTOR = 10.0
         /** Il tetto di peso di un tratto ricercato: il migliore più 1,2 volte il margine di durata (il peso non è il tempo). */
         const val CAP_SLACK = 1.2

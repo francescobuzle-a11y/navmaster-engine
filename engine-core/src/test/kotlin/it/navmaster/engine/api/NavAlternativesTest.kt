@@ -591,6 +591,38 @@ class NavAlternativesServiceTest {
         assertTrue(variants > 0, "nessuna variante su Heidelberg")
     }
 
+    /**
+     * Con una tappa e «evita pedaggi/autostrade» il tratto principale sta spesso in un pezzo solo: le penalità
+     * sui tratti principali cambiano sempre quel pezzo e il pool restava a 2 su 3 (Canneto → Cremona →
+     * Piacenza). Finché mancano varianti il calendario P prosegue con tutti gli archi dei percorsi trovati:
+     * nuove varianti, mai oltre il calendario, il migliore uguale.
+     */
+    @Test
+    fun `while variants are missing the penalties go on with every edge of the routes found`() {
+        val service = DirectionsService(g)
+        val pOnly = NavAlternativesOptions(count = 4, tier1Factor = 1.2, maxFactor = 1.5, sources = setOf(VariantSource.PENALTY), minDetourScale = 0.02)
+        var trips = 0; var reached = 0; var kept = 0
+        for (seed in 1L..20L) for (avoid in listOf("", "tollways", "highways")) {
+            val pts = Heidelberg.points(3, seed + 700)
+            val body = Heidelberg.body(pts, if (avoid.isEmpty()) "" else ""","options":{"avoid_features":["$avoid"]}""")
+            val plain = try { service.solve(DirectionsRequest.fromJson("driving-hgv", body)) } catch (e: ApiException) { continue }
+            val lines = java.util.Collections.synchronizedList(ArrayList<String>())
+            val r = NavAlternativesEngine(service, RequestContext(log = { lines += it })).run(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(pOnly), pOnly)
+            trips++
+            assertEquals(plain.legs.map { l -> l.edges.map { it.edge } }, r.best.legs.map { l -> l.edges.map { it.edge } }, "seme $seed $avoid: migliore diverso")
+            val whole = lines.filter { it.startsWith("varianti: P SP") && "tutti gli archi" in it }
+            assertTrue(whole.size <= 3, "seme $seed $avoid: ${whole.size} candidati oltre il calendario")
+            if (whole.isNotEmpty()) {
+                reached++
+                kept += whole.count { "→ tenuta" in it }
+            }
+            for (a in r.variants) assertTrue(a.legs.all { service.routingGraph.router(r.best.options).isLegal(it) })
+        }
+        println("calendario P con tutti gli archi su Heidelberg (3 punti): $trips viaggi, $reached arrivati ai passi nuovi, $kept varianti tenute da quei passi")
+        assertTrue(trips >= 30, "viaggi: $trips")
+        assertTrue(kept >= 1, "nessuna variante dai passi con tutti gli archi")
+    }
+
     @Test
     fun `the variants trace changes nothing in the answer`() {
         var traced = 0; var printed = 0

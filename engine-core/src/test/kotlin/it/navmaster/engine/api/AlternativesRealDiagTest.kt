@@ -43,7 +43,9 @@ import kotlin.test.assertTrue
  * tablet. Per viaggio: ms del migliore (fonti dei tratti) e delle varianti, il registro delle fonti
  * (rete, deviazioni, candidati P), per percorso minuti, km, r, livello, fonte, firma; la memoria.
  *
- * Asserzioni (FAIL k/n): (a) ≥ 3 percorsi in ≥ 90 % dei viaggi, tappe comprese; (b) le firme attese
+ * Asserzioni (FAIL k/n): (a) almeno 3 alternative oltre al migliore (min(count, 4) percorsi) in ogni viaggio,
+ * tappe comprese (la regola del prodotto è «sempre»: prima bastava il 90 % e un viaggio a 2 alternative
+ * restava nascosto); un viaggio senza percorso (punto non agganciabile, rete chiusa al camion) è un FAIL, non un viaggio saltato; (b) le firme attese
  * in almeno metà dei viaggi noti (dentro i tetti 1,20: Torino→Mestre la A21, Bolzano→Milano la A22
  * fino all'interconnessione di Verona e poi la A4, senza SR450 né SS11; Milano→Bologna nessuna, A21/A22 sono oltre 1,20×); (c) livello 1 entro tier1, tutte entro max_factor in tempo e km;
  * (d) la prima feature è la risposta senza varianti; (e) le varianti subito dopo il migliore: 0
@@ -51,8 +53,14 @@ import kotlin.test.assertTrue
  * penalizzato su 20 coppie; (g) una via in più: ≤ 2 tratti calcolati (un Paese); (h) i titoli delle
  * varianti tutti diversi e mai il nome di una galleria o di un ponte; (i) tra Paesi: la richiesta
  * delle varianti rifà la scelta dei valichi senza ricerche («0 ricerche (N dalla memoria)», i pezzi
- * del migliore tutti dalla cache: i «cercati» meno quelli «per le varianti», le catene del passo 2); (j) tra Paesi: le varianti entro `NM_VARIANTS_MS` (12 000 ms, il proxy in CI dei
- * 25 s del tablet); (k) con «highways» in `NM_AVOID`: nei viaggi oltre 20 km almeno una variante
+ * del migliore tutti dalla cache: i «cercati» meno quelli «per le varianti», le catene del passo 2), coi migliori di 3 o più
+ * grafi (anche i rami esatti del transito, ora in memoria; con 2 grafi stampata); (j) tra Paesi: le varianti entro `NM_VARIANTS_MS` (12 000 ms, il proxy in CI dei
+ * 25 s del tablet), col tempo del motore `NM_BUDGET_MS` (predefinito 10 000, sotto il limite di (j): il motore sta
+ * dentro il suo tempo, minimi garantiti compresi; 2 s restano alle parti che il tempo non ferma, la preparazione della
+ * rete di un pezzo e la risposta. Non è il tablet: i suoi 25 s, a ~5×, sono ~5 000 ms in CI, da provare con
+ * `NM_BUDGET_MS=5000`, input «budget» del flusso); (l) tra Paesi: il migliore entro `NM_BEST_MS`, non nella prima
+ * combinazione (grafi a freddo): solo stampato, un FAIL solo con `NM_BEST_MS` dato (i migliori lenti, «evita
+ * autostrade» senza landmark, sono un lavoro a parte); (k) con «highways» in `NM_AVOID`: nei viaggi oltre 20 km almeno una variante
  * (su altre strade: la regola chiede dMin1 di deviazione dal migliore) e nessuna in autostrada, in
  * almeno l'80 % dei viaggi. Per i viaggi tra Paesi stampa le sequenze, le catene esatte oltre il migliore
  * (Paesi, valichi, peso) e i ms della fonte V.
@@ -69,6 +77,10 @@ class AlternativesRealDiagTest {
         // i viaggi tra Paesi (flusso «Valichi su grafi veri» con più Paesi)
         Place("Canneto sull'Oglio", 45.1502, 10.3792), Place("Bielsko-Biała", 49.8224, 19.0444), Place("Soncino", 45.4103, 9.9428),
         Place("Innsbruck", 47.2692, 11.4041), Place("Komjatice", 48.1536, 18.1872),
+        // Graz: la Hauptplatz (47.0707, 15.4395) è zona pedonale, nessuna strada per il camion entro 400 m: Graz-Webling, sul Gürtel
+        Place("Graz", 47.0450, 15.4000), Place("Trieste", 45.6495, 13.7768),
+        // Padova: il centro (45.4064, 11.8768) è zona a traffico limitato, nessuna strada per il camion entro 400 m: l'Interporto
+        Place("Padova", 45.3920, 11.9350),
     )
 
     private fun placeOf(p: Pair<Double, Double>): String? = places.firstOrNull { DistanceCalc.haversine(it.lat, it.lon, p.first, p.second) < 3_000.0 }?.name
@@ -153,6 +165,19 @@ class AlternativesRealDiagTest {
         // come sul tablet: 2 posti di ricerca, un thread aiutante
         val slots = SearchSlots(2)
         val pool = Executors.newFixedThreadPool(1) { r -> Thread(r, "nm-leg").also { it.isDaemon = true } }
+        // il tempo del motore per le varianti, sotto il limite di (j): il motore ci sta dentro coi minimi garantiti;
+        // 2 s restano alle parti che il tempo non ferma (preparazione della rete di un pezzo, risposta). Il tablet
+        // (25 s, CI ~5× più veloce) è NM_BUDGET_MS=5000
+        val variantsMs = System.getenv("NM_VARIANTS_MS")?.trim()?.toLongOrNull() ?: 12_000L
+        val budgetMs = System.getenv("NM_BUDGET_MS")?.trim()?.toLongOrNull() ?: (variantsMs - 2_000L)
+        // (l) un FAIL solo se il limite è dato; se no solo stampato (12 s)
+        val bestMsSet = System.getenv("NM_BEST_MS")?.trim()?.toLongOrNull()
+        val bestMs = bestMsSet ?: 12_000L
+        println("tempo del motore per le varianti $budgetMs ms, limite delle varianti $variantsMs ms, del migliore tra Paesi $bestMs ms")
+        // i passaggi di tutti i confini prima dei viaggi (l'app li ha già scritti): il tempo del migliore non comprende la loro ricerca
+        if (cb != null) for (i in graphs.indices) for (j in i + 1 until graphs.size) {
+            if (graphs[i].graph.graph.bounds.intersects(graphs[j].graph.graph.bounds)) transfers(graphs[i], graphs[j])
+        }
         val allFailed = ArrayList<String>()
         val summaries = ArrayList<String>()
         var firstCombo = true
@@ -163,7 +188,7 @@ class AlternativesRealDiagTest {
             val tier1 = minOf(maxFactor, alt.getOrNull(2)?.toDouble() ?: if (maxFactor <= 1.2) 1.1 else 1.3)
             val maxKm = maxOf(tier1, alt.getOrNull(3)?.toDouble() ?: maxFactor)
             val fewer = alt.getOrNull(4)?.lowercase()?.let { it == "1" || it == "true" || it == "fewer" } ?: false
-            val opt = NavAlternativesOptions(count, tier1, maxFactor, 25_000, false, tier1, maxKm, fewer, sources = sources)
+            val opt = NavAlternativesOptions(count, tier1, maxFactor, budgetMs, false, tier1, maxKm, fewer, sources = sources)
             // NM_AVOID: le strade da evitare (vuoto: solo i traghetti, come prima); non vuoto: anche avoid_penalty come l'app (NmRouting)
             val avoidList = if (avoidSpec.isEmpty()) listOf("ferries") else avoidSpec.split(',').map { it.trim() }.filter { it.isNotEmpty() }
             val avoidPenalty = avoidSpec.isNotEmpty()
@@ -247,11 +272,10 @@ class AlternativesRealDiagTest {
 
             // i risultati delle asserzioni: per ognuna i casi e quelli falliti
             class Check(val name: String) { var n = 0; var fail = 0; val lines = ArrayList<String>() }
-            val checks = linkedMapOf("a" to Check("(a) ≥ 3 percorsi"), "b" to Check("(b) firme attese"), "c" to Check("(c) fattori"), "d" to Check("(d) prima feature = migliore"),
+            val checks = linkedMapOf("a" to Check("(a) ≥ 3 alternative in ogni viaggio"), "b" to Check("(b) firme attese"), "c" to Check("(c) fattori"), "d" to Check("(d) prima feature = migliore"),
                 "e" to Check("(e) 0 ricerche per il migliore"), "f" to Check("(f) esattezza delle penalità"), "g" to Check("(g) via in più: ≤ 2 tratti"),
                 "h" to Check("(h) titoli diversi"), "i" to Check("(i) tra Paesi: scelta dalla memoria"), "j" to Check("(j) tra Paesi: varianti entro il tempo"),
-                "k" to Check("(k) senza autostrade: varianti su altre strade"))
-            val variantsMs = System.getenv("NM_VARIANTS_MS")?.trim()?.toLongOrNull() ?: 12_000L
+                "k" to Check("(k) senza autostrade: varianti su altre strade"), "l" to Check("(l) tra Paesi: migliore entro il tempo"))
             fun check(key: String, ok: Boolean, what: String) {
                 val c = checks.getValue(key); c.n++
                 if (!ok) { c.fail++; c.lines += what; println("  FAIL ${c.name}: $what") }
@@ -273,11 +297,24 @@ class AlternativesRealDiagTest {
                 // il migliore, come lo mostra l'app
                 val rc0 = context()
                 val t0 = System.currentTimeMillis()
-                val plainDoc = try { handle(request(pts, via, bearings, false), rc0) } catch (e: ApiException) { println("  nessun percorso: ${e.message}"); return null }
+                val plainDoc = try { handle(request(pts, via, bearings, false), rc0) } catch (e: ApiException) {
+                    println("  nessun percorso: ${e.message}")
+                    // un viaggio senza percorso (coordinata non agganciabile, rete chiusa al camion o isolata) non si prova
+                    // mai: conta come FAIL di (a), non sparisce (Padova nel centro: il gruppo B verde senza provare niente)
+                    check("a", false, "$name: nessun percorso (${e.code}: ${e.message})")
+                    return null
+                }
                 val plain = features(plainDoc).first()
                 // un viaggio in un Paese solo (anche con più grafi aperti) ha i tratti nelle misure della richiesta
                 val multi = countries(plainDoc) > 1
-                println("  migliore in ${System.currentTimeMillis() - t0} ms: ${rc0.stats.line()}")
+                val bestTook = System.currentTimeMillis() - t0
+                println("  migliore in $bestTook ms: ${rc0.stats.line()}")
+                // (l) il migliore tra Paesi entro il tempo (la prima combinazione apre i grafi a freddo: solo stampato)
+                if (multi) {
+                    if (firstCombo) println("  (l) prima combinazione (grafi a freddo): migliore in $bestTook ms")
+                    else if (bestMsSet == null) println("  (l) migliore in $bestTook ms (${if (bestTook <= bestMs) "entro" else "OLTRE"} $bestMs ms, solo stampato)")
+                    else check("l", bestTook <= bestMs, "$name: migliore in $bestTook ms (limite $bestMs)")
+                }
                 val d0 = (summary(plain)["duration"] as Number).toDouble(); val l0 = (summary(plain)["distance"] as Number).toDouble()
                 // le sonde del viaggio (un Paese, due punti), poi la traccia delle varianti che le sorveglia
                 val tripName = "${placeOf(pts.first())}→${placeOf(pts.last())}"
@@ -307,8 +344,8 @@ class AlternativesRealDiagTest {
                     println("   $i: %.0f min, %.1f km, r %.3f, km %.3f, livello ${v?.get("tier")}, ${v?.get("source")}, «${v?.get("label")}» ${v?.get("diff") ?: ""}; ${signature(v)}".format(d / 60, l / 1000, d / d0, l / l0))
                 }
                 println("  memoria: $m0 → ${usedMb()} MB")
-                // (a) almeno 3 percorsi
-                check("a", fs.size >= 3, "$name: ${fs.size} percorsi")
+                // (a) almeno 3 alternative oltre al migliore (la regola del prodotto; con count 3 i percorsi chiesti)
+                check("a", fs.size >= minOf(count, 4), "$name: ${fs.size} percorsi (almeno ${minOf(count, 4)})")
                 // (c) livello 1 entro tier1, tutte entro max_factor (tempo e km), sul migliore
                 for (f in fs.drop(1)) {
                     val v = variant(f) ?: continue
@@ -345,11 +382,13 @@ class AlternativesRealDiagTest {
                     val searchedV = sm?.groupValues?.get(2)?.ifEmpty { null }?.toInt() ?: 0
                     val searched = searchedAll - searchedV
                     println("  valichi (seconda richiesta): $line")
-                    // (i) solo quando il migliore passa dalla programmazione dinamica (4 grafi): con 2 o 3 grafi i rami
-                    // esatti (chooseExactTop, chooseTwo, chooseTransit) fanno percorsi mirati e ricerche molti a uno senza memoria
+                    // (i) coi migliori di 3 o più grafi: la scelta dei due valichi del transito (chooseTwo) è nella memoria del
+                    // servizio, i percorsi mirati nella memoria dei pesi rapidi. Con 2 grafi solo stampata: chooseExactTop
+                    // con le varianti cerca anche oltre il migliore (contato per le varianti) e le sue ricerche molti a uno
+                    // non sono contate, ma un percorso mirato con un tetto più alto di quello della prima richiesta si rifà
                     val nCountries = countries(plainDoc)
-                    if (multi && nCountries >= 4) check("i", redone == 0 && searched == 0, "$name: $redone ricerche rifatte, $searched pezzi del migliore ricercati ($searchedV per le varianti): $line")
-                    else println("  (i) non applicabile: $nCountries grafi (ramo esatto), $redone ricerche, $searched pezzi del migliore ricercati ($searchedV per le varianti)")
+                    if (multi && nCountries >= 3) check("i", redone == 0 && searched == 0, "$name: $redone ricerche rifatte, $searched pezzi del migliore ricercati ($searchedV per le varianti): $line")
+                    else println("  (i) non controllata: $nCountries grafi, $redone ricerche, $searched pezzi del migliore ricercati ($searchedV per le varianti)")
                     println("  catene: " + cb.lastChains.joinToString(" | ") { c -> "${c.countries.joinToString("-")} via ${c.via.joinToString(" ") { "%.4f,%.4f".format(it.lat, it.lon) }} peso %.0f".format(c.exact) }.ifEmpty { "nessuna" })
                     val vMs = Regex("""V \d+ \([^)]*\) in (\d+) ms""").find(meta?.get("candidates")?.toString().orEmpty())?.groupValues?.get(1)
                     println("  fonte V: ${vMs?.let { "$it ms" } ?: "non eseguita"}; varianti in tutto ${meta?.get("ms")} ms")
@@ -470,12 +509,11 @@ class AlternativesRealDiagTest {
             if (firstCombo && pairs.isNotEmpty() && verified == 0) check("f", false, "${minOf(20, pairs.size)} coppie, nessuna verificata")
             firstCombo = false
 
-            // il riepilogo della combinazione: (a) almeno il 90 %, (b) almeno metà, (k) almeno l'80 % (dove la rete
-            // non ha altre strade non c'è variante), le altre tutte
+            // il riepilogo della combinazione: (b) almeno metà, (k) almeno l'80 % (dove la rete non ha altre strade
+            // non c'è variante), le altre tutte; (a) in ogni viaggio: la regola del prodotto è «sempre»
             println("== riepilogo $combo")
             for ((key, c) in checks) {
                 val ok = when (key) {
-                    "a" -> c.n == 0 || (c.n - c.fail) >= 0.9 * c.n
                     "b" -> c.n == 0 || (c.n - c.fail) * 2 >= c.n
                     "k" -> c.n == 0 || (c.n - c.fail) >= 0.8 * c.n
                     else -> c.fail == 0

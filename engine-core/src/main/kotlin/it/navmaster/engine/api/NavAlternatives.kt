@@ -1015,7 +1015,8 @@ internal fun accessCircles(solved: DirectionsService.Solved, info: EdgeInfo, tri
  * (livello 2, e 3 con `fill`), al più [FILL_GRACE_MS] oltre quel tempo. Solo le tenute
  * si completano (geometria e nomi). Righe di registro `varianti: …`.
  */
-internal class NavAlternativesEngine(private val service: DirectionsService, private val rc: RequestContext, private val trip: TripContext = TripContext.NONE) {
+internal class NavAlternativesEngine(private val service: DirectionsService, private val rc: RequestContext, private val trip: TripContext = TripContext.NONE,
+                                     private val hardEnd: Long = Long.MAX_VALUE) {
     companion object {
         /** La regione della rete autostradale per tratto: somma delle distanze dai punti ≤ 1,25 volte il tratto più 20 km. */
         const val REGION_FACTOR = 1.25
@@ -1062,6 +1063,22 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         const val MIN_SOURCE_BUDGET_MS = 3_000L
         /** Il riempimento (livelli 2 e 3) e il conto degli scarti dopo la scadenza delle fonti, al più. */
         const val FILL_GRACE_MS = 2_000L
+        /**
+         * Prima della fine rigida (`budget_ms` dall'inizio di [run], o quella data da un viaggio tra Paesi) le
+         * fonti si fermano questo tempo prima (ms): il riempimento ci sta dentro, nessuna fase va oltre la fine.
+         */
+        const val FILL_HARD_MS = 500L
+
+        /**
+         * La scadenza delle fonti (`System.nanoTime`) e quella del riempimento, data la fine delle fonti senza
+         * tetto [sources] e la fine rigida [hard]: le fonti al più [FILL_HARD_MS] prima di [hard], il riempimento
+         * [FILL_GRACE_MS] dopo le fonti, mai oltre [hard].
+         */
+        internal fun stops(sources: Long, hard: Long): Pair<Long, Long> {
+            val s = minOf(sources, if (hard == Long.MAX_VALUE) Long.MAX_VALUE else hard - FILL_HARD_MS * 1_000_000)
+            val f = s + FILL_GRACE_MS * 1_000_000
+            return s to (if (hard == Long.MAX_VALUE) f else minOf(f, hard))
+        }
         /** Il tempo della fonte P «in ombra» della traccia ([VariantTrace.shadowPenalty]). */
         const val SHADOW_P_MS = 20_000L
 
@@ -1157,7 +1174,10 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         for (p in ps) if (p.source in opt.sources) p.prepare(ctx)
         val preparedMs = (System.nanoTime() - t0) / 1_000_000
         val sourceMs = sourceBudgetMs(opt.budgetMs, preparedMs)
-        val deadline = System.nanoTime() + sourceMs * 1_000_000
+        // mai oltre budget_ms dall'inizio, né oltre la fine data da un viaggio tra Paesi (hardEnd): il minimo
+        // delle fonti dopo una preparazione lunga solo dentro quel tempo (le varianti automatiche entro 25 s)
+        val hard = minOf(hardEnd, t0 + opt.budgetMs * 1_000_000)
+        val (deadline, fillEnd) = stops(System.nanoTime() + sourceMs * 1_000_000, hard)
         val budget = rc.cancel.child(deadline)
         if (preparedMs >= 1_000) log("varianti: preparazione $preparedMs ms, alle fonti $sourceMs ms")
         var note: String? = null
@@ -1180,7 +1200,7 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             note = "budget"
         }
         // 4. riempimento: livello 2, poi 3, al più FILL_GRACE_MS dopo la scadenza delle fonti (poi restano i tenuti fin lì)
-        val fillStop = rc.cancel.child(deadline + FILL_GRACE_MS * 1_000_000)
+        val fillStop = rc.cancel.child(fillEnd)
         try {
             pool.admit(2, fillStop)
             if (opt.fill) pool.admit(3, fillStop)
@@ -1576,7 +1596,7 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         }
 
         /**
-         * I candidati a coppie fisse (C1-C2, C3-C4, C5-C6, C7): il secondo si sceglie prima di cercare
+         * I candidati a coppie fisse (C1-C2, C3-C4, C5-C6, C7-C8, C9-C10): il secondo si sceglie prima di cercare
          * il primo, con o senza aiutante, così le varianti non dipendono dal posto libero. Con
          * l'aiutante i due si cercano insieme; senza, il secondo dopo il primo (e non se il primo ha
          * già riempito: le tenute sarebbero le stesse). A tempo scaduto si offre comunque il

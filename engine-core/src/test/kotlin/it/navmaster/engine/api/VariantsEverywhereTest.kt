@@ -303,10 +303,10 @@ class VariantsEverywhereTest {
         assertEquals(start + 17_000 * ms, CrossBorderDirections.topDeadlineAfter(start, 25_000, start + 15_000 * ms, start + 12_000 * ms))
         // un passo 1 di 14 s: 19 s, alle fonti M e P 6 s (prima del rilievo il passo 2 arrivava a 24 s)
         assertEquals(start + 19_000 * ms, CrossBorderDirections.topDeadlineAfter(start, 25_000, start + 15_000 * ms, start + 14_000 * ms))
-        // un passo 1 di 20 s: metà di quel che resta, 22,5 s; l'altra metà alle varianti dei pezzi
-        assertEquals(start + 22_500 * ms, CrossBorderDirections.topDeadlineAfter(start, 25_000, start + 15_000 * ms, start + 20_000 * ms))
-        // un passo 1 oltre il tempo meno 1 s: mai oltre 24 s
-        assertEquals(start + 24_000 * ms, CrossBorderDirections.topDeadlineAfter(start, 25_000, start + 15_000 * ms, start + 24_500 * ms))
+        // un passo 1 di 20 s: metà di quel che resta sarebbe 22,5 s, ma la coda dei minimi garantiti (4,5 s) resta: 20,5 s
+        assertEquals(start + 20_500 * ms, CrossBorderDirections.topDeadlineAfter(start, 25_000, start + 15_000 * ms, start + 20_000 * ms))
+        // un passo 1 oltre il tempo meno 1 s: mai oltre il tempo meno la coda (prima 24 s)
+        assertEquals(start + 20_500 * ms, CrossBorderDirections.topDeadlineAfter(start, 25_000, start + 15_000 * ms, start + 24_500 * ms))
         // le fonti M e P hanno sempre almeno metà del tempo che resta dopo il passo 1
         for (t in 0L..25_000L step 250) {
             val now = start + t * ms

@@ -492,9 +492,16 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
     internal val mainNetCache = it.navmaster.engine.routing.MotorwayNetCache(capacity = 1)
     /** I pesi delle ricerche rapide della scelta dei valichi (viaggi tra Paesi): la richiesta delle varianti non li rifà. */
     internal val quickCache = QuickWeightCache()
+    /** Le scelte dei due valichi di un transito che parte da questo grafo (viaggi tra Paesi): la richiesta delle varianti non le rifà. */
+    internal val transitCache = TransitCache()
+    /**
+     * Il numero d'ordine di questo servizio nel processo: nelle chiavi delle memorie che toccano più grafi
+     * ([transitCache]) dice «lo stesso grafo aperto» senza tenere un riferimento al servizio di un altro Paese.
+     */
+    internal val serial: Long = SERIALS.incrementAndGet()
 
-    /** Svuota le cache dei tratti, degli agganci, delle reti autostradali e dei pesi rapidi (poca memoria: `onTrimMemory` dell'app). */
-    fun clearCaches() { legCache.clear(); snapCache.clear(); netCache.clear(); mainNetCache.clear(); quickCache.clear() }
+    /** Svuota le cache dei tratti, degli agganci, delle reti autostradali, dei pesi rapidi e dei transiti (poca memoria: `onTrimMemory` dell'app). */
+    fun clearCaches() { legCache.clear(); snapCache.clear(); netCache.clear(); mainNetCache.clear(); quickCache.clear(); transitCache.clear() }
 
     /** Diagnostica e prove: lo stato della cache dei tratti. */
     internal val legCacheInfo: String get() = legCache.info
@@ -952,6 +959,8 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
     }
 
     companion object {
+        /** I numeri d'ordine dei servizi ([serial]). */
+        private val SERIALS = java.util.concurrent.atomic.AtomicLong()
         /** Quanto più lontano deve cadere l'aggancio col divieto perché il punto sia "su una strada da evitare" (metri). */
         const val AVOIDED_ROAD_MARGIN = 15.0
         /** Oltre questa distanza in linea d'aria (m) maximum_speed vale sui tempi soltanto. */

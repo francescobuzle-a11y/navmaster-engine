@@ -150,6 +150,18 @@ internal class QuickWeightCache(val maxEntries: Int = 4096) {
         if (w.isFinite() || limit > e.limit) { e.w = w; e.limit = limit }
     }
 
+    /**
+     * La voce di [key] così com'è: il peso e il limite sotto cui è stato cercato (∞: nessun percorso più
+     * leggero del limite); null se non c'è. Per i percorsi mirati della scelta dei valichi, che col peso
+     * esatto o col limite dimostrato fanno a meno della ricerca.
+     */
+    @Synchronized fun entry(key: QuickKey): Pair<Double, Double>? {
+        val e = map[key]
+        if (e == null) { misses++; return null }
+        hits++
+        return e.w to e.limit
+    }
+
     @Synchronized fun clear() { map.clear() }
 
     /** Per le prove: quante voci ci sono ora. */
@@ -157,6 +169,37 @@ internal class QuickWeightCache(val maxEntries: Int = 4096) {
 
     /** Diagnostica: "118 pesi, colpi 118/236". */
     val info: String @Synchronized get() = "${map.size} pesi, colpi $hits/${hits + misses}"
+}
+
+/**
+ * Le scelte dei due valichi di un transito (`CrossBorderDirections` chooseTwo) di un servizio: per
+ * chiave i due valichi scelti e il peso del viaggio, col limite sotto cui è stata fatta la scelta. Come
+ * [QuickWeightCache]: un peso finito è il minimo esatto fra tutte le coppie di valichi e vale sotto
+ * qualunque limite; «nessuna coppia sotto l» (peso ∞) vale solo per i limiti ≤ l; una voce peggiore
+ * non sostituisce una migliore. La chiave (grafi coi loro servizi, opzioni, punti, elenchi dei valichi)
+ * la costruisce chi chiama. Così la richiesta delle varianti, subito dopo quella del migliore, non rifà
+ * la scelta (in CI fino a 20 s, sul tablet minuti). Pochi KB: due riferimenti e due numeri per voce
+ * più la chiave, i meno usati di recente escono oltre [maxEntries]. Un lucchetto solo.
+ */
+internal class TransitCache(val maxEntries: Int = 64) {
+    class Entry(val x: Transfer?, val y: Transfer?, val w: Double, val limit: Double)
+    private val map = object : LinkedHashMap<Any, Entry>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Any, Entry>?) = size > maxEntries
+    }
+
+    @Synchronized fun get(key: Any): Entry? = map[key]
+
+    /** Ricorda la scelta ([x], [y], [w]) fatta sotto [limit]; [w] ∞: nessuna coppia più leggera di [limit]. */
+    @Synchronized fun put(key: Any, x: Transfer?, y: Transfer?, w: Double, limit: Double) {
+        val e = map[key]
+        if (e != null && (e.w.isFinite() || (!w.isFinite() && limit <= e.limit))) return
+        map[key] = if (w.isFinite()) Entry(x, y, w, limit) else Entry(null, null, Double.POSITIVE_INFINITY, limit)
+    }
+
+    @Synchronized fun clear() { map.clear() }
+
+    /** Per le prove: quante voci ci sono ora. */
+    val size: Int @Synchronized get() = map.size
 }
 
 /** Un aggancio: le opzioni del router (`RoutingGraph.routerKey`), la coordinata, il raggio, il controllo delle reti isolate, la direzione. */

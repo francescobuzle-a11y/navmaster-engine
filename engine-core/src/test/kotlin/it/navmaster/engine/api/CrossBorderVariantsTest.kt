@@ -331,7 +331,8 @@ class CrossBorderVariantsTest {
             assertEquals(withoutVariant(plain), withoutVariant(features(docShort)[0]))
             assertEquals(bestW, cb.lastWeight)
             val metaShort = ((docShort["metadata"] as Map<*, *>)["navmaster"] as Map<*, *>)["alternatives"] as Map<*, *>
-            // la nota «budget» (o, se tutto era in memoria e il passo 2 è finito entro il millisecondo, nessuna variante)
+            // la nota «budget» (o, se tutto era in memoria e il passo 2 è finito entro il millisecondo, nessuna variante):
+            // i minimi garantiti stanno dentro budget_ms, nessuna grazia dopo
             assertTrue(metaShort["note"] == "budget" || (metaShort["variants"] == 0 && logs.none { it.contains("tempo finito") }), "nota col tempo finito: $metaShort")
         }
         println("altra sequenza: $trips viaggi, riferimento entro il fattore in $withinRef (peso uguale in $exactMatch), $others varianti per altri Paesi ($namedTitles titoli con strade), posto riservato $keptOther/$reservedChecks")
