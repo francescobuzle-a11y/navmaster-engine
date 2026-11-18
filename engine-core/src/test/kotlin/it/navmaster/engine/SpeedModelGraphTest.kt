@@ -70,17 +70,23 @@ class SpeedModelGraphTest {
         val profiles = listOf(HgvProfile(VehicleProfileOptions(maximumGradeLevel = 1, useAcceleration = false, blockFords = false, speedModel = SpeedModel.NAVMASTER, country = "DE")))
         RoutingGraph.build(File("../data/heidelberg.test.pbf"), dir, profiles).first.use { it.prepareCH(withCore = false, landmarkSets = emptyList()) }
         assertEquals("navmaster", GraphProperties(File(dir, "profiles")).apply { load() }.get("priority_model"))
-        val (a, b) = pairs[0]
+        // il peso consigliato di tutti gli archi: cambia col modello letto (autostrade e strade migliori)
         fun dijkstraWeight(rg: RoutingGraph): Double {
-            val plain = rg.router(RouteOptions(profile = "driving-hgv", turnCosts = false, allowCH = false))
-            return plain.route(plain.snap(a.first, a.second, 400.0, 0), plain.snap(b.first, b.second, 400.0, 1)).weight
+            val w = it.navmaster.engine.weighting.WeightingFactory.create(rg.encoding, rg.encoding.profile("heavyvehicle"), it.navmaster.engine.weighting.WeightingMethod.RECOMMENDED)
+            val iter = rg.graph.createEdgeIterator()
+            var sum = 0.0
+            for (e in 0 until rg.graph.edgeCount) { iter.setEdge(e, rg.graph.nodeA(e)); val x = w.edgeWeight(iter, false); if (x.isFinite()) sum += x }
+            return sum
         }
         val nav = RoutingGraph.load(dir).use { assertEquals(PriorityModel.NAVMASTER, it.encoding.priorityModel); dijkstraWeight(it) }
+        // un motore di prima vuole la versione esatta del formato: questo grafo lo rifiuterebbe
+        assertEquals("$GRAPH_FORMAT_VERSION.navmaster", GraphProperties(File(dir, "properties")).apply { load() }.get("graph.format_version"))
         // i grafi NAVMASTER di prima non hanno la proprietà: la loro CH è col peso di ORS, e così si aprono
         val text = File(dir, "profiles").readLines().filterNot { it.startsWith("priority_model") }
         File(dir, "profiles").writeText(text.joinToString("\n", postfix = "\n"))
+        GraphProperties(File(dir, "properties")).apply { load(); set("graph.format_version", GRAPH_FORMAT_VERSION.toString()); save() }
         val old = RoutingGraph.load(dir).use { assertEquals(PriorityModel.ORS, it.encoding.priorityModel); dijkstraWeight(it) }
-        // premi di ORS più forti: lo stesso viaggio (urbano, pochi premi) pesa meno, e il modello letto arriva davvero al peso
-        assertTrue(old < nav - 1.0, "peso ORS $old, NAVMASTER $nav")
+        // premi di ORS più forti sulle strade sopra le statali: la rete pesa meno, e il modello letto arriva davvero al peso
+        assertTrue(old < nav - 100.0, "peso ORS $old, NAVMASTER $nav")
     }
 }

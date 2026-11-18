@@ -318,12 +318,20 @@ class BaseGraph(
         geometry.setHeader(1, nextGeoRef.toInt()); geometry.setHeader(2, (nextGeoRef ushr 32).toInt())
         nodes.flush(); edges.flush(); geometry.flush(); names.flush()
         GraphProperties(File(dir.dir, "properties")).apply {
-            set("graph.format_version", GRAPH_FORMAT_VERSION.toString())
+            set("graph.format_version", GRAPH_FORMAT_VERSION.toString() + (if (formatVariant.isEmpty()) "" else ".$formatVariant"))
             set("graph.encoded_values", encodedValues.describe())
             set("graph.3d", is3D.toString())
             save()
         }
     }
+
+    /**
+     * La variante del formato scritta in `properties` dopo la versione (`4.navmaster`), vuota per i grafi
+     * di sempre: un grafo che va letto in un modo che i motori di prima non conoscono (CH, core e
+     * landmark preparati col peso consigliato NAVMASTER, vedi PriorityModel) la dichiara, e quei motori,
+     * che vogliono la versione esatta, lo rifiutano invece di usarlo male.
+     */
+    var formatVariant: String = ""
 
     /** Carica un grafo esistente dalla cartella; false se non c'è. */
     fun loadExisting(): Boolean {
@@ -331,7 +339,9 @@ class BaseGraph(
         val e = dir.open("edges", EDGE_SEGMENT) ?: return false
         val g = dir.open("geometry") ?: return false
         val props = GraphProperties(File(dir.dir, "properties")).also { it.load() }
-        check(props.get("graph.format_version") == GRAPH_FORMAT_VERSION.toString()) { "formato grafo incompatibile" }
+        val format = props.get("graph.format_version").orEmpty()
+        check(format.substringBefore('.') == GRAPH_FORMAT_VERSION.toString()) { "formato grafo incompatibile: $format" }
+        formatVariant = format.substringAfter('.', "")
         check(props.get("graph.encoded_values") == encodedValues.describe()) { "valori codificati diversi da quelli del grafo" }
         check(n.getHeader(1) == nodeEntryBytes && e.getHeader(1) == edgeEntryBytes) { "layout record diverso" }
         nodeCount = n.getHeader(2)

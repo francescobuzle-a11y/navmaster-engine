@@ -790,7 +790,20 @@ class CrossBorderDirections(
     }
 
     /** [handle] with "avoid" as a penalty only in the countries of [penalized] (null: all). */
+    /**
+     * I grafi preparati con modelli di priorità diversi ([it.navmaster.engine.profile.PriorityModel]: un
+     * Paese ricostruito accanto a uno di prima), null se tutti uguali. I pesi si sommano fra Paesi così
+     * come sono: con i modelli misti non sono confrontabili e la scelta dei valichi pende verso i Paesi
+     * coi grafi di prima (premi più forti). Non si può correggere qui (il rapporto cambia per tipo di
+     * strada): si dice, e l'app fa aggiornare i Paesi insieme.
+     */
+    val mixedPriority: String? by lazy {
+        val byModel = graphs.groupBy { it.graph.encoding.priorityModel }
+        if (byModel.size < 2) null else byModel.entries.joinToString("; ") { (m, gs) -> "${m.id}: ${gs.joinToString(", ") { it.id }}" }
+    }
+
     private fun route(request: DirectionsRequest, pointGraph: List<String?>, penalized: Set<String>?, rc: RequestContext): Map<String, Any?> {
+        mixedPriority?.let { log?.invoke("ATTENZIONE grafi con priorità diverse ($it): scelta dei valichi falsata, vanno aggiornati i Paesi coi grafi di prima") }
         val started = System.currentTimeMillis()
         val ctx = Ctx(request, penalized, rc = rc)
         // varianti NavMaster: fra due Paesi anche gli altri valichi (fonte V); il loro tempo (budget_ms)
@@ -933,6 +946,7 @@ class CrossBorderDirections(
         metadata["query"] = LinkedHashMap<String, Any?>(request.echo).apply { put("profile", request.profile); put("format", "geojson") }
         metadata["engine"] = pieces[0].graph.service.engineInfo()
         metadata["countries"] = pieces.map { it.graph.id }
+        mixedPriority?.let { metadata["mixed_priority"] = it }
         if (nav != null) {
             val (features, alternatives) = variantsAcross(ctx, request, pieces, pieceRequests, finals, feature, nav, rc, navStart, navBudget!!)
             metadata["navmaster"] = linkedMapOf("alternatives" to alternatives)

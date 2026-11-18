@@ -423,6 +423,9 @@ class RoutingGraph private constructor(
         const val WARM_GRAPH = 2
         const val WARM_ALL = WARM_CORE or WARM_GRAPH
 
+        /** La variante del formato dei grafi preparati col peso consigliato NAVMASTER ([BaseGraph.formatVariant]). */
+        const val PRIORITY_VARIANT = "navmaster"
+
         fun profileByName(name: String): VehicleProfile = when (name) {
             "car", "driving-car", "car-ors" -> CarProfile()
             "hgv", "driving-hgv", "truck", "heavyvehicle" -> HgvProfile()
@@ -441,6 +444,8 @@ class RoutingGraph private constructor(
             val stats = OsmGraphImporter(graph, encoding, tc, importOptions, guidance, points).import(pbf)
             rg.speedModel = (profiles.firstOrNull { it.options.speedModel == SpeedModel.NAVMASTER } ?: profiles.first()).options.speedModel.id
             rg.country = profiles.firstNotNullOfOrNull { it.options.country }
+            // i motori di prima non sanno del peso NAVMASTER: per loro il grafo ha un formato sconosciuto
+            graph.formatVariant = if (encoding.priorityModel == PriorityModel.NAVMASTER) PRIORITY_VARIANT else ""
             rg.flush()
             GraphProperties(File(dir, "profiles")).apply { load(); set("speed_model", rg.speedModel); set("country", rg.country ?: ""); set("priority_model", encoding.priorityModel.id); save() }
             rg.index = LocationIndex.build(graph)
@@ -467,6 +472,9 @@ class RoutingGraph private constructor(
             rg.country = props.get("country")?.takeIf { it.isNotBlank() }
             // il peso con cui sono stati preparati CH, core e landmark: ORS per i grafi di prima (anche NAVMASTER)
             encoding.priorityModel = PriorityModel.parse(props.get("priority_model"))
+            check((graph.formatVariant == PRIORITY_VARIANT) == (encoding.priorityModel == PriorityModel.NAVMASTER)) {
+                "grafo incoerente in $dir: formato «${graph.formatVariant}», priorità ${encoding.priorityModel.id}"
+            }
             rg.landmarkSetNames = (props.get("landmark_sets") ?: "").split(',').filter { it.isNotBlank() }
             for (key in (props.get("ch") ?: "").split(',').filter { it.isNotBlank() }) {
                 val st = CHStorage(gdir, key, graph.edgeCount, graph.nodeCount)

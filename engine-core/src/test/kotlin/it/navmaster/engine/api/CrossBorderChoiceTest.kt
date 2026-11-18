@@ -267,4 +267,19 @@ class CrossBorderChoiceTest {
 
     @Suppress("UNCHECKED_CAST")
     private fun summary(res: Map<String, Any?>) = ((res["features"] as List<Map<String, Any?>>)[0]["properties"] as Map<String, Any?>)["summary"]
+
+    @Test
+    fun `graphs with different priority models are reported`() {
+        val dir = Files.createTempDirectory("nme-cbc-mix").toFile().also { it.deleteOnExit() }
+        RoutingGraph.build(File("../data/heidelberg.test.pbf"), dir, listOf(HgvProfile())).first.use { it.prepareCH(withCore = false, landmarkSets = emptyList()) }
+        RoutingGraph.load(dir, mmap = false).use { g1 ->
+            RoutingGraph.load(dir, mmap = false).use { g2 ->
+                val a = CountryGraph("a", DirectionsService(g1)); val b = CountryGraph("b", DirectionsService(g2)); val c = CountryGraph("c", DirectionsService(g2))
+                kotlin.test.assertNull(CrossBorderDirections(listOf(a, b, c), { _, _ -> emptyList() }).mixedPriority)
+                // un Paese ricostruito col peso NAVMASTER accanto a due di prima
+                g2.encoding.priorityModel = it.navmaster.engine.profile.PriorityModel.NAVMASTER
+                assertEquals("ors: a; navmaster: b, c", CrossBorderDirections(listOf(a, b, c), { _, _ -> emptyList() }).mixedPriority)
+            }
+        }
+    }
 }

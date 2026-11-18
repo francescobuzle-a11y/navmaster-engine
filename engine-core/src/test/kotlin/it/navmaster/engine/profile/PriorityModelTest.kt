@@ -24,21 +24,31 @@ class PriorityModelTest {
     }
 
     @Test
-    fun `NAVMASTER - light bonuses, ORS penalties, still ordered`() {
+    fun `NAVMASTER - light bonuses above primary roads, ORS factors up to them, still ordered`() {
         val nav = PriorityModel.NAVMASTER; val ors = PriorityModel.ORS
         for (code in PriorityCode.entries) {
             val p = code.factor
-            when {
-                code.value > 4 -> assertTrue(nav.factor(p) > ors.factor(p) && nav.factor(p) < 1.0, "premio di $code: ${nav.factor(p)}")
-                else -> assertEquals(ors.factor(p), nav.factor(p), 1e-12, "penalità di $code")
-            }
+            if (code.value > PriorityCode.PREFER.value) assertTrue(nav.factor(p) > ors.factor(p) && nav.factor(p) < ors.factor(PriorityCode.PREFER.factor), "premio di $code: ${nav.factor(p)}")
+            else assertEquals(ors.factor(p), nav.factor(p), 1e-12, "fattore di $code")
         }
         val f = PriorityCode.entries.map { nav.factor(it.factor) }
         for (i in 1 until f.size) assertTrue(f[i] < f[i - 1], "fattori non decrescenti: $f")
+        assertEquals(0.75, nav.factor(PriorityCode.VERY_NICE.factor), 0.005)
+        assertEquals(0.707, nav.factor(PriorityCode.BEST.factor), 0.005)
         // statale contro autostrada: +6 % (ORS +26 %), il tempo decide
-        val primaryVsMotorway = nav.factor(PriorityCode.PREFER.factor) / nav.factor(PriorityCode.VERY_NICE.factor)
-        assertEquals(1.06, primaryVsMotorway, 0.01)
+        assertEquals(1.06, nav.factor(PriorityCode.PREFER.factor) / nav.factor(PriorityCode.VERY_NICE.factor), 0.01)
         assertEquals(1.26, ors.factor(PriorityCode.PREFER.factor) / ors.factor(PriorityCode.VERY_NICE.factor), 0.01)
+        // terziaria e urbana contro statale, locale contro terziaria: come ORS
+        assertEquals(1.26, nav.factor(PriorityCode.UNCHANGED.factor) / nav.factor(PriorityCode.PREFER.factor), 0.01)
+        assertEquals(1.26, nav.factor(PriorityCode.AVOID_IF_POSSIBLE.factor) / nav.factor(PriorityCode.UNCHANGED.factor), 0.01)
+        // le priorità lette da un arco (4 bit a passi di 1/7) danno gli stessi fattori dei codici esatti
+        val enc = GraphEncoding(listOf(HgvProfile()))
+        val stored = enc.profile("heavyvehicle").priority
+        val flags = enc.registry.newFlags()
+        for (code in PriorityCode.entries) {
+            stored.set(flags, code.factor)
+            for (m in PriorityModel.entries) assertEquals(m.factor(code.factor), m.factor(stored.get(flags)), 1e-9, "$m, codice $code letto dall'arco")
+        }
     }
 
     @Test

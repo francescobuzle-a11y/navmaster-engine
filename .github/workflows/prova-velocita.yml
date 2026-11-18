@@ -48,7 +48,8 @@ jobs:
           NAV=""; ORSG=""
           for c in austria czech-republic; do
             case "$c" in austria) CC=AT ;; czech-republic) CC=CZ ;; esac
-            curl -fsSL --retry 6 --retry-delay 20 -o region.osm.pbf "$GEOFABRIK/$c-latest.osm.pbf"
+            curl -fsSL --retry 8 --retry-delay 45 --retry-all-errors --retry-connrefused -o region.osm.pbf "$GEOFABRIK/$c-latest.osm.pbf" \
+              || { echo "Geofabrik non risponde: copia di openstreetmap.fr"; curl -fsSL --retry 5 --retry-delay 30 --retry-all-errors -o region.osm.pbf "https://download.openstreetmap.fr/extracts/europe/$(echo $c | tr - _)-latest.osm.pbf"; }
             osmium tags-filter region.osm.pbf w/highway=$VEHICLE_ROADS w/route=ferry,shuttle_train r/type=restriction -o roads-$c.osm.pbf --overwrite
             rm region.osm.pbf
             echo "== $c navmaster ($CC)"
