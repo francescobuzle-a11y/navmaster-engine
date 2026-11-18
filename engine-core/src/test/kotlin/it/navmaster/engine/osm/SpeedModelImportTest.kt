@@ -55,7 +55,10 @@ class SpeedModelImportTest {
             for (f in graph.getFlags(e)) hFlags = hFlags * 31 + f
             it.setEdge(e, graph.nodeA(e))
             for (w in ws) for (rev in listOf(false, true)) {
-                hW = hW * 31 + java.lang.Double.doubleToLongBits(w.edgeWeight(it, rev))
+                // al millesimo: le ultime cifre dei calcoli in virgola mobile cambiano fra macchine e JVM
+                // (Mac e Linux della CI), le velocità e le distanze no (sono nell'impronta dei flag)
+                val wt = w.edgeWeight(it, rev)
+                hW = hW * 31 + (if (wt.isInfinite()) Long.MAX_VALUE else Math.round(wt * 1000.0))
                 hW = hW * 31 + w.edgeMillis(it, rev)
             }
         }
@@ -69,7 +72,7 @@ class SpeedModelImportTest {
         assertEquals(6, graph.intsForFlags)
         val (flags, weights) = fingerprint(graph, encoding)
         assertEquals(-1038835248884379400L, flags, "flag degli archi diversi da prima")
-        assertEquals(-847073995313778735L, weights, "pesi o tempi degli archi diversi da prima")
+        assertEquals(120975768520584473L, weights, "pesi o tempi degli archi diversi da prima")
         assertEquals(SpeedModel.ORS, stats.speedModel)
         assertTrue(stats.delayEvents.isEmpty())
         for (e in 0 until graph.edgeCount) {
