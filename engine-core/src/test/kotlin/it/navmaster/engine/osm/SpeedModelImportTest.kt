@@ -208,6 +208,37 @@ class SpeedModelImportTest {
     }
 
     @Test
+    fun `customs lanes marked hgv=private on a main road - open to the truck only with the NAVMASTER model`() {
+        // valico di Mikulov (E461): statale 52 → corsia della vecchia dogana hgv=private → statale 52; e una
+        // terziaria privata, che resta chiusa
+        val nodes = listOf(Node(1, 48.786, 16.638), Node(2, 48.789, 16.637), Node(3, 48.790, 16.636), Node(4, 48.793, 16.634),
+            Node(5, 48.789, 16.640), Node(6, 48.790, 16.641))
+        val ways = listOf(
+            OsmWay(10, mapOf("highway" to "primary", "ref" to "52"), longArrayOf(1, 2)),
+            OsmWay(11, mapOf("highway" to "primary", "hgv" to "private", "oneway" to "no"), longArrayOf(2, 3)),
+            OsmWay(12, mapOf("highway" to "primary", "ref" to "52"), longArrayOf(3, 4)),
+            OsmWay(13, mapOf("highway" to "tertiary", "hgv" to "private"), longArrayOf(5, 6)),
+            OsmWay(14, mapOf("highway" to "primary", "hgv" to "no"), longArrayOf(2, 5)),
+        )
+        fun open(profiles: List<VehicleProfile>): Map<Long, Boolean> = imported(profiles, MemoryOsm(nodes, ways)) { g, enc, _ ->
+            val hgv = enc.profile("heavyvehicle")
+            val filter = it.navmaster.engine.weighting.EdgeFilterFactory.create(enc, "heavyvehicle")
+            val iter = g.createEdgeIterator()
+            (0 until g.edgeCount).associate { e ->
+                iter.setEdge(e, g.nodeA(e))
+                enc.shared.osmWayId.get(g.getFlags(e)).toLong() to (hgv.access.get(g.getFlags(e), false) && filter.accept(iter))
+            }
+        }
+        val nav = open(navProfiles("CZ"))
+        assertEquals(true, nav[11], "corsia di dogana: aperta col modello NAVMASTER")
+        assertEquals(false, nav[13] ?: false, "terziaria privata")
+        assertEquals(false, nav[14] ?: false, "hgv=no")
+        assertEquals(true, nav[10]); assertEquals(true, nav[12])
+        val ors = open(listOf(CarProfile(), HgvProfile()))
+        assertEquals(false, ors[11] ?: false, "ORS: hgv=private chiude, come prima")
+    }
+
+    @Test
     fun `an interior stop counts toward the nearest end, without an implied give way on top`() {
         // tertiary 0→1→2→3 (100 m, 100 m, 10 m) con lo stop sul nodo 2, poi la primary 3 che prosegue (4–3–5)
         val nodes = listOf(

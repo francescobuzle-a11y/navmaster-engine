@@ -169,7 +169,7 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
 
     companion object {
         /** Le strade principali su cui un `private` per il camion si legge come corsia riservata ([privateMainRoad]). */
-        private val MAIN_ROADS = setOf("motorway", "motorway_link", "motorroad", "trunk", "trunk_link", "primary", "primary_link")
+        val MAIN_ROADS = setOf("motorway", "motorway_link", "motorroad", "trunk", "trunk_link", "primary", "primary_link")
         private val CONDITION = Regex("""^\s*([^@]+?)\s*@\s*\(?\s*(.+?)\s*\)?\s*$""")
         private val WEIGHT = Regex("""^(weight|weightrating|maxweight)\s*>=?\s*([0-9]+(?:\.[0-9]+)?)\s*t?$""")
 

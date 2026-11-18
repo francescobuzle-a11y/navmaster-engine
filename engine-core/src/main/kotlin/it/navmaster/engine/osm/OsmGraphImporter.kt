@@ -109,6 +109,8 @@ class OsmGraphImporter(
 
     /** Le perdite ai nodi del modello NAVMASTER ([NodeDelays], [JunctionDelayPass]): attive se un profilo usa quel modello. */
     private val nodeDelays = profiles.any { it.profile.options.speedModel == SpeedModel.NAVMASTER }
+    /** Modello NAVMASTER: le corsie `private` delle strade principali non bloccano i mezzi pesanti ([WayAttributeParser.parse]). */
+    private val privateMainRoads = nodeDelays
     private val controlNodes = LongIntHashMap()  // id OSM → codice di NodeDelays.classify
     /** Sensi d'arco (arco·2 + 0 avanti, + 1 indietro) con uno stop, una precedenza o un semaforo entro 30 m dal capo d'arrivo. */
     private val nearEnd = java.util.BitSet()
@@ -340,7 +342,7 @@ class OsmGraphImporter(
             val copy = graph.addNode(graph.lat(tower), graph.lon(tower))
             val e = graph.addEdge(tower, copy, 0.0)
             val flags = graph.encodedValues.newFlags()
-            val attrs = WayAttributeParser.parse(way, isFerry = false, widthFromCarriageway = options.widthFromCarriageway)
+            val attrs = WayAttributeParser.parse(way, isFerry = false, widthFromCarriageway = options.widthFromCarriageway, privateMainRoads = privateMainRoads)
             encoding.shared.write(flags, attrs)
             for (i in profiles.indices) {
                 val pe = profiles[i]
@@ -449,7 +451,7 @@ class OsmGraphImporter(
             }
             val isFerry = way.tag("highway") == null && way.hasTag("route", "ferry", "shuttle_train")
             val flags = graph.encodedValues.newFlags()
-            encoding.shared.write(flags, tollFromNodes(way, WayAttributeParser.parse(way, isFerry, widthFromCarriageway = options.widthFromCarriageway), n))
+            encoding.shared.write(flags, tollFromNodes(way, WayAttributeParser.parse(way, isFerry, widthFromCarriageway = options.widthFromCarriageway, privateMainRoads = privateMainRoads), n))
             val ferryDuration = if (isFerry) OsmValues.parseDurationSeconds(way.tag("duration")) else -1L
             for (i in profiles.indices) {
                 // i traghetti: la velocità dalla durata e dalla lunghezza del tratto; le strade: la linea d'aria della way (ORS)

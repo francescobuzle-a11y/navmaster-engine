@@ -27,10 +27,13 @@ object WayAttributeParser {
     /**
      * @param widthFromCarriageway come GraphHopper/ORS, usa anche il tag `width` (larghezza della carreggiata)
      *   come limite di larghezza; con `false` contano solo `maxwidth` e `maxwidth:physical`.
+     * @param privateMainRoads modello NAVMASTER: su autostrade, superstrade e statali `private` non blocca i
+     *   mezzi pesanti (corsie di dogana e di cantiere, vedi `HgvProfile.privateMainRoad`); `no` sì.
      */
-    fun parse(way: OsmWay, isFerry: Boolean, roadAccessRestrictions: List<String> = carRestrictions, widthFromCarriageway: Boolean = true): WayAttributes = WayAttributes(
+    fun parse(way: OsmWay, isFerry: Boolean, roadAccessRestrictions: List<String> = carRestrictions, widthFromCarriageway: Boolean = true,
+              privateMainRoads: Boolean = false): WayAttributes = WayAttributes(
         osmWayId = way.id,
-        blockedHeavyVehicleTypes = blockedHeavyVehicleTypes(way),
+        blockedHeavyVehicleTypes = blockedHeavyVehicleTypes(way, privateMainRoads),
         hazmatForbidden = hazmatForbidden(way),
         maxHeight = meter(way, heightTags),
         maxWidth = meter(way, if (widthFromCarriageway) widthTags else widthTagsStrict),
@@ -69,10 +72,13 @@ object WayAttributeParser {
      * Prima le restrizioni generiche (`access=no` blocca tutti, salvo i tipi citati esplicitamente),
      * poi i tag specifici: `hgv=no`, `hgv=delivery` (consente delivery e blocca gli altri hgv), ecc.
      */
-    fun blockedHeavyVehicleTypes(way: OsmWay): Int {
+    fun blockedHeavyVehicleTypes(way: OsmWay, privateMainRoads: Boolean = false): Int {
         if (!way.hasTag("highway")) return 0
+        val open = privateMainRoads && way.tag("highway") in HgvProfile.MAIN_ROADS
+        val restrictedHere = if (open) motorVehicleRestrictedValues - "private" else motorVehicleRestrictedValues
+        val noHere = if (open) noValues - "private" else noValues
         var blocked = 0
-        if (way.hasTag(motorVehicleRestrictions, motorVehicleRestrictedValues)) blocked = HeavyVehicleAttributes.ANY
+        if (way.hasTag(motorVehicleRestrictions, restrictedHere)) blocked = HeavyVehicleAttributes.ANY
         if (way.hasTag(motorVehicleRestrictions, heavyVehicleValues)) {
             var allowed = 0
             for (key in motorVehicleRestrictions) for (v in way.tagValues(key)) {
@@ -85,7 +91,7 @@ object WayAttributeParser {
             val vehicleType = if (value in heavyVehicleValues) value else key
             val access = when {
                 vehicleType == value || value in yesValues -> "yes"
-                value in noValues -> "no"
+                value in noHere -> "no"
                 else -> null
             }
             blocked = setAccess(blocked, vehicleType, access)
