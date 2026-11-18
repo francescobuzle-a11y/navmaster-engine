@@ -227,6 +227,8 @@ class CrossBorderDirections(
     internal var focusMax = FOCUS_MAX
     /** Prove: chiamato all'inizio di ogni scelta dei due valichi insieme (chooseTwo), sul suo thread. */
     internal var beforeTwo: (() -> Unit)? = null
+    /** Prove: chiamato all'inizio (vero) e alla fine (falso) di ogni sequenza del passo 1 di [chain], col suo indice, sul suo thread. */
+    internal var onSequence: ((Int, Boolean) -> Unit)? = null
     /**
      * Ai confini di mezzo di [dpChain] una ricerca sola all'indietro da ogni candidato verso tutto lo
      * strato ([Ctx.bestTo]); false: una ricerca per coppia (voce dello strato, candidato), come prima
@@ -369,12 +371,13 @@ class CrossBorderDirections(
         fun fork(cancel: CancelToken, topToken: CancelToken?): Ctx =
             Ctx(request, penalized, plain, RequestContext(cancel, rc.priority, rc.executor, rc.slots, rc.log, rc.stats, rc.useCache), memory).also {
                 it.topK = topK; it.topFactor = topFactor; it.topBudget = topToken; it.topDeadline = topDeadline
-                it.navStart = navStart; it.navBudgetMs = navBudgetMs
+                it.navStart = navStart; it.navBudgetMs = navBudgetMs; it.bestKnown = bestKnown
             }
 
         /** I conteggi (ricerche, memoria, pesi dei pezzi) e le scelte della fonte V di un [fork], dopo che il suo thread ha finito. */
         fun absorb(f: Ctx) {
             queries += f.queries; hits += f.hits; extraSearched += f.extraSearched; extraQueries += f.extraQueries
+            searchedAll += f.searchedAll; knownQueries += f.knownQueries; knownSearched += f.knownSearched
             if (f.topStopped) topStopped = true
             if (f.top.isNotEmpty()) top = f.top
             val ls = synchronized(f.quiet.stats.legs) { f.quiet.stats.legs.toList() }
@@ -420,6 +423,17 @@ class CrossBorderDirections(
          * scadenza si tiene il migliore e quel che c'è; [topStopped] se è successo.
          */
         var topBudget: CancelToken? = null
+        /**
+         * Il migliore della richiesta è già noto dalla memoria del servizio (la scelta dei due valichi insieme con la
+         * tappa nel Paese di mezzo, [route]): le scelte per confine ([chain]) lo ritrovano e servono alla fonte V. Le
+         * loro ricerche del passo 1 si mettono da parte ([knownQueries], [knownSearched]) e si contano per le varianti
+         * solo se i valichi trovati per confine sono quelli della memoria.
+         */
+        var bestKnown = false
+        /** Le ricerche del passo 1 delle scelte per confine con [bestKnown] (non già per le varianti), da contare per le varianti dopo il confronto. */
+        var knownQueries = 0
+        /** I tratti cercati davvero da quelle ricerche ([knownQueries]), non già per le varianti. */
+        var knownSearched = 0
         /** La scadenza di [topBudget] (`System.nanoTime`), per il tempo delle varianti sul thread di un [fork]. */
         var topDeadline = Long.MAX_VALUE
         var topStopped = false
@@ -472,6 +486,7 @@ class CrossBorderDirections(
             // una ricerca solo se un tratto è stato cercato davvero (dalla cache: nessuna)
             val searched = synchronized(quiet.stats.legs) { quiet.stats.legs.drop(n0).count { it.source != LegStats.Source.CACHE } }
             if (searched > 0) { queries++; if (extra) extraQueries++ }
+            searchedAll += searched
             if (extra) extraSearched += searched
             val ms = System.currentTimeMillis() - t0
             if (ms > 300) log?.invoke("    pezzo ${g.id} ${if (w.isFinite()) "%.0f".format(w) else "∞"} in $ms ms")
@@ -485,6 +500,8 @@ class CrossBorderDirections(
         var extraPhase = false
         /** I tratti cercati davvero dai pesi dei pezzi per le varianti (compresi nei «cercati» di [pieceStats]). */
         var extraSearched = 0
+        /** Tutti i tratti cercati davvero dai pesi dei pezzi (per contare a parte quelli di una sequenza, [chain]). */
+        var searchedAll = 0
 
         /**
          * I pesi dei pezzi ([pieceWeight]) nella riga `stats`: quanti tratti, quanti cercati davvero (e
@@ -827,7 +844,7 @@ class CrossBorderDirections(
             fun direct(x: CountryGraph, y: CountryGraph, i: Int, j: Int) = countryPaths(x, y, pts[i], pts[j]).let { it.isNotEmpty() && it.all { pa -> pa.size == 2 } }
             if (direct(g0, g1, r0.last, r1.first) && direct(g1, g2, r1.last, r2.first)) {
                 for (i in r0.drop(1)) { cur.points += request.coordinates[i]; cur.radiuses += radius(i); cur.exact += false; cur.bearings += request.bearings?.getOrNull(i); cur.passThrough += request.passThroughAt(i) }
-                val two = chooseTwo(ctx, cur, r1, g1, r2, g2, radius) { Double.POSITIVE_INFINITY }
+                val two = chooseTwo(ctx, cur, r1, g1, r2, g2, radius, { Double.POSITIVE_INFINITY })
                 if (two != null) {
                     if (two.first == null) throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points ${r0.last} (%.7f %.7f) and ${r1.first} (%.7f %.7f).".format(
                         pts[r0.last].lon, pts[r0.last].lat, pts[r1.first].lon, pts[r1.first].lat))
@@ -845,6 +862,23 @@ class CrossBorderDirections(
                 }
             }
         }
+        // con le varianti e la tappa nel Paese di mezzo la scelta va per confine (sopra): se la richiesta del migliore ha
+        // scelto i due valichi insieme e la memoria li ha, il migliore è noto e le ricerche per confine servono alla fonte V
+        // (prima contavano come «rifatte»: Milano → Innsbruck → Monaco, 3-19 ricerche). Solo se i valichi trovati per
+        // confine sono quelli della memoria: se no il migliore della risposta l'hanno deciso loro e restano del migliore
+        var knownTwo: TransitCache.Entry? = null
+        val chosenX = ArrayList<Transfer>()
+        if (!twoDone && blocks.size == 3 && oneSearch && ctx.topK > 1 && !middlePass) {
+            val (g0, r0) = blocks[0]; val (g1, r1) = blocks[1]; val (g2, r2) = blocks[2]
+            val pre = cur.copy()
+            for (i in r0.drop(1)) { pre.points += request.coordinates[i]; pre.radiuses += radius(i); pre.exact += false; pre.bearings += request.bearings?.getOrNull(i); pre.passThrough += request.passThroughAt(i) }
+            val e = transitKey(ctx, pre, r1, g1, r2, g2, radius)?.let { g0.service.transitCache.get(it) }
+            if (e != null && e.w.isFinite()) {
+                ctx.bestKnown = true
+                knownTwo = e
+                log?.invoke("varianti: i due valichi del migliore dalla memoria (%.5f,%.5f e %.5f,%.5f, peso %.0f): le scelte per confine servono alla fonte V".format(e.x!!.lat, e.x.lon, e.y!!.lat, e.y.lon, e.w))
+            }
+        }
         if (twoDone) { /* pezzi già fatti */ } else for (i in 1 until pts.size) {
             if (of[i] !== cur.graph) {
                 // i punti dopo il confine nello stesso grafo (il pezzo che comincia al valico)
@@ -853,6 +887,7 @@ class CrossBorderDirections(
                 val chain = chain(ctx, cur, i..end, radius, of[i])
                     ?: throw ApiException(404, RoutingErrorCodes.ROUTE_NOT_FOUND, "Unable to find a route between points ${i - 1} (%.7f %.7f) and $i (%.7f %.7f).".format(
                         pts[i - 1].lon, pts[i - 1].lat, pts[i].lon, pts[i].lat))
+                chosenX += chain.map { it.first }
                 // i pezzi del migliore che questa scelta copre (da cur al pezzo che comincia all'ultimo valico) e le sue catene
                 val first = pieces.size
                 val (closed, next) = piecesOf(cur, chain)
@@ -863,6 +898,16 @@ class CrossBorderDirections(
             cur.points += request.coordinates[i]; cur.radiuses += radius(i); cur.exact += false; cur.bearings += request.bearings?.getOrNull(i); cur.passThrough += request.passThroughAt(i)
         }
         pieces += cur
+        knownTwo?.let { e ->
+            ctx.bestKnown = false
+            val same = chosenX.size == 2 && chosenX[0].lat == e.x!!.lat && chosenX[0].lon == e.x.lon && chosenX[1].lat == e.y!!.lat && chosenX[1].lon == e.y.lon
+            if (same) {
+                ctx.extraQueries += ctx.knownQueries; ctx.extraSearched += ctx.knownSearched
+                log?.invoke("varianti: valichi per confine uguali a quelli della memoria: ${ctx.knownQueries} ricerche del passo 1 per la fonte V")
+            } else log?.invoke("varianti: valichi per confine diversi da quelli della memoria (${chosenX.joinToString { "%.5f,%.5f".format(it.lat, it.lon) }}): " +
+                "le ${ctx.knownQueries} ricerche del passo 1 restano del migliore")
+            ctx.knownQueries = 0; ctx.knownSearched = 0
+        }
         val pieceRequests = pieces.map { p -> p.graph to requestOf(request, p) }
         lastPieces = pieceRequests
         rc.stats.addCrossings("${pieces.joinToString(" → ") { it.graph.id }}: ${ctx.queriesText()} in ${System.currentTimeMillis() - started} ms${ctx.pieceStats()}")
@@ -1251,6 +1296,9 @@ class CrossBorderDirections(
     private fun variantsAcross(ctx: Ctx, request: DirectionsRequest, pieces: List<Piece>, pieceRequests: List<Pair<CountryGraph, DirectionsRequest>>, finals: List<FinalPiece>, bestFeature: Map<String, Any?>,
                                nav: NavAlternativesOptions, rc: RequestContext, t0: Long, budget: CancelToken): Pair<List<Map<String, Any?>>, Map<String, Any?>> {
         val want = nav.count - 1
+        // dove va il tempo delle varianti (riga «tempi tra Paesi»): la scelta dei valichi (passi 1 e 2, i pezzi finali) fin qui
+        val tv0 = System.nanoTime()
+        val chooseMs = (tv0 - t0) / 1_000_000
         val totalMs = finals.sumOf { it.millis }; val totalM = finals.sumOf { it.meters }; val totalW = finals.sumOf { it.weight }
         val labels = TripLabels()
         val (bestSig, bestRefM) = labels.refs(finals.map { it.graph to it.solved.legs })
@@ -1357,6 +1405,9 @@ class CrossBorderDirections(
             vMs += (System.nanoTime() - vt0) / 1_000_000
         }
         if (vOn) crossingPass(true)
+        val vOtherMs = (System.nanoTime() - tv0) / 1_000_000
+        val tp0 = System.nanoTime()
+        val pieceMs = ArrayList<String>()
 
         // (b) le varianti dei pezzi lunghi, coi valichi fissi
         val sameLeft = vOn && spans.any { sp -> sp.chains.drop(1).any { !otherCountriesOf(sp, it) } }
@@ -1375,6 +1426,7 @@ class CrossBorderDirections(
                 nav.allowFewerKm, nav.fill, pieceSources, nav.minDetourScale).withTrace(nav.trace)
             val prc = RequestContext(rc.cancel, rc.priority, rc.executor, rc.slots, rc.log ?: log, rc.stats.child("varianti ${f.graph.id}"), rc.useCache)
             val res = NavAlternativesEngine(f.graph.service, prc, trip, hardEnd = t0 + nav.budgetMs * 1_000_000).run(f.solved.request, opt)
+            pieceMs += "${f.graph.id} ${res.ms} ms su $left"
             summaries += "${f.graph.id}: ${res.summary}"
             res.note?.let { notes += "${f.graph.id}: $it" }
             val encoder = f.graph.service.encoder(f.solved.request)
@@ -1390,11 +1442,16 @@ class CrossBorderDirections(
             }
         }
 
+        val piecesMs = (System.nanoTime() - tp0) / 1_000_000
+        val ts0 = System.nanoTime()
         if (vOn) {
             crossingPass(false)
             summaries += "V $crossings ($others per altri Paesi" + (if (sameSkipped > 0) ", $sameSkipped non provate: ${tier1()} di livello 1" else "") + ") in $vMs ms"
         } else if (VariantSource.CROSSING in nav.sources) summaries += "V no (nessun'altra catena)"
 
+        log?.invoke("varianti: tempi tra Paesi: scelta dei valichi (passi 1 e 2, pezzi finali) $chooseMs ms" + (if (ctx.topStopped) " (passo 2 fermato dal tempo)" else "") +
+            ", fonte V per altri Paesi $vOtherMs ms, varianti dei pezzi $piecesMs ms" + (if (pieceMs.isEmpty()) " (nessun pezzo: ${maxOf(0L, leftMs())} ms rimasti)" else " (${pieceMs.joinToString()})") +
+            ", fonte V negli stessi Paesi ${(System.nanoTime() - ts0) / 1_000_000} ms, su ${nav.budgetMs} ms")
         // le tenute, golose: per livello, poi (finché nessuna tenuta passa per altri Paesi) la fonte V per altri Paesi,
         // poi fonte (M, P, V), poi punteggio. La fonte V si giudica sul viaggio intero rispetto ai tenuti; le varianti
         // dei pezzi (giudicate dal loro pezzo) devono stare lontane dalle tenute V
@@ -1513,7 +1570,8 @@ class CrossBorderDirections(
      * I passaggi di confine del percorso migliore da p (grafo [ga]) a q (grafo [gb]), con il grafo
      * in cui si entra a ciascuno; null quando nessuna sequenza di Paesi ha un percorso.
      */
-    private fun chain(ctx: Ctx, prefix: Piece, suffix: IntRange, radius: (Int) -> Double, gb: CountryGraph, together: Boolean = oneSearch): List<Pair<Transfer, CountryGraph>>? {
+    private fun chain(ctx: Ctx, prefix: Piece, suffix: IntRange, radius: (Int) -> Double, gb: CountryGraph, together: Boolean = oneSearch,
+                      fromMemory: Boolean = true): List<Pair<Transfer, CountryGraph>>? {
         val ga = prefix.graph
         val p = prefix.points.last().let { LL(it.first, it.second) }; val rp = prefix.radiuses.last()
         val q = ctx.request.coordinates[suffix.first].let { LL(it.first, it.second) }; val rq = radius(suffix.first)
@@ -1538,11 +1596,24 @@ class CrossBorderDirections(
         val seqChain = AtomicReferenceArray<List<Pair<Transfer, CountryGraph>>?>(n)
         // le catene esatte trovate (sotto il tetto del momento) di ogni sequenza: il migliore e, per la fonte V, le altre
         val seqFound = AtomicReferenceArray<List<ChainChoice>>(n)
+        // la memoria del passo 1 ([chainKey]): il peso del migliore della stessa scelta e la sequenza che l'ha dato. Per la
+        // memoria dei transiti ([chooseTwo]: «nessuna coppia sotto l») ogni sequenza vede subito il tetto che avrà dopo
+        // quella del migliore ([memoCeiling]): la sequenza del migliore e quelle prima fino al suo peso compreso, quelle
+        // dopo sotto. Prima, con due thread, un transito partito mentre la sequenza del migliore lavorava ancora vedeva il
+        // tetto infinito, l'attesa finiva e si rifaceva (Lione → Francoforte senza autostrade: 18 s; Milano → Innsbruck →
+        // Monaco: 3 ricerche rifatte). I tetti della programmazione dinamica restano quelli di sempre: con un tetto più
+        // basso gli strati cambiano e qualche peso rapido non sta più nella memoria (una richiesta uguale rifaceva ricerche)
+        val memoKey = chainKey(ctx, prefix, suffix, radius, gb, paths, together)
+        val memo = if (!fromMemory || memoKey == null) null else ga.service.transitCache.get(memoKey)?.takeIf { it.w.isFinite() && it.seq in 0 until n }
+        val knownW = memo?.w ?: Double.POSITIVE_INFINITY
+        val knownSeq = memo?.seq ?: -1
+        if (memo != null) { ctx.hits++; log?.invoke("  passo 1 dalla memoria: tetto %.0f dalla sequenza %s".format(knownW, paths[knownSeq].joinToString("-") { it.id })) }
         fun ceiling(i: Int): Double {
             var c = Double.POSITIVE_INFINITY
             for (k in 0 until n) { val w = Double.fromBits(seqBest.get(k)); val x = if (k <= i) w else Math.nextUp(w); if (x < c) c = x }
             return c
         }
+        fun memoCeiling(i: Int): Double = if (knownSeq < 0) ceiling(i) else minOf(ceiling(i), if (knownSeq < i) knownW else Math.nextUp(knownW))
         // il tetto della sequenza i come una dopo l'altra (solo le sequenze fino a i): per le catene di
         // due Paesi della fonte V ([chooseExactTop]), che il passo 2 non ripesa; la sequenza 0 lo vede infinito anche
         // se una sequenza dopo, sull'altro thread, ha già un migliore
@@ -1551,27 +1622,67 @@ class CrossBorderDirections(
             for (k in 0..i) { val w = Double.fromBits(seqBest.get(k)); if (w < c) c = w }
             return c
         }
+        // col migliore dalla memoria le ricerche del passo 1 nelle altre sequenze non lo cambiano più: servono solo alle
+        // catene della fonte V (quelle trovate sotto il tetto, [found]) e si contano per le varianti, pezzi compresi
+        // ([Ctx.extraPhase]). Con due thread uno strato può cambiare col momento in cui il tetto scende (la prima
+        // richiesta l'ha visto scendere a metà): qualche peso rapido mancava alla memoria e risultava «rifatto» (D: 14
+        // nella sequenza italy-austria-hungary-croatia, non in quella del migliore). La sequenza del migliore no: la
+        // memoria ha solo il peso e la sequenza, i valichi si ritrovano con le sue ricerche (sul tablet, memoria dei
+        // pesi o dei tratti svuotata in parte: ricerche vere per ricostruire il migliore, contate come tali)
+        val q1 = ctx.queries; val x1 = ctx.extraQueries; val xs1 = ctx.extraSearched
+        // le ricerche per le varianti del passo 1 (con la memoria: tutte quelle delle altre sequenze) e quelle della sequenza del migliore
+        val forVq = java.util.concurrent.atomic.AtomicInteger(); val knownSeqQ = java.util.concurrent.atomic.AtomicInteger()
         sequences(ctx, n) { c, i ->
             val path = paths[i]
             // da capo anche dopo un aiutante fermato a metà
             seqBest.set(i, Double.POSITIVE_INFINITY.toRawBits()); seqChain.set(i, null)
             val f = ArrayList<ChainChoice>()
             val sq0 = c.queries; val sh0 = c.hits; val st0 = System.currentTimeMillis()
-            dpChain(c, prefix, suffix, radius, p, rp, q, rq, path, { ceiling(i) },
-                { w, via -> seqChain.set(i, via.mapIndexed { k, tr -> tr to path[k + 1] }); seqBest.set(i, w.toRawBits()) }, f, together = together,
-                exactTopLimit = { ceilingBefore(i) })
+            val sx0 = c.extraQueries; val ss0 = c.searchedAll; val sxs0 = c.extraSearched
+            onSequence?.invoke(i, true)
+            val wasExtra = c.extraPhase
+            val vSeq = memo != null && i != knownSeq
+            if (vSeq) c.extraPhase = true
+            try {
+                dpChain(c, prefix, suffix, radius, p, rp, q, rq, path, { ceiling(i) },
+                    { w, via -> seqChain.set(i, via.mapIndexed { k, tr -> tr to path[k + 1] }); seqBest.set(i, w.toRawBits()) }, f, together = together,
+                    exactTopLimit = { ceilingBefore(i) }, memoLimit = { memoCeiling(i) })
+            } finally { c.extraPhase = wasExtra; onSequence?.invoke(i, false) }
+            val dq = c.queries - sq0; val dx = c.extraQueries - sx0
+            forVq.addAndGet(if (vSeq) dq else dx)
+            if (memo != null && i == knownSeq) knownSeqQ.addAndGet(dq - dx)
+            // i valichi scelti insieme dalla memoria ([Ctx.bestKnown]): da parte, per le varianti solo dopo il confronto ([route])
+            if (memo == null && c.bestKnown) { c.knownQueries += dq - dx; c.knownSearched += (c.searchedAll - ss0) - (c.extraSearched - sxs0) }
             seqFound.set(i, f)
             // il costo di ogni sequenza nella scelta del migliore (da misurare sul tablet), col thread che l'ha pesata
             if (n > 1) log?.invoke("  sequenza ${path.joinToString("-") { it.id }}: ${c.queries - sq0} ricerche (${c.hits - sh0} dalla memoria) in ${System.currentTimeMillis() - st0} ms @${Thread.currentThread().name}")
         }
         var best = Double.POSITIVE_INFINITY
         var bestChain: List<Pair<Transfer, CountryGraph>>? = null
+        var bestSeq = -1
         val found = ArrayList<ChainChoice>()
         for (i in 0 until n) {
             seqFound.get(i)?.let { found += it }
             val w = Double.fromBits(seqBest.get(i))
             val via = seqChain.get(i)
-            if (via != null && w < best) { best = w; bestChain = via }
+            if (via != null && w < best) { best = w; bestChain = via; bestSeq = i }
+        }
+        if (memo != null && (bestSeq != knownSeq || best != knownW)) {
+            // la memoria non torna (non dovrebbe mai): la scelta da capo, senza
+            log?.invoke("  passo 1: la memoria dava %.0f dalla sequenza $knownSeq, trovato %.0f dalla $bestSeq: da capo senza memoria".format(knownW, best))
+            // la voce sbagliata via (se no resterebbe: [TransitCache.put] non sostituisce un peso finito) e le ricerche fatte
+            // con la memoria non più per le varianti: la scelta da capo la rimette giusta
+            ga.service.transitCache.remove(memoKey!!)
+            ctx.extraQueries = x1; ctx.extraSearched = xs1
+            return chain(ctx, prefix, suffix, radius, gb, together, fromMemory = false)
+        }
+        // il migliore nella memoria del passo 1 (la richiesta delle varianti parte da lì)
+        if (memoKey != null && memo == null && bestChain != null) ga.service.transitCache.put(memoKey, null, null, best, best, bestSeq)
+        if (memo != null) {
+            ctx.extraQueries = x1 + forVq.get()
+            val forV = forVq.get(); val again = knownSeqQ.get()
+            if (forV > 0 || again > 0) log?.invoke("  passo 1 col migliore dalla memoria: $forV ricerche delle altre sequenze per le catene della fonte V, " +
+                "$again della sequenza del migliore per ritrovarne i valichi")
         }
         lastWeight = best; lastCrossings = bestChain?.map { it.first }.orEmpty()
         ctx.chains = emptyList()
@@ -1722,7 +1833,9 @@ class CrossBorderDirections(
     private fun dpChain(ctx: Ctx, prefix: Piece, suffix: IntRange, radius: (Int) -> Double, p: LL, rp: Double, q: LL, rq: Double, path: List<CountryGraph>,
                         limit: () -> Double, improve: (Double, List<Transfer>) -> Unit, found: MutableList<ChainChoice>,
                         layerSize: Int = LAYER, onePerPlace: Boolean = false, token: CancelToken? = null, maxExact: Int = Int.MAX_VALUE,
-                        together: Boolean = false, skip: ChainChoice? = null, exactTopLimit: () -> Double = limit): Boolean {
+                        together: Boolean = false, skip: ChainChoice? = null, exactTopLimit: () -> Double = limit,
+                        /** Il tetto per la memoria dei transiti ([chooseTwo]): con la memoria del passo 1 quello che avrà alla fine. */
+                        memoLimit: () -> Double = limit): Boolean {
         fun stopped(): Boolean { if (token == null || !token.isCancelled) return false; ctx.rc.cancel.check(); ctx.topStopped = true; return true }
         var exacts = 0
         // un giro per un Paese vicino (A-B-A): si rientra a un altro valico (allo stesso sarebbe il percorso del Paese)
@@ -1769,7 +1882,7 @@ class CrossBorderDirections(
             // transito per un Paese: i due valichi insieme, fra tutti i passaggi dei due confini
             if (together && path.size == 3 && k == 1) {
                 // il tetto come funzione: riletto durante la scelta (il migliore di un'altra sequenza sull'altro thread)
-                val two = chooseTwo(ctx, prefix, null, path[1], suffix, path[2], radius, limit)
+                val two = chooseTwo(ctx, prefix, null, path[1], suffix, path[2], radius, limit, memoLimit)
                 if (two != null) {
                     if (two.first != null && two.third < limit()) {
                         val via = listOf(two.first!!, two.second!!)
@@ -2144,7 +2257,7 @@ class CrossBorderDirections(
      * varianti, subito dopo quella del migliore, la riprende senza ricerche (stesso risultato esatto).
      */
     private fun chooseTwo(ctx: Ctx, prefix: Piece, mid: IntRange?, gMid: CountryGraph, suffix: IntRange, gEnd: CountryGraph, radius: (Int) -> Double,
-                          limit: () -> Double): Triple<Transfer?, Transfer?, Double>? {
+                          limit: () -> Double, memoLimit: () -> Double = limit): Triple<Transfer?, Transfer?, Double>? {
         beforeTwo?.invoke()
         val none = Triple<Transfer?, Transfer?, Double>(null, null, Double.POSITIVE_INFINITY)
         val ga = prefix.graph; val request = ctx.request
@@ -2161,7 +2274,7 @@ class CrossBorderDirections(
                 log?.invoke(what + "%.5f,%.5f e %.5f,%.5f peso %.0f".format(e.x!!.lat, e.x.lon, e.y!!.lat, e.y.lon, e.w))
                 return Triple(e.x, e.y, e.w)
             }
-            if (belowWithin(ctx, limit, e.limit)) { ctx.hits++; log?.invoke(what + "nessuna coppia sotto %.0f".format(e.limit)); return none }
+            if (belowWithin(ctx, memoLimit, e.limit)) { ctx.hits++; log?.invoke(what + "nessuna coppia sotto %.0f".format(e.limit)); return none }
         }
         // il tetto sotto cui «nessuna coppia» è dimostrato: quello dell'ultimo momento (∞ se il transito non ha scartato nulla per lui)
         val noneBelow = doubleArrayOf(Double.NaN)
@@ -2221,6 +2334,22 @@ class CrossBorderDirections(
         fun g(x: CountryGraph) = listOf(x.id, x.service.serial, x.graph.routerKey(ctx.options(x)), x.service.routeOptions(ctx.inGraph(x, r)))
         return listOf("valico", g(ga), g(gb), prefix.points.toList(), prefix.radiuses.toList(), prefix.exact.toList(), prefix.bearings.toList(), prefix.passThrough.toList(),
             suffix.map { i -> listOf(r.coordinates[i], radius(i), r.bearings?.getOrNull(i), r.passThroughAt(i)) }, Ident(transfers(ga, gb)), cands.size, ctx.penalized, ctx.plain)
+    }
+
+    /**
+     * La chiave della memoria del passo 1 di [chain] nel servizio del primo grafo, come [transitKey]: i grafi delle
+     * sequenze [paths] (id, servizio, opzioni del router e della richiesta), le sequenze stesse (dipendono dai grafi del
+     * migliore, [bestGraphs]), i punti del capo e dell'arrivo, gli elenchi dei valichi di ogni confine (per identità),
+     * dove «evita» è penalità, [together]. Null senza [RequestContext.useCache].
+     */
+    private fun chainKey(ctx: Ctx, prefix: Piece, suffix: IntRange, radius: (Int) -> Double, gb: CountryGraph, paths: List<List<CountryGraph>>, together: Boolean): Any? {
+        if (!ctx.rc.useCache || paths.isEmpty()) return null
+        val r = ctx.request
+        fun g(x: CountryGraph) = listOf(x.id, x.service.serial, x.graph.routerKey(ctx.options(x)), x.service.routeOptions(ctx.inGraph(x, r)))
+        val borders = paths.flatMap { pa -> pa.zipWithNext() }.distinctBy { (x, y) -> x.id + ">" + y.id }.map { (x, y) -> Ident(transfers(x, y)) }
+        return listOf("passo 1", (paths.flatten() + prefix.graph + gb).distinct().map { g(it) }, paths.map { pa -> pa.map { it.id } }, prefix.points.toList(), prefix.radiuses.toList(),
+            prefix.exact.toList(), prefix.bearings.toList(), prefix.passThrough.toList(), suffix.map { i -> listOf(r.coordinates[i], radius(i), r.bearings?.getOrNull(i), r.passThroughAt(i)) },
+            borders, ctx.penalized, ctx.plain, together)
     }
 
     /** [chooseTwo] senza la memoria, coi passaggi [c01] e [c12] già filtrati. */
@@ -2377,6 +2506,39 @@ class CrossBorderDirections(
             } else if (e.limit >= limit) { ctx.hits++; log?.invoke("    valico scelto: dalla memoria, nessuno sotto %.0f".format(e.limit)); return none }
             else if (k > 1 && e.limit >= bestCut) { ctx.hits++; forV = true; log?.invoke("    valico scelto: dalla memoria, nessuno sotto %.0f: solo per le varianti".format(e.limit)) }
         }
+        // k > 1 col migliore dalla memoria ([known]) o «nessuno sotto il tetto del migliore» ([forV]): tutto quel che segue
+        // (le ricerche verso i passaggi, i percorsi mirati, i pezzi) serve solo alla fonte V e sta tutto nel tempo delle
+        // varianti ([Ctx.topBudget]): i router dei due grafi con quel tempo, alla scadenza il migliore e quel che c'è.
+        // Prima le ricerche verso i passaggi e i percorsi mirati andavano avanti senza tempo (evita autostrade, landmark
+        // deboli: Lione → Francoforte 14 s su 10 di varianti, le fonti M e P dei pezzi senza tempo)
+        val tb = ctx.topBudget
+        val vOnly = k > 1 && (known != null || forV) && tb != null
+        fun onlyKnown(why: String): List<Choice> {
+            ctx.topStopped = true
+            log?.invoke("varianti: valichi nessun altro ($why; tempo finito)")
+            val e = known ?: return none
+            return listOf(Choice(e.w, cands.first { it.lat == e.x!!.lat && it.lon == e.x.lon }))
+        }
+        if (vOnly && tb!!.isCancelled) { ctx.rc.cancel.check(); return onlyKnown("prima delle ricerche") }
+        val routersV = if (vOnly) listOf(ga, gb).distinctBy { it.id }.map { ctx.router(it) } else emptyList()
+        val cancelsV = routersV.map { it.cancel }
+        routersV.forEach { it.cancel = tb!! }
+        try {
+            return exactTopIn(ctx, prefix, suffix, radius, gb, cands, limit, k, factor, sp, sq, tKey, known, forV, vOnly, ::onlyKnown)
+        } finally { routersV.forEachIndexed { i, r -> r.cancel = cancelsV[i] } }
+    }
+
+    /** Il resto di [chooseExactTop] dopo la memoria: [vOnly] tutto per la fonte V, coi router dei due grafi nel suo tempo. */
+    private fun exactTopIn(ctx: Ctx, prefix: Piece, suffix: IntRange, radius: (Int) -> Double, gb: CountryGraph, cands: List<Transfer>, limit: Double,
+                           k: Int, factor: Double, sp: Snap, sq: Snap, tKey: Any?, known: TransitCache.Entry?, forV: Boolean, vOnly: Boolean,
+                           onlyKnown: (String) -> List<Choice>): List<Choice>? {
+        val none = listOf(Choice(Double.POSITIVE_INFINITY, null))
+        val ga = prefix.graph
+        val request = ctx.request
+        val pl = prefix.points.last()
+        val qi = suffix.first
+        val cache = ga.service.transitCache
+        fun deadline(e: SearchCancelledException): Boolean = vOnly && e.reason == SearchCancelledException.Reason.DEADLINE && !ctx.rc.cancel.isCancelled
         val inA = cands.map { ctx.snap(ga, LL(it.lat, it.lon), TRANSFER_RADIUS)!! }
         val inB = cands.map { ctx.snap(gb, LL(it.lat, it.lon), TRANSFER_RADIUS)!! }
         // i pezzi finali con il passaggio t: prima del confine i punti del pezzo più t, dopo t più i punti nel grafo seguente
@@ -2393,13 +2555,16 @@ class CrossBorderDirections(
         fun nearPiece(t: Transfer) = if (shortIsB) pieceB(t) else pieceA(t)
         fun farPiece(t: Transfer) = if (shortIsB) pieceA(t) else pieceB(t)
         val t0 = System.currentTimeMillis()
-        val mNear = (if (shortIsB) ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true) else ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false)) ?: return null
-        val mFar = (if (shortIsB) ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false) else ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true)) ?: return null
+        val mNear: CoreManyToOne; val mFar: CoreManyToOne
+        try {
+            mNear = (if (shortIsB) ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true) else ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false)) ?: return null
+            mFar = (if (shortIsB) ctx.router(ga).manyToOne(sp, inA, rootIsTarget = false) else ctx.router(gb).manyToOne(sq, inB, rootIsTarget = true)) ?: return null
+        } catch (e: SearchCancelledException) { if (deadline(e)) return onlyKnown("ricerche verso i passaggi in ${System.currentTimeMillis() - t0} ms"); throw e }
         // il lato lontano con le ricerche mirate per i passaggi lontani dalla sua frontiera (vedi Reach)
         val rFar = if (shortIsB) Reach(ctx, ga, sp, inA, cands, false, mFar, memoRoot(ctx, ga, LL(pl.first, pl.second), prefix.radiuses.last(), prefix.exact.last(), prefix.bearings.last()), prefix.radiuses.last())
             else Reach(ctx, gb, sq, inB, cands, true, mFar, memoRoot(ctx, gb, LL(request.coordinates[qi].first, request.coordinates[qi].second), radius(qi), false, request.bearings?.getOrNull(qi)), radius(qi))
         // dove i pesi di ricerca sono quelli dei pezzi (vedi Ends): allora niente pezzo, la ricerca va avanti fino al passaggio
-        val ends = ends(ctx, prefix, suffix, radius, gb) ?: return none
+        val ends = try { ends(ctx, prefix, suffix, radius, gb) ?: return none } catch (e: SearchCancelledException) { if (deadline(e)) return onlyKnown("capi"); throw e }
         val nearExact = if (shortIsB) ends.endExact else ends.startExact; val nearInner = if (shortIsB) ends.endInner else ends.startInner
         val farExact = if (shortIsB) ends.startExact else ends.endExact; val farInner = if (shortIsB) ends.startInner else ends.endInner
         val nearWeight = DoubleArray(cands.size) { Double.NaN }
@@ -2423,6 +2588,7 @@ class CrossBorderDirections(
         // più): solo per la fonte V, entro il tempo delle varianti; alla scadenza si tiene quel che c'è
         val tb = ctx.topBudget
         var stopped = false
+        var vMs = 0L
         fun piece(extra: Boolean, g: CountryGraph, r: DirectionsRequest, bounded: Boolean = extra): Double? {
             if (!bounded || tb == null) return ctx.pieceWeight(g, r, extra = extra)
             return try { ctx.pieceWeight(g, r, tb, extra = true) } catch (e: SearchCancelledException) {
@@ -2430,7 +2596,8 @@ class CrossBorderDirections(
                 null
             }
         }
-        while (true) {
+        val loop0 = System.currentTimeMillis()
+        try { while (true) {
             // il passaggio col limite più basso del viaggio intero, non ancora pesato dal lato lontano
             var i = -1; var key = Double.POSITIVE_INFINITY
             for (j in cands.indices) if (farWeight[j].isNaN() && !skip[j]) {
@@ -2439,9 +2606,9 @@ class CrossBorderDirections(
             }
             if (i < 0 || key >= cut()) break
             val extra = k > 1 && (key >= best || known != null || forV)
-            // sotto il migliore del momento (con la memoria: il suo peso, o il tetto della richiesta) si pesa a ogni
-            // tempo, come senza memoria: la fonte V non perde le catene dello stesso confine a tempo finito
-            val bounded = extra && key >= best
+            // sotto il migliore del momento si pesa a ogni tempo (decide il migliore); col migliore dalla memoria
+            // ([vOnly]) anche sotto il suo peso tutto è per la fonte V: nel tempo delle varianti
+            val bounded = extra && (key >= best || vOnly)
             if (bounded && tb != null && tb.isCancelled) { ctx.rc.cancel.check(); stopped = true; break }
             if (k > 1 && key >= best && cands.indices.any { j -> !farWeight[j].isNaN() && total(j) <= key && samePlace(i, j) }) { skip[i] = true; continue }
             if (nearWeight[i].isNaN()) {
@@ -2462,9 +2629,11 @@ class CrossBorderDirections(
             if (stopped) break
             val total = nearWeight[i] + farWeight[i]
             if (total < best) { best = total; bestI = i }
-        }
+        } } catch (e: SearchCancelledException) { if (deadline(e)) stopped = true else throw e }
+        if (vOnly) vMs = System.currentTimeMillis() - loop0
         log?.invoke("    valico scelto: ${if (bestI < 0) "nessuno" else "%.5f,%.5f peso %.0f".format(cands[bestI].lat, cands[bestI].lon, best)} fra ${cands.size} passaggi; " +
-            "lato vicino ${near.id} ${mNear.stats}, $nearCount pezzi; lato lontano ${far.id} ${rFar.stats}, $farCount pezzi in $farMs ms; in tutto ${System.currentTimeMillis() - t0} ms")
+            "lato vicino ${near.id} ${mNear.stats}, $nearCount pezzi; lato lontano ${far.id} ${rFar.stats}, $farCount pezzi in $farMs ms; in tutto ${System.currentTimeMillis() - t0} ms" +
+            if (vOnly) " (il migliore dalla memoria: tutto per la fonte V, $vMs ms nel suo tempo${if (stopped) ", fermato" else ""})" else "")
         fun w(x: Double) = if (x.isFinite()) "%.0f".format(x) else "∞"
         for ((j, t) in cands.withIndex()) if (!nearWeight[j].isNaN() || !farWeight[j].isNaN() || mNear.lowerBound(j) + rFar.lowerBound(j) < best + 600)
             log?.invoke("      %.5f,%.5f r${t.rank}: ${near.id} ${if (nearWeight[j].isNaN()) "≥" + w(mNear.lowerBound(j)) else w(nearWeight[j])}, ${far.id} ${if (farWeight[j].isNaN()) "≥" + w(rFar.lowerBound(j)) else w(farWeight[j])}".format(t.lat, t.lon))

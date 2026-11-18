@@ -503,6 +503,9 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
     /** Svuota le cache dei tratti, degli agganci, delle reti autostradali, dei pesi rapidi e dei transiti (poca memoria: `onTrimMemory` dell'app). */
     fun clearCaches() { legCache.clear(); snapCache.clear(); netCache.clear(); mainNetCache.clear(); quickCache.clear(); transitCache.clear() }
 
+    /** Per le prove: la memoria dei tratti e dei pesi rapidi svuotata, quella delle scelte ([transitCache]) no (sul tablet: limiti propri, grafo riaperto). */
+    internal fun clearLegAndQuickCaches() { legCache.clear(); quickCache.clear() }
+
     /** Diagnostica e prove: lo stato della cache dei tratti. */
     internal val legCacheInfo: String get() = legCache.info
     internal val legCacheSize: Int get() = legCache.size

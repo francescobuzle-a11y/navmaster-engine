@@ -53,7 +53,10 @@ import kotlin.test.assertTrue
  * penalizzato su 20 coppie; (g) una via in più: ≤ 2 tratti calcolati (un Paese); (h) i titoli delle
  * varianti tutti diversi e mai il nome di una galleria o di un ponte; (i) tra Paesi: la richiesta
  * delle varianti rifà la scelta dei valichi senza ricerche («0 ricerche (N dalla memoria)», i pezzi
- * del migliore tutti dalla cache: i «cercati» meno quelli «per le varianti», le catene del passo 2), coi migliori di 3 o più
+ * del migliore tutti dalla cache: i «cercati» meno quelli «per le varianti», le catene del passo 2; col migliore dalla
+ * memoria del passo 1, «passo 1 dalla memoria», anche le ricerche del passo 1 nelle altre sequenze, che servono solo alle
+ * catene della fonte V, non quelle della sequenza del migliore, che ne ritrovano i valichi; con la tappa nel Paese di mezzo le
+ * ricerche per confine solo se i valichi trovati sono quelli scelti insieme nella memoria), coi migliori di 3 o più
  * grafi (anche i rami esatti del transito, ora in memoria; con 2 grafi stampata); (j) tra Paesi: le varianti entro `NM_VARIANTS_MS` (12 000 ms, il proxy in CI dei
  * 25 s del tablet), col tempo del motore `NM_BUDGET_MS` (predefinito 10 000, sotto il limite di (j): il motore sta
  * dentro il suo tempo, minimi garantiti compresi; 2 s restano alle parti che il tempo non ferma, la preparazione della
@@ -79,8 +82,10 @@ class AlternativesRealDiagTest {
         Place("Innsbruck", 47.2692, 11.4041), Place("Komjatice", 48.1536, 18.1872),
         // Graz: la Hauptplatz (47.0707, 15.4395) è zona pedonale, nessuna strada per il camion entro 400 m: Graz-Webling, sul Gürtel
         Place("Graz", 47.0450, 15.4000), Place("Trieste", 45.6495, 13.7768),
-        // Padova: il centro (45.4064, 11.8768) è zona a traffico limitato, nessuna strada per il camion entro 400 m: l'Interporto
-        Place("Padova", 45.3920, 11.9350),
+        // Padova: il centro (45.4064, 11.8768) è zona a traffico limitato e dentro l'Interporto (45.3920, 11.9350) la strada aperta
+        // al camion più vicina è a ~500 m (2010 entro 400 m): il Corso Stati Uniti, primaria a 3 corsie della zona industriale,
+        // senza divieti per i mezzi pesanti (OSM way 159160887), l'asse dell'Interporto
+        Place("Padova", 45.3952, 11.9304),
     )
 
     private fun placeOf(p: Pair<Double, Double>): String? = places.firstOrNull { DistanceCalc.haversine(it.lat, it.lon, p.first, p.second) < 3_000.0 }?.name

@@ -1079,6 +1079,9 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             val f = s + FILL_GRACE_MS * 1_000_000
             return s to (if (hard == Long.MAX_VALUE) f else minOf(f, hard))
         }
+        /** Le combinazioni fra tratti ([offerLegMixes]): i percorsi per tratto al più, le combinazioni al più. */
+        const val MIX_PER_LEG = 6
+        const val MAX_MIXES = 48
         /** Il tempo della fonte P «in ombra» della traccia ([VariantTrace.shadowPenalty]). */
         const val SHADOW_P_MS = 20_000L
 
@@ -1199,9 +1202,12 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             if (e.reason != SearchCancelledException.Reason.DEADLINE || rc.cancel.isCancelled) throw e
             note = "budget"
         }
-        // 4. riempimento: livello 2, poi 3, al più FILL_GRACE_MS dopo la scadenza delle fonti (poi restano i tenuti fin lì)
+        // 4. riempimento: livello 2, poi 3, al più FILL_GRACE_MS dopo la scadenza delle fonti (poi restano i tenuti fin lì).
+        // Prima, con le tappe, i tratti dei percorsi trovati mescolati (in RAM, nessuna ricerca)
         val fillStop = rc.cancel.child(fillEnd)
+        var mixed = 0
         try {
+            if (!pool.full && solved.legs.size >= 2) mixed = offerLegMixes(ctx, fillStop)
             pool.admit(2, fillStop)
             if (opt.fill) pool.admit(3, fillStop)
             // le varianti solo locali (un altro modo di uscire dalla città) solo se non c'è altro
@@ -1210,6 +1216,7 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             if (e.reason != SearchCancelledException.Reason.DEADLINE || rc.cancel.isCancelled) throw e
             note = "budget"
         }
+        for ((d, v) in pool.accepted) if (d.tag.startsWith("tratti misti")) log("varianti: tratti misti: ${d.tag.removePrefix("tratti misti ")} → tenuta (livello ${v.tier}, ${v.label})")
         if (pool.accepted.size < pool.want && note == null) note = used.firstNotNullOfOrNull { it.note() } ?: when {
             used.isEmpty() -> "nessuna fonte di varianti per questa richiesta"
             else -> "nessun'altra strada entro +${Math.round((opt.maxFactor - 1) * 100)} %"
@@ -1219,12 +1226,59 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         // i titoli sulle altre varianti della risposta: prima le strade che il migliore non usa, tutti diversi
         val titles = judge.titles(ordered.map { it.first })
         val variants = ordered.mapIndexed { i, (d, v) -> Accepted(d, v.withLabel(titles[i]), i + 1, d.legs.map { router.materialize(it) }) }
-        val summary = (used.joinToString(", ") { it.summary() }.ifEmpty { "nessuna fonte" }) + " | " + pool.discards(fillStop)
+        val summary = (used.joinToString(", ") { it.summary() }.ifEmpty { "nessuna fonte" }) + (if (mixed > 0) ", tratti misti $mixed" else "") + " | " + pool.discards(fillStop)
         val ms = (System.nanoTime() - t0) / 1_000_000
         log("varianti: ${variants.size}/${pool.want} in $ms ms ($summary)" + (note?.let { "; $it" } ?: ""))
         rc.stats.variants = "${variants.size}/${pool.want} in $ms ms ($summary)"
         opt.trace?.let { traceEnd(ctx, it, used) }
         Result(solved, variants, note, summary, judge, best, ms)
+    }
+
+    /**
+     * Le combinazioni fra i tratti dei percorsi trovati (viaggi con tappe, finché mancano varianti): per ogni tratto i
+     * suoi percorsi distinti fra il migliore, le tenute e le scartate di ogni fonte (al più [MIX_PER_LEG], prima quelli
+     * delle tenute), poi i viaggi col migliore e un tratto solo cambiato, poi con due, al più [MAX_MIXES]. Le fonti
+     * trovano le varianti di un tratto insieme a quelle degli altri: una variante del secondo tratto restava legata a
+     * una del primo uguale a una tenuta (diversità) o coi minuti dei due tratti (tempo). Dove si passa senza fermarsi
+     * (`pass_through`) il tratto dopo resta quello trovato con lo stesso arrivo. Solo RAM; la regola sceglie.
+     */
+    private fun offerLegMixes(ctx: VariantContext, stop: CancelToken): Int {
+        val pool = ctx.pool; val best = pool.best
+        val m = best.legs.size
+        class Option(val leg: RoutePath, val source: VariantSource, val arrival: Long, val tag: String)
+        fun key(e: it.navmaster.engine.routing.PathEdge?): Long = if (e == null) -1L else (e.edge.toLong() shl 1) or (if (e.reverse) 1L else 0L)
+        fun legHash(l: RoutePath): Long { var h = 1125899906842597L; for (e in l.edges) h = 31 * h + (e.edge.toLong() shl 1 or (if (e.reverse) 1L else 0L)); return h }
+        val options = List(m) { ArrayList<Option>() }
+        val seen = List(m) { HashSet<Long>() }
+        for (d in listOf(best) + pool.accepted.map { it.first } + pool.rejected) {
+            if (d.legs.size != m) continue
+            for (j in 0 until m) {
+                if (options[j].size >= MIX_PER_LEG || !seen[j].add(legHash(d.legs[j]))) continue
+                options[j] += Option(d.legs[j], d.source, if (j == 0) -1L else key(d.legs[j - 1].edges.lastOrNull()), d.tag.ifEmpty { d.source.json })
+            }
+        }
+        if (options.all { it.size <= 1 }) return 0
+        val existing = HashSet<Long>().also { h -> h += best.hash; for (d in pool.drafts) h += d.hash }
+        val batch = ArrayList<Draft>()
+        fun add(pick: IntArray) {
+            if (batch.size >= MAX_MIXES) return
+            val legs = (0 until m).map { options[it][pick[it]].leg }
+            // dove si passa senza fermarsi il tratto dopo vale solo con l'arrivo con cui è stato trovato
+            for (j in 1 until m) if (ctx.request.passThroughAt(j) && options[j][pick[j]].arrival != key(legs[j - 1].edges.lastOrNull())) return
+            val changed = (0 until m).filter { pick[it] != 0 }
+            // ogni tratto viene da un percorso già valido (svolte controllate da chi l'ha trovato), i raccordi alle tappe sono i suoi
+            val d = Draft(legs, options[changed.first()][pick[changed.first()]].source,
+                tag = "tratti misti " + changed.joinToString(" + ") { j -> "t$j da ${options[j][pick[j]].tag}" }, turnsChecked = true)
+            if (existing.add(d.hash)) batch += d
+        }
+        // un tratto solo cambiato, poi due
+        for (j in 0 until m) for (a in 1 until options[j].size) add(IntArray(m).also { it[j] = a })
+        for (j in 0 until m) for (k in j + 1 until m) for (a in 1 until options[j].size) for (b in 1 until options[k].size) add(IntArray(m).also { it[j] = a; it[k] = b })
+        stop.check()
+        if (batch.isEmpty()) return 0
+        val n = pool.offerAll(batch)
+        log("varianti: tratti misti: ${batch.size} combinazioni dai tratti di ${options.joinToString("/") { it.size.toString() }} percorsi, $n nuove")
+        return n
     }
 
     private fun verdictText(v: Verdict): String =

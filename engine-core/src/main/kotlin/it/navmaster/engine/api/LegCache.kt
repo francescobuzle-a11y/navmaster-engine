@@ -182,7 +182,8 @@ internal class QuickWeightCache(val maxEntries: Int = 4096) {
  * più la chiave, i meno usati di recente escono oltre [maxEntries]. Un lucchetto solo.
  */
 internal class TransitCache(val maxEntries: Int = 64) {
-    class Entry(val x: Transfer?, val y: Transfer?, val w: Double, val limit: Double)
+    /** [seq]: per la memoria del passo 1 di una scelta per confine, l'indice della sequenza di Paesi del migliore (-1 altrove). */
+    class Entry(val x: Transfer?, val y: Transfer?, val w: Double, val limit: Double, val seq: Int = -1)
     private val map = object : LinkedHashMap<Any, Entry>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Any, Entry>?) = size > maxEntries
     }
@@ -190,16 +191,22 @@ internal class TransitCache(val maxEntries: Int = 64) {
     @Synchronized fun get(key: Any): Entry? = map[key]
 
     /** Ricorda la scelta ([x], [y], [w]) fatta sotto [limit]; [w] ∞: nessuna coppia più leggera di [limit]. */
-    @Synchronized fun put(key: Any, x: Transfer?, y: Transfer?, w: Double, limit: Double) {
+    @Synchronized fun put(key: Any, x: Transfer?, y: Transfer?, w: Double, limit: Double, seq: Int = -1) {
         val e = map[key]
         if (e != null && (e.w.isFinite() || (!w.isFinite() && limit <= e.limit))) return
-        map[key] = if (w.isFinite()) Entry(x, y, w, limit) else Entry(null, null, Double.POSITIVE_INFINITY, limit)
+        map[key] = if (w.isFinite()) Entry(x, y, w, limit, seq) else Entry(null, null, Double.POSITIVE_INFINITY, limit)
     }
+
+    /** Toglie la voce di [key] (una memoria del passo 1 che non torna: [put] non sostituirebbe il suo peso finito). */
+    @Synchronized fun remove(key: Any) { map.remove(key) }
 
     @Synchronized fun clear() { map.clear() }
 
     /** Per le prove: quante voci ci sono ora. */
     val size: Int @Synchronized get() = map.size
+
+    /** Per le prove: le chiavi di ora. */
+    internal val keys: List<Any> @Synchronized get() = map.keys.toList()
 }
 
 /** Un aggancio: le opzioni del router (`RoutingGraph.routerKey`), la coordinata, il raggio, il controllo delle reti isolate, la direzione. */

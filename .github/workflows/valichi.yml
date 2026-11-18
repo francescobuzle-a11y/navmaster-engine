@@ -70,9 +70,10 @@ jobs:
               # (Graz a Webling, sul Gürtel: la Hauptplatz 47.0707,15.4395 è zona pedonale, nessuna strada per il camion entro 400 m)
               group_trips='45.4642,9.1900;48.1372,11.5756|46.4983,11.3548;48.7758,9.1829|44.4949,11.3426;47.2692,11.4041|45.6495,13.7768;47.0450,15.4000|47.2692,11.4041;47.8095,13.0550|45.4642,9.1900;47.2692,11.4041;48.1372,11.5756' ;;
             gruppo-B) COUNTRIES=italy,austria,czech-republic,germany,slovakia
-              # Padova→Praha, Padova→Wien (tappa)→Praha (Padova all'Interporto: il centro 45.4064,11.8768 è ZTL, nessuna strada per il camion
-              # entro 400 m, e il gruppo non provava niente)
-              group_trips='45.3920,11.9350;50.0755,14.4378|45.3920,11.9350;48.2082,16.3738;50.0755,14.4378' ;;
+              # Padova→Praha, Padova→Wien (tappa)→Praha. Padova sul Corso Stati Uniti (zona industriale, primaria a 3 corsie senza divieti
+              # per i mezzi pesanti, l'asse dell'Interporto): il centro 45.4064,11.8768 è ZTL e il punto nell'Interporto 45.3920,11.9350
+              # sta a ~500 m dalla strada aperta al camion più vicina (2010 entro 400 m): il gruppo non provava niente
+              group_trips='45.3952,11.9304;50.0755,14.4378|45.3952,11.9304;48.2082,16.3738;50.0755,14.4378' ;;
             gruppo-C) COUNTRIES=italy,austria,slovakia,hungary,slovenia
               # Canneto→Komjatice, Wien→Budapest
               group_trips='45.1508,10.3794;48.1547,18.1736|48.2082,16.3738;47.4979,19.0402' ;;

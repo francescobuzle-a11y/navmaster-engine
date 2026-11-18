@@ -107,7 +107,13 @@ internal class PenaltyCandidates(private val service: DirectionsService, private
                 // principale solo in un pezzo, e le varianti cambiavano sempre lo stesso pezzo (2 su 3)
                 7 -> sp(kept + rejected, 1.6, whole = true)
                 8 -> sp(kept + rejected, 2.5, whole = true)
-                else -> sp(kept + rejected, 4.0, whole = true)
+                9 -> sp(kept + rejected, 4.0, whole = true)
+                // con le tappe, ancora senza tutte le varianti: un tratto alla volta (il più lungo prima), tutti gli archi
+                // dei percorsi trovati in quel tratto e nient'altro. Le penalità su tutto il viaggio cambiavano insieme
+                // il tratto che ha un'alternativa vicina e gli altri: varianti uguali sul primo tratto (diversità) o con
+                // i minuti in più di due tratti (tempo). Canneto → Cremona → Piacenza evitando pedaggi: 2 su 3, la
+                // variante sul secondo tratto mai provata da sola; gli altri tratti restano del migliore (riusati)
+                else -> spLeg(kept + rejected, s - 10, LEG_FACTOR)
             } ?: continue
             if (c.penalties.size == 0) continue
             if (covered(c)) { log("varianti: P ${c.label} saltato: darebbe un percorso già trovato"); continue }
@@ -235,6 +241,25 @@ internal class PenaltyCandidates(private val service: DirectionsService, private
         return Candidate(Kind.SP, p, "SP×$f (${paths.size} percorsi${if (whole) ", tutti gli archi" else ""})", spFactor = f)
     }
 
+    /** I tratti in ordine di lunghezza (il più lungo prima), per le penalità su un tratto solo ([spLeg]). */
+    private val legOrder: List<Int> by lazy { solved.legs.indices.sortedByDescending { solved.legs[it].distance } }
+
+    /**
+     * ×[f] sugli archi esposti del tratto [k]-esimo per lunghezza ([legOrder]) di tutti i [paths] (in quel tratto, e solo
+     * lì): gli altri tratti del migliore non toccano le penalità e restano (riusati). Null senza tappe o oltre i tratti.
+     */
+    private fun spLeg(paths: List<Draft>, k: Int, f: Double): Candidate? {
+        if (solved.legs.size < 2) return null
+        val j = legOrder.getOrNull(k) ?: return null
+        val p = EdgePenalties(4096)
+        val seen = IntHashSet()
+        for (d in paths) {
+            if (d.legs.size != solved.legs.size) continue
+            for (i in d.legStart[j] until d.legStart[j + 1]) { val e = d.edgeIds[i]; if (seen.add(e) && expo.isCoreExposed(e)) p.multiply(e, f) }
+        }
+        return Candidate(Kind.SP, p, "SP×$f (${paths.size} percorsi, tratto ${j + 1})", spFactor = f)
+    }
+
     /** I pezzi di [d] con lo stesso ref (gli archi senza ref non li interrompono) lunghi almeno il 25 % del viaggio o 60 km. */
     private fun mainStretches(d: Draft): List<IntRange> {
         val out = ArrayList<IntRange>()
@@ -296,8 +321,11 @@ internal class PenaltyCandidates(private val service: DirectionsService, private
     }
 
     companion object {
-        /** I passi del calendario ([next]). */
-        const val STEPS = 10
+        /** I passi del calendario ([next]): 10 su tutto il viaggio, poi al più [LEG_STEPS] tratti uno alla volta. */
+        const val LEG_STEPS = 3
+        const val STEPS = 10 + LEG_STEPS
+        /** La penalità sugli archi di un tratto solo ([spLeg]). */
+        const val LEG_FACTOR = 2.0
         const val MAX_CANDIDATES = STEPS
         const val AR_FACTOR = 10.0
         /** Il tetto di peso di un tratto ricercato: il migliore più 1,2 volte il margine di durata (il peso non è il tempo). */
