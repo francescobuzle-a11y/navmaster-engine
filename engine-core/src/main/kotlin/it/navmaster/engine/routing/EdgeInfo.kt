@@ -14,7 +14,7 @@ import it.navmaster.engine.storage.SharedEncoding
  */
 class EdgeInfo(private val graph: BaseGraph, private val sh: SharedEncoding, private val guidance: GuidanceStore?) {
     private val it = graph.createEdgeIterator()
-    /** arco → (indice del ref + 1) shl [SHIFT] | classe ([MW], [TR], [LINK]); 0 = non letto ([READ] sempre presente). */
+    /** arco → (indice del ref + 1) shl [SHIFT] | classe ([MW], [TR], [PR], [LINK]); 0 = non letto ([READ] sempre presente). */
     private val codes = IntIntHashMap(4096)
     /** puntatore della stringa → indice del ref + 1 (0: nessun ref valido). */
     private val byPtr = IntIntHashMap(256)
@@ -29,6 +29,7 @@ class EdgeInfo(private val graph: BaseGraph, private val sh: SharedEncoding, pri
         when (it.get(sh.roadClass)) {
             RoadClass.MOTORWAY -> bits = bits or MW
             RoadClass.TRUNK -> bits = bits or TR
+            RoadClass.PRIMARY -> bits = bits or PR
             else -> {}
         }
         if (it.get(sh.roadClassLink)) bits = bits or LINK
@@ -51,6 +52,11 @@ class EdgeInfo(private val graph: BaseGraph, private val sh: SharedEncoding, pri
     fun isMotorwayOrTrunk(edge: Int): Boolean = code(edge) and (MW or TR) != 0
     /** `highway=motorway` o `motorway_link`. */
     fun isMotorway(edge: Int): Boolean = code(edge) and MW != 0
+    /**
+     * Una strada della rete principale: autostrada, superstrada o strada primaria (rampe comprese):
+     * i semi della rete delle varianti «rete principale» ([MotorwayNet.build] con `mainRoads`).
+     */
+    fun isMainRoad(edge: Int): Boolean = code(edge) and (MW or TR or PR) != 0
     /** Una rampa (`*_link`). */
     fun isLink(edge: Int): Boolean = code(edge) and LINK != 0
 
@@ -67,7 +73,8 @@ class EdgeInfo(private val graph: BaseGraph, private val sh: SharedEncoding, pri
         private const val MW = 1 shl 1
         private const val TR = 1 shl 2
         private const val LINK = 1 shl 3
-        private const val SHIFT = 4
+        private const val PR = 1 shl 4
+        private const val SHIFT = 5
         private val TOKEN = Regex("^[A-Z]{1,3}\\d+[A-Z]?$")
 
         /**

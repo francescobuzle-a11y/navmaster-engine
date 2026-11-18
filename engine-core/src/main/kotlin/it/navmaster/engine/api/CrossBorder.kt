@@ -21,6 +21,11 @@ import it.navmaster.engine.routing.SearchCancelledException
 import it.navmaster.engine.storage.BBox
 import it.navmaster.engine.util.DistanceCalc
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLongArray
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicReferenceArray
 
 /** Il grafo di un Paese, per i viaggi tra Paesi. */
 class CountryGraph(val id: String, val service: DirectionsService) {
@@ -120,6 +125,28 @@ object Transfers {
     /** Un luogo di valico: i passaggi entro questi metri (dal più importante) sono lo stesso valico. */
     internal const val PLACE = 5_000.0
 
+    /**
+     * Vero se un giro per il Paese di [list] (i valichi con un Paese vicino) può servire al viaggio
+     * p → q in un Paese solo: due valichi t1, t2 in luoghi diversi ([PLACE]) con
+     * crow(p,t1) + crow(t1,t2) + crow(t2,q) ≤ [factor]·crow(p,q). Solo geometria (nessun grafo letto):
+     * lo usa anche l'app per sapere quale grafo aprire.
+     */
+    fun aroundOk(list: List<Transfer>, pLat: Double, pLon: Double, qLat: Double, qLon: Double, factor: Double = CrossBorderDirections.AROUND_FACTOR): Boolean {
+        val crow = DistanceCalc.haversine(pLat, pLon, qLat, qLon)
+        if (crow <= 0) return false
+        val lim = factor * crow
+        val ins = list.filter { t -> DistanceCalc.haversine(pLat, pLon, t.lat, t.lon) + DistanceCalc.haversine(t.lat, t.lon, qLat, qLon) <= lim }
+        for (a in ins) {
+            val da = DistanceCalc.haversine(pLat, pLon, a.lat, a.lon)
+            for (b in ins) {
+                val ab = DistanceCalc.haversine(a.lat, a.lon, b.lat, b.lon)
+                if (ab < PLACE) continue
+                if (da + ab + DistanceCalc.haversine(b.lat, b.lon, qLat, qLon) <= lim) return true
+            }
+        }
+        return false
+    }
+
     fun rank(c: RoadClass): Int = when (c) {
         RoadClass.MOTORWAY -> 1
         RoadClass.TRUNK -> 2
@@ -196,6 +223,26 @@ class CrossBorderDirections(
      * (prove: stesso risultato). Non tocca l'esattezza, solo il lavoro.
      */
     internal var layerManyToOne = true
+    /**
+     * Le sequenze di Paesi di [chain] (il passo 1, il migliore, e il passo 2, le altre catene) divise
+     * fra il thread della richiesta e il posto da aiutante ([helperSlot]), quando c'è; false: una dopo
+     * l'altra (prove). Il migliore non cambia (vedi [chain]), cambia solo il tempo.
+     */
+    internal var parallelSequences = true
+    /**
+     * I grafi del passo 1 di [chain] (il migliore): quelli che l'app aprirebbe per il percorso a schermo
+     * (null: tutti). Gli altri grafi aperti servono solo alle sequenze in più del passo 2 (fonte V), così
+     * aprirne di più per la richiesta delle varianti non cambia il migliore.
+     */
+    var bestGraphs: Set<String>? = null
+    /**
+     * I grafi che decidono il migliore ([bestGraphs], o tutti): oltre al passo 1, i Paesi dove «evita»
+     * diventa penalità ([handleIn], [shutIn]) e il grafo dei punti ([route]). Così la richiesta delle
+     * varianti, coi grafi in più, ha lo stesso insieme di Paesi con la penalità e gli stessi grafi dei
+     * punti della richiesta del migliore, quindi gli stessi pesi e lo stesso migliore.
+     */
+    private val bestPool: List<CountryGraph>
+        get() = bestGraphs?.let { ids -> graphs.filter { it.id in ids } }?.takeIf { it.isNotEmpty() } ?: graphs
 
     /** Il peso del viaggio scelto all'ultimo confine e i suoi valichi (diagnostica, prove). */
     internal var lastWeight = Double.NaN; private set
@@ -251,19 +298,77 @@ class CrossBorderDirections(
     /** Una [chain] del viaggio: i pezzi del migliore da [first] a [last] (quello che comincia all'ultimo valico) e le sue catene (il migliore primo). */
     private class Span(val first: Int, val last: Int, val chains: List<ChainChoice>)
 
+    /**
+     * I pesi rapidi di una richiesta ([Ctx.weight], [Ctx.bestTo]), condivisi dai [Ctx] dei due thread
+     * di [chain] ([Ctx.fork]): ogni peso col limite sotto cui è stato cercato, e quelli in corso su un
+     * thread (l'altro aspetta invece di rifare la stessa ricerca). Un lucchetto solo.
+     */
+    private class Memory {
+        private val weights = HashMap<String, Pair<Double, Double>>()
+        private val running = HashMap<String, CountDownLatch>()
+        /** Vero mentre due thread pesano sequenze insieme: [dpChain] divide fra loro il primo strato ([Ctx.warm]). */
+        @Volatile var shared = false
+
+        @Synchronized fun get(key: String): Pair<Double, Double>? = weights[key]
+
+        /** Come [QuickWeightCache.put]: un peso finito resta; «nessun percorso sotto l» lascia il posto a uno finito o a un limite più alto. */
+        @Synchronized fun put(key: String, w: Double, limit: Double) {
+            val e = weights[key]
+            if (e == null || (!e.first.isFinite() && (w.isFinite() || limit > e.second))) weights[key] = w to limit
+        }
+
+        /** null: [key] è di chi chiama (lo cerca e poi [release]); altrimenti l'attesa della ricerca in corso sull'altro thread. */
+        @Synchronized fun claim(key: String): CountDownLatch? {
+            running[key]?.let { return it }
+            running[key] = CountDownLatch(1)
+            return null
+        }
+
+        /** Vero se [key] è in corso su un thread. */
+        @Synchronized fun isRunning(key: String): Boolean = key in running
+
+        @Synchronized fun release(key: String) { running.remove(key)?.countDown() }
+    }
+
     /** Lo stato di una richiesta: router e agganci per grafo, pesi già calcolati. */
     private inner class Ctx(val request: DirectionsRequest, val penalized: Set<String>? = null,
                             /** Searches without the roads to avoid at all (the yardstick of [shutIn]). */
                             val plain: Boolean = false,
                             /** L'annullamento e i posti di ricerca della richiesta. */
-                            val rc: RequestContext = RequestContext.NONE) {
+                            val rc: RequestContext = RequestContext.NONE,
+                            /** I pesi rapidi, condivisi con i [fork] di questo contesto. */
+                            private val memory: Memory = Memory()) {
         /** Per i pesi dei pezzi ([pieceWeight]): lo stesso annullamento, misure a parte (non sono tratti della risposta). */
         private val quiet = RequestContext(rc.cancel, rc.priority, rc.executor, rc.slots, rc.log, useCache = rc.useCache)
+        // router, opzioni e agganci di un thread solo (un Router non è thread-safe: il [fork] ha i suoi)
         private val routers = HashMap<String, Router>()
         private val options = HashMap<String, RouteOptions>()
         private val snaps = HashMap<String, Snap?>()
-        /** The weights found, with the limit they were looked for under (an infinite one below a limit may exist above it). */
-        private val weights = HashMap<String, Pair<Double, Double>>()
+
+        /**
+         * Lo stesso contesto per un altro thread (l'aiutante di [chain]): router, agganci e contatori
+         * suoi, i pesi rapidi ([Memory]) in comune; [cancel] il token del posto da aiutante,
+         * [topToken] il tempo delle varianti sul suo thread. I conteggi tornano qui con [absorb].
+         */
+        fun fork(cancel: CancelToken, topToken: CancelToken?): Ctx =
+            Ctx(request, penalized, plain, RequestContext(cancel, rc.priority, rc.executor, rc.slots, rc.log, rc.stats, rc.useCache), memory).also {
+                it.topK = topK; it.topFactor = topFactor; it.topBudget = topToken; it.topDeadline = topDeadline
+                it.navStart = navStart; it.navBudgetMs = navBudgetMs
+            }
+
+        /** I conteggi (ricerche, memoria, pesi dei pezzi) e le scelte della fonte V di un [fork], dopo che il suo thread ha finito. */
+        fun absorb(f: Ctx) {
+            queries += f.queries; hits += f.hits; extraSearched += f.extraSearched
+            if (f.topStopped) topStopped = true
+            if (f.top.isNotEmpty()) top = f.top
+            val ls = synchronized(f.quiet.stats.legs) { f.quiet.stats.legs.toList() }
+            synchronized(quiet.stats.legs) { quiet.stats.legs += ls }
+        }
+
+        /** Il «passo 1 in parallelo» per [Memory.shared]. */
+        var shared: Boolean
+            get() = memory.shared
+            set(v) { memory.shared = v }
         /** Le ricerche davvero fatte (rapide, pezzi, mirate, molti a uno). */
         var queries = 0
         /** Le ricerche rapide risparmiate dalla memoria del servizio ([DirectionsService.quickCache]). */
@@ -274,6 +379,17 @@ class CrossBorderDirections(
          */
         var topK = 1
         var topFactor = 1.0
+        /**
+         * Il tetto di peso delle altre catene (passo 2 di [chain], [chooseExactTop]): la regola delle
+         * varianti è in tempo ([topFactor]), il peso del camion «recommended» premia le autostrade, così
+         * una catena su statali ha un rapporto di peso più alto di quello di tempo. Lo stesso margine
+         * della fonte P: 1 + [PenaltyCandidates.CAP_SLACK]·(topFactor − 1) (1,24 per 1,2; 1,6 per 1,5);
+         * il filtro in tempo e km resta in [variantsAcross].
+         */
+        val topWeightFactor: Double get() = 1 + PenaltyCandidates.CAP_SLACK * (topFactor - 1)
+        /** L'inizio (`System.nanoTime`) e il tempo (`budget_ms`) della richiesta delle varianti, per allungare [topBudget] dopo il passo 1. */
+        var navStart = 0L
+        var navBudgetMs = 0L
         var top: List<Choice> = emptyList()
         /** Le catene esatte dell'ultima [chain] (il migliore primo, poi le altre entro [topFactor] in ordine di peso). */
         var chains: List<ChainChoice> = emptyList()
@@ -286,6 +402,8 @@ class CrossBorderDirections(
          * scadenza si tiene il migliore e quel che c'è; [topStopped] se è successo.
          */
         var topBudget: CancelToken? = null
+        /** La scadenza di [topBudget] (`System.nanoTime`), per il tempo delle varianti sul thread di un [fork]. */
+        var topDeadline = Long.MAX_VALUE
         var topStopped = false
 
         /**
@@ -372,7 +490,23 @@ class CrossBorderDirections(
          */
         fun weight(g: CountryGraph, a: LL, ra: Double, b: LL, rb: Double, limit: Double = Double.POSITIVE_INFINITY): Double {
             rc.cancel.check()
-            remembered(g, a, ra, b, rb, limit)?.let { return it }
+            val key = weightKey(g, a, b)
+            while (true) {
+                remembered(g, a, ra, b, rb, limit)?.let { return it }
+                // la stessa ricerca in corso sull'altro thread di [chain]: si aspetta il suo peso (poi
+                // dalla memoria; se l'ha cercato sotto un limite più basso del nostro, la si rifà qui)
+                val other = memory.claim(key) ?: break
+                while (!other.await(WAIT_MS, TimeUnit.MILLISECONDS)) rc.cancel.check()
+            }
+            try {
+                // l'altro thread può averlo finito fra la memoria e la chiave: niente seconda ricerca
+                remembered(g, a, ra, b, rb, limit)?.let { return it }
+                return search(g, a, ra, b, rb, limit)
+            } finally { memory.release(key) }
+        }
+
+        /** La ricerca rapida da [a] a [b] sotto [limit], ricordata (chi chiama tiene la sua chiave, [Memory.claim]). */
+        private fun search(g: CountryGraph, a: LL, ra: Double, b: LL, rb: Double, limit: Double): Double {
             val sa = snap(g, a, ra) ?: return Double.POSITIVE_INFINITY
             val sb = snap(g, b, rb) ?: return Double.POSITIVE_INFINITY
             queries++
@@ -383,6 +517,25 @@ class CrossBorderDirections(
             if (ms > 300) log?.invoke("    ricerca ${g.id} ${if (w.isFinite()) "%.0f".format(w) else "∞"} (limite ${if (limit.isFinite()) "%.0f".format(limit) else "∞"}) in $ms ms: ${router(g).lastAlgorithm} ${router(g).lastSearch}")
             remember(g, a, ra, b, rb, w, limit)
             return w
+        }
+
+        /**
+         * Con due thread su sequenze che cominciano dallo stesso confine ([Memory.shared]): i pesi da
+         * [a] ai passaggi [bs] che nessuno sa né sta cercando, saltando quelli in corso sull'altro
+         * thread (così il primo strato, comune, si divide fra i due invece di farlo due volte). Gli
+         * stessi pesi di [weight] sotto lo stesso [limit]: [dpChain] poi li trova in memoria.
+         */
+        fun warm(g: CountryGraph, a: LL, ra: Double, bs: List<LL>, rb: Double, limit: () -> Double) {
+            if (!memory.shared) return
+            for (b in bs) {
+                rc.cancel.check()
+                val key = weightKey(g, a, b)
+                if (memory.isRunning(key)) continue
+                val l = limit()
+                if (remembered(g, a, ra, b, rb, l) != null) continue
+                if (memory.claim(key) != null) continue
+                try { if (remembered(g, a, ra, b, rb, l) == null) search(g, a, ra, b, rb, l) } finally { memory.release(key) }
+            }
         }
 
         /**
@@ -398,14 +551,14 @@ class CrossBorderDirections(
         /** Il peso da [a] a [b] sotto [limit] se la memoria (della richiesta o del servizio) lo sa (+∞: nessun percorso sotto [limit]); null se va cercato. */
         private fun remembered(g: CountryGraph, a: LL, ra: Double, b: LL, rb: Double, limit: Double): Double? {
             val key = weightKey(g, a, b)
-            weights[key]?.let { (w, l) -> if (w.isFinite() || l >= limit) return if (w < limit) w else Double.POSITIVE_INFINITY }
+            memory.get(key)?.let { (w, l) -> if (w.isFinite() || l >= limit) return if (w < limit) w else Double.POSITIVE_INFINITY }
             val qk = quickKey(g, a, ra, b, rb) ?: return null
-            return g.service.quickCache.get(qk, limit)?.also { w -> hits++; weights[key] = w to limit }
+            return g.service.quickCache.get(qk, limit)?.also { w -> hits++; memory.put(key, w, limit) }
         }
 
         /** Ricorda [w] cercato sotto [limit] (+∞ con [limit]: nessun percorso più leggero di [limit]). */
         private fun remember(g: CountryGraph, a: LL, ra: Double, b: LL, rb: Double, w: Double, limit: Double) {
-            weights[weightKey(g, a, b)] = w to limit
+            memory.put(weightKey(g, a, b), w, limit)
             quickKey(g, a, ra, b, rb)?.let { g.service.quickCache.put(it, w, limit) }
         }
 
@@ -506,7 +659,8 @@ class CrossBorderDirections(
         // road to avoid: there the penalty, elsewhere the ban with its landmarks (the penalty in every
         // country took 128 s on the tablet from Lombardy to Bratislava); with none, the ban everywhere
         val started = System.currentTimeMillis()
-        val onRoad = request.coordinates.indices.flatMap { i -> graphs.filter { it.service.onAvoidedRoad(request, i) }.map { it.id } }.toSet()
+        val pool = bestPool
+        val onRoad = request.coordinates.indices.flatMap { i -> pool.filter { it.service.onAvoidedRoad(request, i) }.map { it.id } }.toSet()
         val shut = onRoad + if (shutInCheck) shutIn(request, pointGraph, rc) else emptySet()
         log?.invoke("evita come penalità in: ${shut.ifEmpty { setOf("nessun Paese") }.joinToString()} (${System.currentTimeMillis() - started} ms)")
         rc.stats.addCrossings("dove la penalità ${System.currentTimeMillis() - started} ms")
@@ -536,14 +690,16 @@ class CrossBorderDirections(
         val free = Ctx(request.withAvoidPenalty(false), plain = true, rc = rc)
         val out = LinkedHashSet<String>()
         val last = request.coordinates.lastIndex
+        // solo i grafi del migliore ([bestPool]): un valico verso un Paese aperto solo per le varianti non conta
+        val pool = bestPool
         for ((i, c) in request.coordinates.withIndex()) {
             rc.cancel.check()
             val t0 = System.currentTimeMillis()
             val p = LL(c.first, c.second)
             val radius = request.radiuses?.getOrNull(i)?.takeIf { it > 0 } ?: graphs.first().service.maximumSnappingRadius
             // the point's country as the trip takes it (a point on a road to avoid: already penalised)
-            val hint = pointGraph.getOrNull(i)?.let { id -> graphs.firstOrNull { it.id == id } }
-            val (g, sb) = (if (hint != null) listOf(hint) else graphs.filter { it.graph.graph.bounds.contains(p.lat, p.lon) })
+            val hint = pointGraph.getOrNull(i)?.let { id -> pool.firstOrNull { it.id == id } }
+            val (g, sb) = (if (hint != null) listOf(hint) else pool.filter { it.graph.graph.bounds.contains(p.lat, p.lon) })
                 .mapNotNull { g -> ban.snap(g, p, radius)?.let { g to it } }.minByOrNull { it.second.distance } ?: continue
             if (g.id in out) continue
             val rb = ban.router(g); val r0 = free.router(g)
@@ -551,7 +707,7 @@ class CrossBorderDirections(
             if (!rb.searchesExact) continue
             val s0 = free.snap(g, p, radius) ?: continue
             // the crossings usable with the ban, in both countries
-            val exits = graphs.filter { it !== g && it.graph.graph.bounds.intersects(g.graph.graph.bounds) }
+            val exits = pool.filter { it !== g && it.graph.graph.bounds.intersects(g.graph.graph.bounds) }
                 .flatMap { n -> transfers(g, n).map { n to LL(it.lat, it.lon) } }
                 .filter { (n, l) -> ban.snap(g, l, TRANSFER_RADIUS) != null && ban.snap(n, l, TRANSFER_RADIUS) != null }
                 .map { it.second }
@@ -592,13 +748,17 @@ class CrossBorderDirections(
         val navBudget = nav?.let { rc.cancel.child(navStart + it.budgetMs * 1_000_000) }
         if (nav != null && VariantSource.CROSSING in nav.sources && nav.count > 1) {
             ctx.topK = nav.count; ctx.topFactor = nav.maxFactor
-            ctx.topBudget = rc.cancel.child(navStart + (nav.budgetMs * TOP_BUDGET_SHARE).toLong() * 1_000_000)
+            ctx.topDeadline = navStart + (nav.budgetMs * TOP_BUDGET_SHARE).toLong() * 1_000_000
+            ctx.topBudget = rc.cancel.child(ctx.topDeadline)
+            ctx.navStart = navStart; ctx.navBudgetMs = nav.budgetMs
         }
         val pts = request.coordinates.map { LL(it.first, it.second) }
         val radius = { i: Int -> request.radiuses?.getOrNull(i)?.takeIf { it > 0 } ?: graphs.first().service.maximumSnappingRadius }
+        // il grafo di ogni punto fra quelli del migliore ([bestPool]), come nella richiesta senza i grafi delle varianti
+        val pool = bestPool
         val of = pts.indices.map { i ->
-            val wanted = pointGraph.getOrNull(i)?.let { id -> graphs.firstOrNull { it.id == id } }
-            val g = wanted?.takeIf { ctx.snap(it, pts[i], radius(i)) != null } ?: graphs
+            val wanted = pointGraph.getOrNull(i)?.let { id -> pool.firstOrNull { it.id == id } }
+            val g = wanted?.takeIf { ctx.snap(it, pts[i], radius(i)) != null } ?: pool
                 .filter { it.graph.graph.bounds.contains(pts[i].lat, pts[i].lon) }
                 .mapNotNull { g -> ctx.snap(g, pts[i], radius(i))?.let { s -> g to s.distance } }
                 .minByOrNull { it.second }?.first
@@ -606,7 +766,12 @@ class CrossBorderDirections(
                 "Could not find routable point within a radius of ${radius(i).toLong()} meters of specified coordinate $i: %.7f %.7f.".format(pts[i].lon, pts[i].lat))
         }
         log?.invoke("punti nei grafi: ${of.joinToString { it.id }}")
-        if (of.all { it === of[0] }) return of[0].service.handle(ctx.inGraph(of[0], request), ResponseFormat.GEOJSON, rc)
+        if (of.all { it === of[0] }) {
+            // un Paese solo: con le varianti (fonte V) anche il giro per un Paese vicino (A-B-A), come variante; il migliore resta quello del Paese
+            val around = if (nav != null && ctx.topK > 1 && pts.size == 2 && request.alternatives == null) countryPaths(of[0], of[0], pts[0], pts[1], all = true) else emptyList()
+            if (around.isEmpty()) return of[0].service.handle(ctx.inGraph(of[0], request), ResponseFormat.GEOJSON, rc)
+            return aroundTrip(ctx, request, of[0], around, radius, rc, nav!!, navStart, navBudget!!, started)
+        }
         // alternatives across borders: the via points method (each candidate is a trip like this one)
         if (request.alternatives != null && pts.size == 2) {
             return LongAlternatives(graphs.map { it.graph }, log, cancel = rc.cancel) { r, pg -> route(r, pg, penalized, rc) }.handle(request, of.map { it.id })
@@ -620,7 +785,12 @@ class CrossBorderDirections(
         val blocks = ArrayList<Pair<CountryGraph, IntRange>>()
         run { var s = 0; for (i in 1..pts.size) if (i == pts.size || of[i] !== of[s]) { blocks += of[s] to (s until i); s = i } }
         var twoDone = false
-        if (blocks.size == 3 && oneSearch) {
+        // con le varianti (fonte V) la scelta per confine ([chain]), che registra le altre catene: con la tappa
+        // nel Paese di mezzo i due valichi sono indipendenti, il migliore è lo stesso. Non con una tappa di
+        // passaggio (pass_through) nel Paese di mezzo: il verso d'arrivo dal primo valico condiziona la
+        // ripartenza verso il secondo, i due valichi vanno scelti insieme come nella richiesta del migliore
+        val middlePass = blocks.size == 3 && blocks[1].second.any { request.passThroughAt(it) }
+        if (blocks.size == 3 && oneSearch && (ctx.topK <= 1 || middlePass)) {
             val (g0, r0) = blocks[0]; val (g1, r1) = blocks[1]; val (g2, r2) = blocks[2]
             // solo coi due confini diretti e senza sequenze alternative per un terzo Paese (quelle le pesa chain)
             fun direct(x: CountryGraph, y: CountryGraph, i: Int, j: Int) = countryPaths(x, y, pts[i], pts[j]).let { it.isNotEmpty() && it.all { pa -> pa.size == 2 } }
@@ -689,6 +859,89 @@ class CrossBorderDirections(
             return linkedMapOf("type" to "FeatureCollection", "bbox" to bboxAll, "features" to features, "metadata" to metadata)
         }
         return linkedMapOf("type" to "FeatureCollection", "bbox" to bbox, "features" to listOf(feature), "metadata" to metadata)
+    }
+
+    /**
+     * Il tempo del passo 2 ([Ctx.topBudget]) dopo il passo 1 ([topDeadlineAfter]): un passo 1 lento, col
+     * grafo appena riaperto o la memoria svuotata, non lascia il passo 2 senza tempo, ma il passo 2 non
+     * prende mai più di metà del tempo che resta: l'altra metà, almeno, resta alle fonti M e P.
+     */
+    private fun extendTopBudget(ctx: Ctx) {
+        val d = topDeadlineAfter(ctx.navStart, ctx.navBudgetMs, ctx.topDeadline, System.nanoTime())
+        if (d <= ctx.topDeadline) return
+        log?.invoke("varianti: tempo delle altre catene allungato di ${(d - ctx.topDeadline) / 1_000_000} ms (passo 1 lento)")
+        ctx.topDeadline = d
+        ctx.topBudget = ctx.rc.cancel.child(d)
+    }
+
+    /**
+     * Un viaggio in un Paese solo ([g], due punti) con le varianti: il migliore è quello del Paese
+     * (come [DirectionsService.handle]: lo stesso percorso, gli «evita» come prima), le varianti dei
+     * pezzi (fonti M e P) e in più i giri per i Paesi vicini [around] (A-B-A: la A93/A8 tedesca da
+     * Innsbruck a Salisburgo) come catene della fonte V, pesate come il passo 2 di [chain] (strato
+     * corto, un passaggio per luogo, sotto il tempo delle varianti) entro il tetto di peso delle
+     * varianti; la scelta è quella di [variantsAcross]. Un giro più veloce del migliore resta una variante.
+     */
+    private fun aroundTrip(ctx: Ctx, request: DirectionsRequest, g: CountryGraph, around: List<List<CountryGraph>>, radius: (Int) -> Double,
+                           rc: RequestContext, nav: NavAlternativesOptions, navStart: Long, navBudget: CancelToken, started: Long): Map<String, Any?> {
+        val c0 = request.coordinates[0]; val c1 = request.coordinates[1]
+        val piece = Piece(g, mutableListOf(c0, c1), mutableListOf(radius(0), radius(1)), mutableListOf(false, false),
+            mutableListOf(request.bearings?.getOrNull(0), request.bearings?.getOrNull(1)), mutableListOf(request.passThroughAt(0), request.passThroughAt(1)))
+        val pieces = listOf(piece)
+        val pieceRequests = listOf(g to requestOf(request, piece))
+        lastPieces = pieceRequests
+        // il migliore del Paese (i tratti in cache dopo la richiesta senza varianti) e il suo peso, come quello delle catene
+        val finals = finalPieces(ctx, pieceRequests, rc)
+        val bestW = ctx.pieceWeight(g, pieceRequests[0].second)
+        val bestChoice = ChainChoice(listOf(g), emptyList(), bestW)
+        val picked = ArrayList<ChainChoice>()
+        if (bestW.isFinite()) {
+            val t0 = System.currentTimeMillis(); val q0 = ctx.queries
+            val cap = bestW * ctx.topWeightFactor
+            val prefix = Piece(g, mutableListOf(c0), mutableListOf(radius(0)), mutableListOf(false), mutableListOf(request.bearings?.getOrNull(0)), mutableListOf(request.passThroughAt(0)))
+            val p = LL(c0.first, c0.second); val q = LL(c1.first, c1.second)
+            val found = ArrayList<ChainChoice>()
+            for (path in around) {
+                if (ctx.topBudget?.isCancelled == true) { ctx.topStopped = true; break }
+                val routers = path.distinct().map { ctx.router(it) }
+                val cancels = routers.map { it.cancel }
+                ctx.topBudget?.let { tk -> routers.forEach { it.cancel = tk } }
+                ctx.extraPhase = true
+                val before = found.size
+                try {
+                    dpChain(ctx, prefix, 1..1, radius, p, radius(0), q, radius(1), path, { cap }, { _, _ -> }, found,
+                        layerSize = LAYER_EXTRA, onePerPlace = true, token = ctx.topBudget, maxExact = ctx.topK - 1, together = false, skip = bestChoice)
+                } catch (e: SearchCancelledException) {
+                    if (e.reason != SearchCancelledException.Reason.DEADLINE || rc.cancel.isCancelled) throw e
+                    ctx.topStopped = true
+                } finally { routers.forEachIndexed { i, r -> r.cancel = cancels[i] }; ctx.extraPhase = false }
+                log?.invoke("  varianti: giro ${path.joinToString("-") { it.id }}: ${found.size - before} catene esatte entro ${"%.2f".format(ctx.topWeightFactor)}× del peso")
+            }
+            for (c in found.filter { it.exact < cap }.sortedBy { it.exact }) if (picked.none { it.samePlaces(c) } && picked.size < ctx.topK - 1) picked += c
+            ctx.extraQueries += ctx.queries - q0
+            log?.invoke("varianti: giri per Paesi vicini: ${picked.size}" + picked.joinToString("") { " (${it.text()}: peso ${"%.0f".format(it.exact)}, ${"%+d".format(Math.round((it.exact / bestW - 1) * 100))} %)" } +
+                ", ${ctx.queries - q0} ricerche in ${System.currentTimeMillis() - t0} ms" + if (ctx.topStopped) "; tempo finito" else "")
+        }
+        ctx.chains = listOf(bestChoice) + picked
+        lastChains = ctx.chains.map { ChainInfo(it.path.map { x -> x.id }, it.via, it.exact) }
+        lastWeight = bestW; lastCrossings = emptyList()
+        if (picked.isNotEmpty()) ctx.spans += Span(0, 0, ctx.chains)
+        rc.stats.addCrossings("${g.id} (giri per ${around.joinToString { it[1].id }}): ${ctx.queriesText()} in ${System.currentTimeMillis() - started} ms${ctx.pieceStats()}")
+        val feature = merge(finals.map { featureOf(it) }, request)
+        val metadata = LinkedHashMap<String, Any?>()
+        metadata["attribution"] = g.service.attribution
+        metadata["service"] = "routing"
+        metadata["timestamp"] = System.currentTimeMillis()
+        metadata["query"] = LinkedHashMap<String, Any?>(request.echo).apply { put("profile", request.profile); put("format", "geojson") }
+        metadata["engine"] = g.service.engineInfo()
+        metadata["countries"] = listOf(g.id)
+        val (features, alternatives) = variantsAcross(ctx, request, pieces, pieceRequests, finals, feature, nav, rc, navStart, navBudget)
+        metadata["navmaster"] = linkedMapOf("alternatives" to alternatives)
+        val all = BBox.empty()
+        for (f in features) { val b = f["bbox"] as DoubleArray; all.include(b[1], b[0]); all.include(b[3], b[2]) }
+        val bboxAll = if (features.isEmpty()) doubleArrayOf() else
+            doubleArrayOf(DirectionsService.r6(all.minLon), DirectionsService.r6(all.minLat), DirectionsService.r6(all.maxLon), DirectionsService.r6(all.maxLat))
+        return linkedMapOf("type" to "FeatureCollection", "bbox" to bboxAll, "features" to features, "metadata" to metadata)
     }
 
     /** Un pezzo finale: il grafo, i tratti ([DirectionsService.solveAsHandled]) e la sua feature (null: non ancora costruita, vedi [featureOf]). */
@@ -984,47 +1237,29 @@ class CrossBorderDirections(
         fun sigJson(sig: List<Pair<String, Double>>) = sig.map { linkedMapOf("ref" to it.first, "km" to it.second) }
         fun factor(x: Double) = Math.round(x * 1000) / 1000.0
 
-        // (b) le varianti dei pezzi lunghi, coi valichi fissi
-        val pieceSources = nav.sources - VariantSource.CROSSING
-        if (pieceSources.isNotEmpty()) for ((n, j) in finals.indices.sortedByDescending { finals[it].meters }.withIndex()) {
-            if (tier1() >= want || (n > 0 && finals[j].meters < PIECE_SHARE * totalM)) break
-            val left = leftMs()
-            if (left < MIN_PIECE_BUDGET_MS) { notes += "budget"; break }
-            val f = finals[j]
-            val trip = TripContext(totalMs - f.millis, totalM - f.meters, totalW - f.weight, finals.take(j).sumOf { it.meters })
-            val opt = NavAlternativesOptions(want - tier1() + 1, nav.tier1Factor, nav.maxFactor, left, true, nav.tier1KmFactor, nav.maxKmFactor,
-                nav.allowFewerKm, nav.fill, pieceSources, nav.minDetourScale).withTrace(nav.trace)
-            val prc = RequestContext(rc.cancel, rc.priority, rc.executor, rc.slots, rc.log ?: log, rc.stats.child("varianti ${f.graph.id}"), rc.useCache)
-            val res = NavAlternativesEngine(f.graph.service, prc, trip).run(f.solved.request, opt)
-            summaries += "${f.graph.id}: ${res.summary}"
-            res.note?.let { notes += "${f.graph.id}: $it" }
-            val encoder = f.graph.service.encoder(f.solved.request)
-            for (a in res.variants) {
-                val parts = finals.mapIndexed { i, p -> p.graph to (if (i == j) a.legs else p.solved.legs) }
-                val (sig, _) = labels.refs(parts)
-                val json = LinkedHashMap(res.json(a))
-                json["signature"] = sig.joinToString(" · ") { it.first }; json["refs"] = sigJson(sig)
-                val r = (json["factor"] as Number).toDouble(); val rk = (json["km_factor"] as Number).toDouble()
-                cands += CrossVariant(a.verdict.tier, a.draft.source, a.verdict.score, r, rk, edgesOf(parts), sig.map { it.first }, cands.size, json, a.verdict.local) {
-                    merge(finals.mapIndexed { i, p -> if (i == j) f.graph.service.feature(f.solved.request, a.legs, encoder, null) else featureOf(p) }, request)
-                }
-            }
-        }
-
         // (c) fonte V: le altre catene di valichi di ogni scelta (altri luoghi, altre sequenze di Paesi), coi
-        // loro tratti dalla cache; il livello alla scelta. Le catene della stessa sequenza solo finché mancano
-        // varianti di livello 1; quelle per altri Paesi sempre (costano solo i tratti dalla cache)
+        // loro tratti dalla cache; il livello alla scelta. Quelle per altri Paesi sempre e prima delle varianti
+        // dei pezzi (costano solo i tratti dalla cache: le M e P dei pezzi le lasciavano senza tempo); quelle
+        // della stessa sequenza dopo, solo finché mancano varianti di livello 1
         var crossings = 0; var others = 0; var sameSkipped = 0
         val crossingText = HashMap<CrossVariant, String>()
         val spans = ctx.spans.filter { s -> s.chains.size > 1 && s.chains[0].via.size == s.last - s.first &&
             s.chains[0].via.indices.all { i -> pieces[s.first + i].points.last().let { (la, lo) -> la == s.chains[0].via[i].lat && lo == s.chains[0].via[i].lon } } }
-        if (VariantSource.CROSSING in nav.sources && spans.isNotEmpty()) {
+        fun otherCountriesOf(span: Span, alt: ChainChoice) = alt.path.map { it.id } != (span.first..span.last).map { pieces[it].graph.id }
+        val vOn = VariantSource.CROSSING in nav.sources && spans.isNotEmpty()
+        var vMs = 0L
+        val vrc by lazy { RequestContext(budget, rc.priority, rc.executor, rc.slots, rc.log, rc.stats.child("varianti valichi"), rc.useCache) }
+        /**
+         * Le candidate V delle catene per altri Paesi ([others] vero: prima delle varianti dei pezzi, così
+         * non restano mai senza tempo: i tratti vengono dalla cache) o di quelle negli stessi Paesi (dopo,
+         * solo finché mancano varianti di livello 1).
+         */
+        fun crossingPass(others0: Boolean) {
             val vt0 = System.nanoTime()
-            val vrc = RequestContext(budget, rc.priority, rc.executor, rc.slots, rc.log, rc.stats.child("varianti valichi"), rc.useCache)
             try {
                 for (span in spans) for (alt in span.chains.drop(1)) {
-                    val bestIds = (span.first..span.last).map { pieces[it].graph.id }
-                    val otherCountries = alt.path.map { it.id } != bestIds
+                    val otherCountries = otherCountriesOf(span, alt)
+                    if (otherCountries != others0) continue
                     if (!otherCountries && tier1() >= want) { sameSkipped++; continue }
                     budget.check()
                     // i pezzi della catena: dal prefisso del primo pezzo del migliore, poi i punti del suo ultimo pezzo
@@ -1075,7 +1310,42 @@ class CrossBorderDirections(
                 if (e.reason != SearchCancelledException.Reason.DEADLINE || rc.cancel.isCancelled) throw e
                 notes += "budget"
             }
-            summaries += "V $crossings ($others per altri Paesi" + (if (sameSkipped > 0) ", $sameSkipped non provate: ${tier1()} di livello 1" else "") + ") in ${(System.nanoTime() - vt0) / 1_000_000} ms"
+            vMs += (System.nanoTime() - vt0) / 1_000_000
+        }
+        if (vOn) crossingPass(true)
+
+        // (b) le varianti dei pezzi lunghi, coi valichi fissi
+        val sameLeft = vOn && spans.any { sp -> sp.chains.drop(1).any { !otherCountriesOf(sp, it) } }
+        val pieceSources = nav.sources - VariantSource.CROSSING
+        if (pieceSources.isNotEmpty()) for ((n, j) in finals.indices.sortedByDescending { finals[it].meters }.withIndex()) {
+            if (tier1() >= want || (n > 0 && finals[j].meters < PIECE_SHARE * totalM)) break
+            // con catene V negli stessi Paesi ancora da guardare (dopo), un po' di tempo resta a loro
+            val left = leftMs() - (if (sameLeft) V_RESERVE_MS else 0L)
+            if (left < MIN_PIECE_BUDGET_MS) { notes += "budget"; break }
+            val f = finals[j]
+            val trip = TripContext(totalMs - f.millis, totalM - f.meters, totalW - f.weight, finals.take(j).sumOf { it.meters })
+            val opt = NavAlternativesOptions(want - tier1() + 1, nav.tier1Factor, nav.maxFactor, left, true, nav.tier1KmFactor, nav.maxKmFactor,
+                nav.allowFewerKm, nav.fill, pieceSources, nav.minDetourScale).withTrace(nav.trace)
+            val prc = RequestContext(rc.cancel, rc.priority, rc.executor, rc.slots, rc.log ?: log, rc.stats.child("varianti ${f.graph.id}"), rc.useCache)
+            val res = NavAlternativesEngine(f.graph.service, prc, trip).run(f.solved.request, opt)
+            summaries += "${f.graph.id}: ${res.summary}"
+            res.note?.let { notes += "${f.graph.id}: $it" }
+            val encoder = f.graph.service.encoder(f.solved.request)
+            for (a in res.variants) {
+                val parts = finals.mapIndexed { i, p -> p.graph to (if (i == j) a.legs else p.solved.legs) }
+                val (sig, _) = labels.refs(parts)
+                val json = LinkedHashMap(res.json(a))
+                json["signature"] = sig.joinToString(" · ") { it.first }; json["refs"] = sigJson(sig)
+                val r = (json["factor"] as Number).toDouble(); val rk = (json["km_factor"] as Number).toDouble()
+                cands += CrossVariant(a.verdict.tier, a.draft.source, a.verdict.score, r, rk, edgesOf(parts), sig.map { it.first }, cands.size, json, a.verdict.local) {
+                    merge(finals.mapIndexed { i, p -> if (i == j) f.graph.service.feature(f.solved.request, a.legs, encoder, null) else featureOf(p) }, request)
+                }
+            }
+        }
+
+        if (vOn) {
+            crossingPass(false)
+            summaries += "V $crossings ($others per altri Paesi" + (if (sameSkipped > 0) ", $sameSkipped non provate: ${tier1()} di livello 1" else "") + ") in $vMs ms"
         } else if (VariantSource.CROSSING in nav.sources) summaries += "V no (nessun'altra catena)"
 
         // le tenute, golose: per livello, poi (finché nessuna tenuta passa per altri Paesi) la fonte V per altri Paesi,
@@ -1104,6 +1374,30 @@ class CrossBorderDirections(
             val p = pick ?: break
             chosen += p; left.remove(p); kept += p.edges to p.sig
             if (p.source == VariantSource.CROSSING) { p.json["tier"] = pickTier; p.json["longer"] = pickTier >= 2 && p.r > nav.tier1Factor }
+        }
+        // il posto per un altro Paese anche fra livelli diversi: se nessuna tenuta passa per altri Paesi ma una
+        // candidata V per altri Paesi vale il livello 1 o 2 (sui tenuti senza la tenuta peggiore dei pezzi), prende
+        // l'ultimo posto al posto della tenuta peggiore dei pezzi (l'ultima scelta), se le altre tenute dei pezzi
+        // restano abbastanza lontane da lei. Prima una V di livello 2 perdeva sempre contro tre deviazioni M di livello 1
+        if (want >= 2 && chosen.size == want && chosen.none { it.otherCountries }) {
+            val worst = chosen.lastOrNull { it.source != VariantSource.CROSSING }
+            if (worst != null) {
+                val keptW = kept.filter { it.first !== worst.edges }
+                val rest = chosen.filter { it !== worst }
+                val swap = cands.filter { it.otherCountries && it !in chosen }.mapNotNull { c ->
+                    val (t, w) = judge.tier(c.edges, c.sig, c.r, c.rk, keptW)
+                    if (t !in 1..2) { why[c] = w; return@mapNotNull null }
+                    if (rest.any { o -> o.source != VariantSource.CROSSING && !judge.diverse(o.edges, o.tier, listOf(c.edges)) }) { why[c] = "diversità"; return@mapNotNull null }
+                    Triple(c, t, c.score)
+                }.minWithOrNull(compareBy({ it.second }, { it.third }, { it.first.order }))
+                if (swap != null) {
+                    val (c, t, _) = swap
+                    chosen.remove(worst); chosen += c
+                    kept.removeAll { it.first === worst.edges }; kept += c.edges to c.sig
+                    c.json["tier"] = t; c.json["longer"] = t >= 2 && c.r > nav.tier1Factor
+                    log?.invoke("varianti: posto per altri Paesi: ${crossingText[c]} (livello $t) al posto di ${worst.json["label"]} (${worst.source.json}, livello ${worst.tier})")
+                }
+            }
         }
         for (c in cands) if (c.source == VariantSource.CROSSING) {
             log?.invoke("varianti: ${crossingText[c]}: " + if (c in chosen) "tenuta, livello ${c.json["tier"]}" else "scartata (${why[c]?.ifEmpty { null } ?: "posti finiti"})")
@@ -1141,12 +1435,19 @@ class CrossBorderDirections(
 
     // ------------------------------------------------------------------------------- the borders
 
-    /** Le sequenze di grafi da [a] a [b] (al più due intermedi) che stanno vicino alla linea p → q ([countrySequences]). */
-    private fun countryPaths(a: CountryGraph, b: CountryGraph, p: LL, q: LL): List<List<CountryGraph>> {
-        val byId = graphs.associateBy { it.id }
+    /**
+     * Le sequenze di grafi da [a] a [b] che stanno vicino alla linea p → q ([countrySequences]): fra i
+     * grafi del passo 1 ([bestGraphs], se dati) o, con [all], fra tutti; [extra] sequenze in più per il
+     * passo 2. Con [a] uguale a [b] i giri per un Paese vicino (A-B-A) i cui valichi stanno entro
+     * [AROUND_FACTOR] della linea ([Transfers.aroundOk]).
+     */
+    private fun countryPaths(a: CountryGraph, b: CountryGraph, p: LL, q: LL, extra: Int = 0, all: Boolean = false): List<List<CountryGraph>> {
+        val pool = if (all) graphs else bestGraphs?.let { ids -> graphs.filter { it.id in ids || it === a || it === b } } ?: graphs
+        val byId = pool.associateBy { it.id }
         fun linked(x: String, y: String) = transfers(byId.getValue(x), byId.getValue(y)).isNotEmpty()
-        return countrySequences(graphs.map { it.id }, { byId[it]?.graph?.graph?.bounds }, ::linked, p.lat, p.lon, q.lat, q.lon, a.id, b.id)
+        val seqs = countrySequences(pool.map { it.id }, { byId[it]?.graph?.graph?.bounds }, ::linked, p.lat, p.lon, q.lat, q.lon, a.id, b.id, extra)
             .map { seq -> seq.map { byId.getValue(it) } }
+        return if (a !== b) seqs else seqs.filter { seq -> Transfers.aroundOk(transfers(a, seq[1]), p.lat, p.lon, q.lat, q.lon) }
     }
 
     /** I passaggi da provare su un confine: i migliori per deviazione dalla linea p → q, prima le strade principali. */
@@ -1175,28 +1476,66 @@ class CrossBorderDirections(
             val other = chain(c2, prefix, suffix, radius, gb, together = false)
             log.invoke("  confronto, un valico alla volta: ${other?.joinToString { "%.5f,%.5f".format(it.first.lat, it.first.lon) } ?: "nessuno"} peso ${"%.0f".format(lastWeight)}, ${c2.queries} ricerche, ${System.currentTimeMillis() - t0} ms")
         }
-        var best = Double.POSITIVE_INFINITY
-        var bestChain: List<Pair<Transfer, CountryGraph>>? = null
         val paths = countryPaths(ga, gb, p, q)
         log?.invoke("sequenze ${ga.id} → ${gb.id}: ${paths.joinToString(" | ") { pa -> pa.joinToString("-") { it.id } }}")
-        // le catene esatte trovate (sotto il tetto del momento): il migliore e, per la fonte V, le altre
+        // passo 1: il migliore, ogni sequenza cercata sotto il peso del migliore trovato finora (un tetto
+        // solo), le sequenze divise fra due thread ([sequences]). Per sequenza il suo migliore: il tetto
+        // della sequenza i è il minimo dei migliori delle sequenze fino a i (si migliora solo scendendo
+        // sotto) e, appena sopra, di quelle dopo (a parità vince la sequenza che viene prima, come una
+        // dopo l'altra). Il tetto più basso visto prima non cambia il migliore: un passaggio, uno strato o
+        // una catena scartati perché già sopra il tetto (i pesi rapidi sono limiti inferiori dei pezzi)
+        // non potevano batterlo. Una dopo l'altra (un thread solo) è esattamente il calcolo di prima.
+        val n = paths.size
+        val seqBest = AtomicLongArray(n).also { a -> for (i in 0 until n) a.set(i, Double.POSITIVE_INFINITY.toRawBits()) }
+        val seqChain = AtomicReferenceArray<List<Pair<Transfer, CountryGraph>>?>(n)
+        // le catene esatte trovate (sotto il tetto del momento) di ogni sequenza: il migliore e, per la fonte V, le altre
+        val seqFound = AtomicReferenceArray<List<ChainChoice>>(n)
+        fun ceiling(i: Int): Double {
+            var c = Double.POSITIVE_INFINITY
+            for (k in 0 until n) { val w = Double.fromBits(seqBest.get(k)); val x = if (k <= i) w else Math.nextUp(w); if (x < c) c = x }
+            return c
+        }
+        // il tetto della sequenza i come una dopo l'altra (solo le sequenze fino a i): per le catene di
+        // due Paesi della fonte V ([chooseExactTop]), che il passo 2 non ripesa; la sequenza 0 lo vede infinito anche
+        // se una sequenza dopo, sull'altro thread, ha già un migliore
+        fun ceilingBefore(i: Int): Double {
+            var c = Double.POSITIVE_INFINITY
+            for (k in 0..i) { val w = Double.fromBits(seqBest.get(k)); if (w < c) c = w }
+            return c
+        }
+        sequences(ctx, n) { c, i ->
+            val path = paths[i]
+            // da capo anche dopo un aiutante fermato a metà
+            seqBest.set(i, Double.POSITIVE_INFINITY.toRawBits()); seqChain.set(i, null)
+            val f = ArrayList<ChainChoice>()
+            val sq0 = c.queries; val sh0 = c.hits; val st0 = System.currentTimeMillis()
+            dpChain(c, prefix, suffix, radius, p, rp, q, rq, path, { ceiling(i) },
+                { w, via -> seqChain.set(i, via.mapIndexed { k, tr -> tr to path[k + 1] }); seqBest.set(i, w.toRawBits()) }, f, together = together,
+                exactTopLimit = { ceilingBefore(i) })
+            seqFound.set(i, f)
+            // il costo di ogni sequenza nella scelta del migliore (da misurare sul tablet), col thread che l'ha pesata
+            if (n > 1) log?.invoke("  sequenza ${path.joinToString("-") { it.id }}: ${c.queries - sq0} ricerche (${c.hits - sh0} dalla memoria) in ${System.currentTimeMillis() - st0} ms @${Thread.currentThread().name}")
+        }
+        var best = Double.POSITIVE_INFINITY
+        var bestChain: List<Pair<Transfer, CountryGraph>>? = null
         val found = ArrayList<ChainChoice>()
-        // passo 1: il migliore, ogni sequenza cercata sotto il peso del migliore trovato finora (un tetto solo)
-        for (path in paths) {
-            val sq0 = ctx.queries; val sh0 = ctx.hits; val st0 = System.currentTimeMillis()
-            dpChain(ctx, prefix, suffix, radius, p, rp, q, rq, path, { best }, { w, via -> best = w; bestChain = via.mapIndexed { i, tr -> tr to path[i + 1] } },
-                found, together = together)
-            // il costo di ogni sequenza nella scelta del migliore (da misurare sul tablet)
-            if (paths.size > 1) log?.invoke("  sequenza ${path.joinToString("-") { it.id }}: ${ctx.queries - sq0} ricerche (${ctx.hits - sh0} dalla memoria) in ${System.currentTimeMillis() - st0} ms")
+        for (i in 0 until n) {
+            seqFound.get(i)?.let { found += it }
+            val w = Double.fromBits(seqBest.get(i))
+            val via = seqChain.get(i)
+            if (via != null && w < best) { best = w; bestChain = via }
         }
         lastWeight = best; lastCrossings = bestChain?.map { it.first }.orEmpty()
         ctx.chains = emptyList()
         val chosen = bestChain ?: return null
+        // il tempo del passo 2 dopo un passo 1 lungo (grafo appena riaperto, memoria svuotata): fino a
+        // [TOP_AFTER_SHARE] del tempo dalla fine del passo 1, mai più di metà di quel che resta (il resto alle fonti M e P)
+        if (ctx.topK > 1 && ctx.navBudgetMs > 0) extendTopBudget(ctx)
         val bestChoice = ChainChoice(chosen.map { it.second }.let { listOf(ga) + it }, chosen.map { it.first }, best)
         // passo 2 (solo per le varianti): le altre catene entro topFactor, su ogni sequenza di 3+ grafi
         // (quelle di 2 le ha già date chooseExactTop), strato corto, un passaggio per luogo, sotto il budget
         if (ctx.topK > 1 && best.isFinite()) {
-            val cap = best * ctx.topFactor
+            val cap = best * ctx.topWeightFactor
             val t0 = System.currentTimeMillis()
             val q0 = ctx.queries
             val bestIds = bestChoice.path.map { it.id }
@@ -1207,29 +1546,55 @@ class CrossBorderDirections(
                 for (c in found.filter { it.exact < cap && !it.samePlaces(bestChoice) }.sortedBy { it.exact }) if (out.none { it.samePlaces(c) }) out += c
                 return out
             }
+            /** Le catene di [path] entro il tetto con [c] (sul suo thread), aggiunte a [into]; falso se il tempo è finito. */
+            fun extra(c: Ctx, path: List<CountryGraph>, into: MutableList<ChainChoice>, maxExact: Int): Boolean {
+                val before = into.size
+                // le ricerche rapide si fermano anche a metà alla scadenza delle varianti (non solo fra una e l'altra)
+                val routers = path.map { c.router(it) }
+                val cancels = routers.map { it.cancel }
+                c.topBudget?.let { tk -> routers.forEach { it.cancel = tk } }
+                c.extraPhase = true
+                val done = try {
+                    dpChain(c, prefix, suffix, radius, p, rp, q, rq, path, { cap }, { _, _ -> }, into,
+                        layerSize = LAYER_EXTRA, onePerPlace = true, token = c.topBudget, maxExact = maxExact, together = false, skip = bestChoice)
+                } catch (e: SearchCancelledException) {
+                    if (e.reason != SearchCancelledException.Reason.DEADLINE || c.rc.cancel.isCancelled) throw e
+                    c.topStopped = true; false
+                } finally { routers.forEachIndexed { i, r -> r.cancel = cancels[i] }; c.extraPhase = false }
+                log?.invoke("  varianti: sequenza ${path.joinToString("-") { it.id }}: ${into.size - before} catene esatte entro ${"%.2f".format(ctx.topWeightFactor)}× del peso" +
+                    (if (!done) " (tempo finito)" else "") + " @${Thread.currentThread().name}")
+                return done
+            }
             // prima le altre sequenze di Paesi, per ultima quella del migliore: le sue catene servono solo se
             // mancano varianti (variantsAcross le salta appena le fonti M e P bastano), e non devono consumare
-            // il tempo prima che le altre sequenze siano state guardate
-            for (path in paths.filter { it.size >= 3 }.sortedBy { if (it.map { g -> g.id } == bestIds) 1 else 0 }) {
-                val own = path.map { it.id } == bestIds
+            // il tempo prima che le altre sequenze siano state guardate. Le altre sono indipendenti (ognuna
+            // guarda solo le catene sue già trovate): divise fra due thread, le loro catene in [found]
+            // nell'ordine delle sequenze; a tempo finito nessuna sequenza nuova
+            // oltre alle sequenze del passo 1, per il solo passo 2 qualche sequenza in più (anche coi grafi
+            // fuori dal passo 1, [bestGraphs]), ordinate per lunghezza e deviazione dalla linea
+            val more = countryPaths(ga, gb, p, q, extra = EXTRA_SEQUENCES, all = true).filter { pa -> paths.none { it.map { g -> g.id } == pa.map { g -> g.id } } }
+            if (more.isNotEmpty()) log?.invoke("  varianti: sequenze in più: ${more.joinToString(" | ") { pa -> pa.joinToString("-") { it.id } }}")
+            val longer = (paths + more).filter { it.size >= 3 }
+            val otherPaths = longer.filter { it.map { g -> g.id } != bestIds }
+            val added = AtomicReferenceArray<List<ChainChoice>>(otherPaths.size)
+            val timeUp = java.util.concurrent.atomic.AtomicBoolean(false)
+            sequences(ctx, otherPaths.size, stop = { timeUp.get() }) { c, i ->
+                val path = otherPaths[i]
+                val pid = path.map { it.id }
+                val own = found.filter { ids(it) == pid }
+                val into = ArrayList(own)
+                added.set(i, null)
+                val done = extra(c, path, into, ctx.topK - 1)
+                added.set(i, into.subList(own.size, into.size).toList())
+                if (!done) timeUp.set(true)
+            }
+            for (i in otherPaths.indices) added.get(i)?.let { found += it }
+            val ownPath = longer.firstOrNull { it.map { g -> g.id } == bestIds }
+            if (ownPath != null && !timeUp.get()) {
                 // nella sequenza del migliore solo le catene che mancano ai posti (quelle già trovate li tengono)
-                val maxExact = if (own) ctx.topK - 1 - distinct().size else ctx.topK - 1
-                if (maxExact <= 0) { log?.invoke("  varianti: sequenza ${path.joinToString("-") { it.id }}: posti già pieni"); continue }
-                val before = found.size
-                // le ricerche rapide si fermano anche a metà alla scadenza delle varianti (non solo fra una e l'altra)
-                val routers = path.map { ctx.router(it) }
-                val cancels = routers.map { it.cancel }
-                ctx.topBudget?.let { tk -> routers.forEach { it.cancel = tk } }
-                ctx.extraPhase = true
-                val done = try {
-                    dpChain(ctx, prefix, suffix, radius, p, rp, q, rq, path, { cap }, { _, _ -> }, found,
-                        layerSize = LAYER_EXTRA, onePerPlace = true, token = ctx.topBudget, maxExact = maxExact, together = false, skip = bestChoice)
-                } catch (e: SearchCancelledException) {
-                    if (e.reason != SearchCancelledException.Reason.DEADLINE || ctx.rc.cancel.isCancelled) throw e
-                    ctx.topStopped = true; false
-                } finally { routers.forEachIndexed { i, r -> r.cancel = cancels[i] }; ctx.extraPhase = false }
-                log?.invoke("  varianti: sequenza ${path.joinToString("-") { it.id }}: ${found.size - before} catene esatte entro ${"%.2f".format(ctx.topFactor)}×" + if (!done) " (tempo finito)" else "")
-                if (!done) break
+                val maxExact = ctx.topK - 1 - distinct().size
+                if (maxExact <= 0) log?.invoke("  varianti: sequenza ${ownPath.joinToString("-") { it.id }}: posti già pieni")
+                else extra(ctx, ownPath, found, maxExact)
             }
             // le altre: prima la più leggera di ogni altra sequenza di Paesi (i loro posti), poi le altre in ordine di peso
             val others = distinct()
@@ -1243,6 +1608,53 @@ class CrossBorderDirections(
         } else ctx.chains = listOf(bestChoice)
         lastChains = ctx.chains.map { ChainInfo(it.path.map { g -> g.id }, it.via, it.exact) }
         return chosen
+    }
+
+    /**
+     * Le voci 0 until [n] (le sequenze di Paesi di [chain]) su questo thread con [ctx] e, col posto da
+     * aiutante ([helperSlot]) e [parallelSequences], anche sull'aiutante con un contesto suo
+     * ([Ctx.fork]: router e contatori suoi, i pesi rapidi in comune): ogni thread prende la prima voce
+     * libera finché [stop] non dice basta. Una voce interrotta sull'aiutante (prelazionato: il lavoro
+     * BACKGROUND lascia il posto a una richiesta MAIN) torna libera e la rifà da capo questo thread
+     * ([work] deve poterla rifare da capo). Senza posto (o con un executor che rifiuta il lavoro): in
+     * ordine su questo thread, con [stop] fra una voce e l'altra. Torna con l'aiutante fermo e i suoi
+     * conteggi in [ctx] ([Ctx.absorb]).
+     */
+    private fun sequences(ctx: Ctx, n: Int, stop: () -> Boolean = { false }, work: (Ctx, Int) -> Unit) {
+        val slot = if (n >= 2 && parallelSequences) helperSlot(ctx.rc, ctx.rc.cancel) else null
+        if (slot == null) {
+            for (i in 0 until n) { if (stop()) break; work(ctx, i) }
+            return
+        }
+        // per voce: 0 libera, 1 in corso, 2 fatta
+        val state = IntArray(n)
+        fun take(): Int = synchronized(state) {
+            if (stop()) return -1
+            val i = state.indexOfFirst { it == 0 }
+            if (i >= 0) state[i] = 1
+            i
+        }
+        fun loop(c: Ctx) {
+            while (true) {
+                val i = take()
+                if (i < 0) return
+                try { work(c, i) } catch (t: Throwable) { synchronized(state) { state[i] = 0 }; throw t }
+                synchronized(state) { state[i] = 2 }
+            }
+        }
+        val helper = AtomicReference<Ctx?>(null)
+        val wasShared = ctx.shared
+        ctx.shared = true
+        try {
+            onTwoThreads(ctx.rc, ctx.rc.cancel, slot, { _ -> loop(ctx) }, { t ->
+                // l'aiutante mai partito o fermato: le voci che restano su questo thread
+                if (t === ctx.rc.cancel) loop(ctx)
+                else loop(ctx.fork(t, ctx.topBudget?.let { t.child(ctx.topDeadline) }).also { helper.set(it) })
+            })
+        } finally {
+            ctx.shared = wasShared
+            helper.get()?.let { ctx.absorb(it) }
+        }
     }
 
     /**
@@ -1260,9 +1672,12 @@ class CrossBorderDirections(
     private fun dpChain(ctx: Ctx, prefix: Piece, suffix: IntRange, radius: (Int) -> Double, p: LL, rp: Double, q: LL, rq: Double, path: List<CountryGraph>,
                         limit: () -> Double, improve: (Double, List<Transfer>) -> Unit, found: MutableList<ChainChoice>,
                         layerSize: Int = LAYER, onePerPlace: Boolean = false, token: CancelToken? = null, maxExact: Int = Int.MAX_VALUE,
-                        together: Boolean = false, skip: ChainChoice? = null): Boolean {
+                        together: Boolean = false, skip: ChainChoice? = null, exactTopLimit: () -> Double = limit): Boolean {
         fun stopped(): Boolean { if (token == null || !token.isCancelled) return false; ctx.rc.cancel.check(); ctx.topStopped = true; return true }
         var exacts = 0
+        // un giro per un Paese vicino (A-B-A): si rientra a un altro valico (allo stesso sarebbe il percorso del Paese)
+        val around = path.size == 3 && path[0] === path[2]
+        fun sameAround(a: Transfer, b: Transfer) = around && DistanceCalc.haversine(a.lat, a.lon, b.lat, b.lon) < Transfers.PLACE
         /** Vero se [exact] su [via] non farebbe niente (il migliore o una catena già trovata negli stessi luoghi). */
         fun known(via: List<Transfer>): Boolean {
             if (skip == null && !onePerPlace) return false
@@ -1314,7 +1729,9 @@ class CrossBorderDirections(
             }
             // due Paesi: fra tutti i passaggi del confine, pesati come i pezzi finali (sotto, uno alla volta quando non si può)
             if (together && path.size == 2) {
-                val cs = chooseExactTop(ctx, prefix, suffix, radius, to, cands, limit(), ctx.topK, ctx.topFactor)
+                // con le varianti il tetto come una dopo l'altra ([exactTopLimit]): le catene dirette restano candidate V
+                // anche quando una sequenza più lunga, sull'altro thread, ha già un migliore; il migliore resta sotto [limit]
+                val cs = chooseExactTop(ctx, prefix, suffix, radius, to, cands, if (ctx.topK > 1) maxOf(limit(), exactTopLimit()) else limit(), ctx.topK, ctx.topWeightFactor)
                 if (cs != null) {
                     if (ctx.topK > 1) { ctx.top = cs; for (c in cs) if (c.transfer != null && c.weight.isFinite()) found += ChainChoice(path, listOf(c.transfer), c.weight) }
                     val c = cs.first()
@@ -1322,6 +1739,8 @@ class CrossBorderDirections(
                     return true
                 }
             }
+            // due thread su sequenze dallo stesso primo confine: il primo strato diviso fra loro (gli stessi pesi)
+            if (k == 1 && path.size > 2 && token == null) ctx.warm(from, p, rp, cands.map { LL(it.lat, it.lon) }, TRANSFER_RADIUS, limit)
             val next = ArrayList<Triple<Transfer, Double, List<Transfer>>>()
             for (t in cands) {
                 val tl = LL(t.lat, t.lon)
@@ -1338,7 +1757,7 @@ class CrossBorderDirections(
                         if (total < limit()) exact(listOf(t)) ?: return false
                         continue
                     }
-                } else if (layerManyToOne) {
+                } else if (layerManyToOne && !around) {
                     // da tutto lo strato a questo passaggio: una ricerca sola all'indietro (stesso risultato
                     // delle ricerche una per voce, che erano 8 per candidato)
                     if (layer.first().second >= limit()) continue
@@ -1347,6 +1766,7 @@ class CrossBorderDirections(
                     if (i >= 0) { w = x; via = layer[i].third + t }
                 } else for ((pt, pw, pc) in layer) {
                     if (pw >= limit() || pw >= w) continue
+                    if (sameAround(pt, t)) continue
                     if (stopped()) return false
                     val x = pw + ctx.weight(from, LL(pt.lat, pt.lon), TRANSFER_RADIUS, tl, TRANSFER_RADIUS, minOf(limit(), w) - pw)
                     if (x < w) { w = x; via = pc + t }
@@ -1610,7 +2030,7 @@ class CrossBorderDirections(
         val inM2 = c12.map { ctx.snap(gMid, LL(it.lat, it.lon), TRANSFER_RADIUS)!! }
         val inE = c12.map { ctx.snap(gEnd, LL(it.lat, it.lon), TRANSFER_RADIUS)!! }
         val t0 = System.currentTimeMillis()
-        twoChoices++
+        synchronized(this) { twoChoices++ }
         fun pieceA(x: Transfer) = request.withPoints(prefix.points + (x.lat to x.lon), (prefix.radiuses + TRANSFER_RADIUS).toDoubleArray(), (prefix.exact + true).toBooleanArray(), prefix.bearings + null,
             (prefix.passThrough + false).toBooleanArray())
         fun pieceMid(x: Transfer, y: Transfer): DirectionsRequest {
@@ -2000,36 +2420,73 @@ class CrossBorderDirections(
         /** Sotto questo tempo rimasto non si cercano le varianti di un altro pezzo (ms). */
         const val MIN_PIECE_BUDGET_MS = 1_000L
         /**
+         * La scadenza del passo 2 ([Ctx.topDeadline], `System.nanoTime`) alla fine del passo 1 ([now]):
+         * mai prima di [topDeadline]; dopo, al più [TOP_AFTER_SHARE] di [budgetMs] da [now] e al più
+         * metà del tempo che resta fino a [budgetMs] da [navStart] (l'altra metà, almeno, alle fonti M
+         * e P dei pezzi), mai oltre [budgetMs] meno [MIN_PIECE_BUDGET_MS]. Un passo 1 che finisce entro
+         * (TOP_BUDGET_SHARE − TOP_AFTER_SHARE) del tempo non allunga nulla: alle fonti M e P resta tutto
+         * il loro tempo, come senza allungamento.
+         */
+        fun topDeadlineAfter(navStart: Long, budgetMs: Long, topDeadline: Long, now: Long): Long {
+            val end = navStart + budgetMs * 1_000_000
+            val want = minOf(now + (budgetMs * TOP_AFTER_SHARE).toLong() * 1_000_000, now + (end - now).coerceAtLeast(0) / 2,
+                end - MIN_PIECE_BUDGET_MS * 1_000_000)
+            return maxOf(topDeadline, want)
+        }
+
+        /** Il tempo lasciato alle catene V negli stessi Paesi dopo le varianti dei pezzi (ms). */
+        const val V_RESERVE_MS = 3_000L
+        /**
          * La quota di `budget_ms` per la parte della scelta dei valichi che serve solo alla fonte V
          * ([Ctx.topBudget]: il passo 2 di [chain], gli extra di [chooseExactTop]), che viene prima
          * delle varianti dei pezzi: il resto resta alle fonti M e P (sul tablet 10 s su 25).
          */
         const val TOP_BUDGET_SHARE = 0.6
+        /**
+         * Dopo un passo 1 lento il passo 2 ha fino a questa quota di `budget_ms` dalla sua fine, e non
+         * più di metà del tempo che resta ([topDeadlineAfter], [extendTopBudget]).
+         */
+        const val TOP_AFTER_SHARE = 0.2
         /** Lo strato della programmazione dinamica ai confini intermedi ([dpChain]): per il migliore, e per le altre catene della fonte V. */
         const val LAYER = 8
         const val LAYER_EXTRA = 3
+        /** Ogni quanto l'attesa di un peso in corso sull'altro thread ([Ctx.weight]) controlla l'annullamento (ms). */
+        const val WAIT_MS = 50L
 
         /**
-         * Le sequenze di grafi da [from] a [to] fra gli [ids] (al più 4 grafi, nessuna ripetizione):
+         * Le sequenze di grafi da [from] a [to] fra gli [ids] (al più 4 grafi, nessuna ripetizione;
+         * solo se nessuna di 4 c'è, 5 e poi [MAX_GRAPHS]: Italia → Svezia, Bulgaria, Lituania):
          * un grafo entra se il suo rettangolo ([bounds], null: mai) sta entro `0,35·crow + 60 km`
          * dalla linea p → q (l'arrivo sempre), ogni passo fra rettangoli che si intersecano e grafi
          * [linked] (valichi non vuoti). Al più 6: le prime 6 per lunghezza nell'ordine degli [ids]
          * (lo stesso insieme di sempre), messe prima le più corte, poi quelle coi centri dei
-         * rettangoli dei grafi intermedi meno lontani dalla linea (cambia solo l'ordine di esame).
+         * rettangoli dei grafi intermedi meno lontani dalla linea (cambia solo l'ordine di esame);
+         * poi, con [extra] (solo il passo 2 delle varianti), fino a [extra] escluse, per lunghezza e
+         * deviazione. Con [from] uguale a [to] i giri A-B-A per un Paese vicino (al più [AROUND_MAX]).
          * La stessa regola nell'app (quali grafi aprire) e nel motore ([countryPaths]: quali pesare).
          */
         fun countrySequences(ids: List<String>, bounds: (String) -> BBox?, linked: (String, String) -> Boolean,
-                             pLat: Double, pLon: Double, qLat: Double, qLon: Double, from: String, to: String): List<List<String>> {
+                             pLat: Double, pLon: Double, qLat: Double, qLon: Double, from: String, to: String, extra: Int = 0): List<List<String>> {
             val crow = DistanceCalc.haversine(pLat, pLon, qLat, qLon)
             val reach = crow * 0.35 + 60_000.0
             val boxes = HashMap<String, BBox?>()
             fun box(id: String) = boxes.getOrPut(id) { bounds(id)?.takeIf { it.isValid } }
             fun near(id: String) = box(id)?.let { distanceToBox(pLat, pLon, qLat, qLon, it) <= reach } == true
+            fun deviation(seq: List<String>) = seq.drop(1).dropLast(1).sumOf { id ->
+                box(id)?.let { b -> distanceToSegment(pLat, pLon, qLat, qLon, (b.minLat + b.maxLat) / 2, (b.minLon + b.maxLon) / 2) } ?: 0.0 }
+            // un Paese solo: i giri per un Paese vicino A-B-A (B vicino alla linea, rettangoli che si toccano, valichi), per deviazione
+            if (from == to) {
+                if (from !in ids) return emptyList()
+                val fb = box(from) ?: return emptyList()
+                return ids.filter { g -> g != from && near(g) && box(g)?.let { fb.intersects(it) } == true && linked(from, g) }
+                    .map { listOf(from, it, from) }.sortedBy { deviation(it) }.take(AROUND_MAX)
+            }
             val out = ArrayList<List<String>>()
+            var maxGraphs = 4
             fun walk(path: List<String>) {
                 val last = path.last()
                 if (last == to) { out += path; return }
-                if (path.size >= 4) return
+                if (path.size >= maxGraphs) return
                 val lb = box(last) ?: return
                 for (g in ids) {
                     if (g in path) continue
@@ -2040,13 +2497,32 @@ class CrossBorderDirections(
                     walk(path + g)
                 }
             }
-            if (from in ids && to in ids) walk(listOf(from))
+            if (from in ids && to in ids) {
+                walk(listOf(from))
+                // nessuna sequenza di al più 4 grafi (Italia → Svezia, Bulgaria, Lituania): 5, poi 6 grafi.
+                // Dove una sequenza corta c'è, l'insieme è quello di sempre (il migliore non cambia)
+                while (out.isEmpty() && maxGraphs < MAX_GRAPHS) { maxGraphs++; walk(listOf(from)) }
+            }
             // le prime 6 per lunghezza nell'ordine dei grafi (l'insieme di sempre: il migliore non cambia), poi
             // prima le sequenze più corte, poi quelle che deviano meno dalla linea (i centri dei grafi intermedi)
-            fun deviation(seq: List<String>) = seq.drop(1).dropLast(1).sumOf { id ->
-                box(id)?.let { b -> distanceToSegment(pLat, pLon, qLat, qLon, (b.minLat + b.maxLat) / 2, (b.minLon + b.maxLon) / 2) } ?: 0.0 }
-            return out.sortedBy { it.size }.take(6).sortedWith(compareBy({ it.size }, { deviation(it) }))
+            val first = out.sortedBy { it.size }.take(6)
+            val base = first.sortedWith(compareBy({ it.size }, { deviation(it) }))
+            if (extra <= 0) return base
+            // [extra] in più (solo il passo 2 delle varianti): le escluse, per lunghezza e deviazione
+            return base + out.filter { s -> first.none { it === s } }.sortedWith(compareBy({ it.size }, { deviation(it) })).take(extra)
         }
+
+        /** I grafi al più di una sequenza di Paesi quando nessuna di 4 c'è ([countrySequences]). */
+        const val MAX_GRAPHS = 6
+        /** Le sequenze in più del solo passo 2 di [chain] (fonte V), oltre alle 6 del passo 1. */
+        const val EXTRA_SEQUENCES = 3
+        /** I giri per un Paese vicino (A-B-A) al più, per un viaggio in un Paese solo. */
+        const val AROUND_MAX = 2
+        /**
+         * Un giro per un Paese vicino si guarda se due suoi valichi t1, t2 (in luoghi diversi) stanno
+         * entro questo fattore della linea: crow(p,t1) + crow(t1,t2) + crow(t2,q) ≤ 1,2·crow(p,q).
+         */
+        const val AROUND_FACTOR = 1.2
 
         /** Distanza (m, approssimata) fra il segmento p → q e un rettangolo. */
         private fun distanceToBox(pLat: Double, pLon: Double, qLat: Double, qLon: Double, b: BBox): Double {

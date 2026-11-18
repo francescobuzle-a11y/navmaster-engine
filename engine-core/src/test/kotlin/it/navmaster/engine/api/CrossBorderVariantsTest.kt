@@ -5,7 +5,12 @@ import it.navmaster.engine.routing.CorridorAnalyzer
 import it.navmaster.engine.routing.EdgeInfo
 import it.navmaster.engine.routing.PointNotFoundException
 import it.navmaster.engine.util.DistanceCalc
+import it.navmaster.engine.routing.CancelToken
 import java.util.Random
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -257,7 +262,8 @@ class CrossBorderVariantsTest {
             // il riferimento: lo stesso viaggio coi soli grafi dell'altra sequenza
             val ref = five.only(otherSeq)
             val refW = try { ref.handle(DirectionsRequest.fromJson("driving-hgv", body), countries); ref.lastWeight } catch (e: ApiException) { Double.POSITIVE_INFINITY }
-            val cap = bestW * opt.maxFactor
+            // il tetto di peso del passo 2: lo stesso margine della fonte P (1 + 1,2·(max_factor − 1))
+            val cap = bestW * (1 + PenaltyCandidates.CAP_SLACK * (opt.maxFactor - 1))
             // la richiesta delle varianti (sola fonte V)
             val rc = RequestContext()
             val doc = cb.handle(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(opt), countries, rc)
@@ -601,5 +607,148 @@ class CrossBorderVariantsTest {
         }
         println("valico condiviso col primo punto del luogo più caro: $valid semi validi su $tried provati")
         assertTrue(valid >= 2, "semi validi: $valid su $tried")
+    }
+
+    // ------------------------------------------------------------- le sequenze di Paesi su due thread
+
+    /**
+     * L'esito di un viaggio tra Paesi: le feature (o l'errore), il peso, i valichi e la sequenza del
+     * migliore, il registro.
+     */
+    private class Outcome(val doc: String, val weight: Double, val crossings: List<Pair<Double, Double>>, val seq: List<String>?, val logs: List<String>) {
+        val key get() = listOf(doc, crossings, seq)
+    }
+
+    /**
+     * Lo stesso migliore: feature, valichi e sequenza identici, il peso entro 1e-6 relativo (lo stesso
+     * percorso pesato per un'altra strada, i pezzi esatti o i pesi di chooseTwo sotto un altro tetto,
+     * differisce nelle ultime cifre, come già oggi fra un ordine delle sequenze e un altro).
+     */
+    private fun assertSameBest(want: Outcome, got: Outcome, what: String) {
+        assertEquals(want.key, got.key, what)
+        assertTrue((want.weight.isInfinite() && got.weight.isInfinite()) || Math.abs(want.weight - got.weight) <= 1e-6 * want.weight, "$what: peso ${got.weight} invece di ${want.weight}")
+    }
+
+    /**
+     * Il viaggio [pts] da a a d con i valichi [pairs] su un servizio nuovo (cache vuote, così ogni
+     * modo cerca davvero), col contesto [rc]; [nav]: le varianti (la prima feature è il migliore).
+     */
+    private fun crossTrip(pairs: Map<Set<String>, List<Transfer>>, pts: List<Pair<Double, Double>>, rc: RequestContext, nav: NavAlternativesOptions? = null): Outcome {
+        val service = DirectionsService(g)
+        val logs = java.util.Collections.synchronizedList(ArrayList<String>())
+        val cb = CrossBorderDirections(listOf("a", "b", "c", "d", "e").map { CountryGraph(it, service) }, { x, y -> pairs[setOf(x.id, y.id)] ?: emptyList() }, { logs += it })
+        val req = DirectionsRequest.fromJson("driving-hgv", Heidelberg.body(pts, ""","navmaster":{"roads":true}""")).let { if (nav == null) it else it.withNavAlternatives(nav) }
+        val doc = try {
+            val fs = features(cb.handle(req, listOf("a", "d"), rc))
+            Json.stringify(if (nav == null) fs else listOf(withoutVariant(fs[0])))
+        } catch (e: ApiException) { "errore ${e.code}: ${e.message}" }
+        return Outcome(doc, cb.lastWeight, cb.lastCrossings.map { it.lat to it.lon }, cb.lastChains.firstOrNull()?.countries, synchronized(logs) { logs.toList() })
+    }
+
+    /**
+     * Il passo 1 di [CrossBorderDirections.chain] con le sequenze divise fra il thread della richiesta
+     * e l'aiutante: lo stesso migliore (feature, peso, valichi, sequenza) che una dopo l'altra, con e
+     * senza le cache, con un executor che rifiuta il lavoro, con le varianti (topK 4: anche il passo 2
+     * su due thread). Cinque Paesi finti su Heidelberg: a-b-c-d e a-b-e-d (lo stesso primo confine, il
+     * primo strato diviso fra i due thread) e, a semi pari, anche a-c e b-d (fino a 5 sequenze, di 3
+     * e 4 Paesi: anche i due valichi insieme di chooseTwo).
+     */
+    @Test
+    fun `country sequences on two threads - the same best as one after the other`() {
+        val pool = Executors.newFixedThreadPool(1) { r -> Thread(r, "aiutante").apply { isDaemon = true } }
+        val refusing = Executors.newSingleThreadExecutor().also { it.shutdown() }
+        var trips = 0; var onHelper = 0; var multi = 0; var maxSeq = 0; var sameChains = 0; var variantTrips = 0; var step2OnHelper = 0; var qSeq = 0; var qPar = 0
+        try {
+            for (seed in 1L..22L) {
+                val five = Five(DirectionsService(g), seed)
+                val rich = seed % 2 == 0L
+                val pairs = if (!rich) five.pairs else five.pairs + mapOf(setOf("a", "c") to crossings(26 + seed * 10, 3), setOf("b", "d") to crossings(27 + seed * 10, 3))
+                val pts = Heidelberg.points(2, seed + 900)
+                for (useCache in listOf(true, false)) {
+                    val seq = crossTrip(pairs, pts, RequestContext(useCache = useCache))
+                    if (seq.doc.startsWith("errore")) continue
+                    trips++
+                    val par = crossTrip(pairs, pts, RequestContext(executor = pool, slots = SearchSlots(2), useCache = useCache))
+                    val rej = crossTrip(pairs, pts, RequestContext(executor = refusing, slots = SearchSlots(2), useCache = useCache))
+                    assertSameBest(seq, par, "seme $seed, cache $useCache: due thread contro uno")
+                    assertSameBest(seq, rej, "seme $seed, cache $useCache: executor che rifiuta")
+                    val seqLines = par.logs.filter { it.startsWith("  sequenza ") }
+                    // le ricerche del viaggio: con due thread il primo strato comune non si rifà (Ctx.warm, attesa dei pesi in corso)
+                    fun total(o: Outcome) = o.logs.lastOrNull { it.startsWith("viaggio tra Paesi") }?.let { queries(it).first } ?: 0
+                    if (!useCache) { qSeq += total(seq); qPar += total(par) }
+                    if (seqLines.size > 1) multi++
+                    maxSeq = maxOf(maxSeq, seqLines.size)
+                    onHelper += seqLines.count { it.endsWith("@aiutante") }
+                    assertTrue(rej.logs.none { it.endsWith("@aiutante") }, "executor che rifiuta: ${rej.logs}")
+                    if (useCache) println("seme $seed${if (rich) " (5 Paesi, più sequenze)" else ""}: ${seq.seq?.joinToString("-")} peso %.1f; ".format(seq.weight) + seqLines.joinToString(" | ") { it.trim() })
+                }
+                // le varianti (passo 2 sulle altre sequenze, anche su due thread): il migliore identico
+                val opt = NavAlternativesOptions(count = 4, tier1Factor = 1.1, maxFactor = 1.2, sources = setOf(VariantSource.CROSSING), minDetourScale = 0.02, budgetMs = 60_000)
+                val vSeq = crossTrip(pairs, pts, RequestContext(), opt)
+                if (vSeq.doc.startsWith("errore")) continue
+                variantTrips++
+                val vPar = crossTrip(pairs, pts, RequestContext(executor = pool, slots = SearchSlots(2)), opt)
+                assertSameBest(vSeq, vPar, "seme $seed, varianti: due thread contro uno")
+                step2OnHelper += vPar.logs.count { it.startsWith("  varianti: sequenza ") && it.endsWith("@aiutante") }
+                // le catene oltre il migliore possono cambiare solo per il tetto visto prima (contate, non richieste)
+                if (vSeq.logs.lastOrNull { it.startsWith("varianti: catene oltre") }?.substringBefore(", ") == vPar.logs.lastOrNull { it.startsWith("varianti: catene oltre") }?.substringBefore(", ")) sameChains++
+            }
+        } finally { pool.shutdown(); pool.awaitTermination(10, TimeUnit.SECONDS) }
+        println("sequenze su due thread: $trips viaggi, $multi con più sequenze (al più $maxSeq), $onHelper sequenze pesate dall'aiutante; varianti: catene uguali in $sameChains viaggi su $variantTrips, $step2OnHelper sequenze del passo 2 sull'aiutante; ricerche senza cache: $qSeq una dopo l'altra, $qPar su due thread")
+        assertTrue(trips >= 20, "viaggi: $trips")
+        assertTrue(maxSeq >= 4, "sequenze: al più $maxSeq")
+        assertTrue(onHelper > 0, "nessuna sequenza sull'aiutante")
+        assertTrue(step2OnHelper > 0, "nessuna sequenza del passo 2 sull'aiutante")
+    }
+
+    /**
+     * Il lavoro in sottofondo (BACKGROUND) lascia il posto da aiutante a una richiesta MAIN
+     * (prelazione, anche a metà di una sequenza): la sequenza torna al thread della richiesta e si
+     * rifà da capo; il migliore non cambia.
+     */
+    @Test
+    fun `country sequences on two threads - a preempted helper leaves the same best`() {
+        val pool = Executors.newCachedThreadPool { r -> Thread(r, "aiutante").apply { isDaemon = true } }
+        var trips = 0; var preempted = 0
+        try {
+            for (seed in 1L..12L) {
+                val five = Five(DirectionsService(g), seed)
+                val pairs = five.pairs + mapOf(setOf("a", "c") to crossings(26 + seed * 10, 3), setOf("b", "d") to crossings(27 + seed * 10, 3))
+                val pts = Heidelberg.points(2, seed + 900)
+                val seq = crossTrip(pairs, pts, RequestContext(useCache = false))
+                if (seq.doc.startsWith("errore")) continue
+                trips++
+                for (delayMicros in listOf(200L, 1_000L, 3_000L)) {
+                    val slots = SearchSlots(2)
+                    val running = AtomicBoolean(false)
+                    val stops = java.util.concurrent.atomic.AtomicInteger()
+                    val mains = ArrayList<Thread>()
+                    // ogni aiutante, poco dopo la partenza, trova una richiesta MAIN che chiede un posto: lo lascia (PREEMPTED)
+                    val executor = object : java.util.concurrent.AbstractExecutorService() {
+                        override fun execute(command: Runnable) {
+                            pool.execute { running.set(true); try { command.run() } finally { running.set(false) } }
+                            mains += thread(isDaemon = true) {
+                                Thread.sleep(delayMicros / 1000, ((delayMicros % 1000) * 1000).toInt())
+                                if (running.get()) stops.incrementAndGet()
+                                slots.primary(RequestContext.MAIN, CancelToken.NEVER) { }
+                            }
+                        }
+                        override fun shutdown() {}
+                        override fun shutdownNow(): MutableList<Runnable> = mutableListOf()
+                        override fun isShutdown() = false
+                        override fun isTerminated() = false
+                        override fun awaitTermination(timeout: Long, unit: TimeUnit) = true
+                    }
+                    val par = crossTrip(pairs, pts, RequestContext(priority = RequestContext.BACKGROUND, executor = executor, slots = slots, useCache = false))
+                    mains.forEach { it.join(5_000) }
+                    assertSameBest(seq, par, "seme $seed, prelazione dopo $delayMicros µs")
+                    assertEquals(0, slots.inUse, "posti lasciati")
+                    preempted += stops.get()
+                }
+            }
+        } finally { pool.shutdown(); pool.awaitTermination(10, TimeUnit.SECONDS) }
+        println("prelazione: $trips viaggi, $preempted aiutanti fermati a metà")
+        assertTrue(trips >= 8, "viaggi: $trips")
+        assertTrue(preempted > 0, "nessun aiutante fermato")
     }
 }

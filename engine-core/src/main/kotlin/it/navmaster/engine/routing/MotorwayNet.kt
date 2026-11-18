@@ -126,6 +126,12 @@ class MotorwayNet internal constructor(
     val region: Region, val truncated: Boolean,
     val nodeLat: DoubleArray = DoubleArray(0), val nodeLon: DoubleArray = DoubleArray(0),
     val access: List<Circle> = emptyList(), val arcKind: ByteArray = ByteArray(0), val accessCapped: Boolean = false,
+    /**
+     * La «rete principale» ([build] con `mainRoads`): anche le strade primarie (rampe comprese) sono
+     * archi [KIND_MAJOR] in tutta la regione, non solo nei cerchi d'accesso. Per le richieste che
+     * evitano autostrade o pedaggi o col migliore su poca autostrada (le statali alternative).
+     */
+    val mainRoads: Boolean = false,
 ) {
     val nodeCount: Int get() = nodeGraph.size
     val arcCount: Int get() = arcTail.size
@@ -206,8 +212,8 @@ class MotorwayNet internal constructor(
          * Alla fine, con le svolte del profilo, le svolte vietate fra archi della rete ([turnBans]).
          */
         fun build(a: DetourAccess, seeds: IntArray, region: Region, maxArcs: Int = 250_000, cancel: CancelToken = CancelToken.NEVER,
-                  counts: IntArray? = null, access: List<Circle> = emptyList(), maxAccessArcs: Int = MAX_ACCESS_ARCS): MotorwayNet =
-            grow(a, null, seeds, region, maxArcs, cancel, counts, access, maxAccessArcs)
+                  counts: IntArray? = null, access: List<Circle> = emptyList(), maxAccessArcs: Int = MAX_ACCESS_ARCS, mainRoads: Boolean = false): MotorwayNet =
+            grow(a, null, seeds, region, maxArcs, cancel, counts, access, maxAccessArcs, mainRoads)
 
         /**
          * La rete autostradale [base] (senza strade d'accesso, con le regole di [a]: della cache)
@@ -221,14 +227,14 @@ class MotorwayNet internal constructor(
                        cancel: CancelToken = CancelToken.NEVER, counts: IntArray? = null, maxAccessArcs: Int = MAX_ACCESS_ARCS): MotorwayNet {
             require(base.access.isEmpty()) { "rete di base con strade d'accesso" }
             if (access.isEmpty() || base.truncated || base.nodeLat.size != base.nodeCount) return base
-            return grow(a, base, seeds, need, maxArcs, cancel, counts, access, maxAccessArcs)
+            return grow(a, base, seeds, need, maxArcs, cancel, counts, access, maxAccessArcs, base.mainRoads)
         }
 
         /** La chiave di una svolta dall'arco [inArc] all'arco [outArc] della rete ([turnBans]). */
         fun pairKey(inArc: Int, outArc: Int): Long = (inArc.toLong() shl 32) or (outArc.toLong() and 0xffffffffL)
 
         private fun grow(a: DetourAccess, base: MotorwayNet?, seeds: IntArray, region: Region, maxArcs: Int, cancel: CancelToken,
-                         counts: IntArray?, access: List<Circle>, maxAccessArcs: Int): MotorwayNet {
+                         counts: IntArray?, access: List<Circle>, maxAccessArcs: Int, mainRoads: Boolean = false): MotorwayNet {
             val g = a.graph; val sh = a.shared; val w = a.weighting
             val index = IntIntHashMap(4096)
             val nodes = IntArrayList(); val restricted = IntArrayList(); val lats = DoubleArrayList(); val lons = DoubleArrayList()
@@ -283,9 +289,11 @@ class MotorwayNet internal constructor(
                     if (adj == n) continue
                     val rc = it.get(sh.roadClass)
                     // la classe: autostrada e superstrada ovunque; primaria/secondaria (terziaria) solo fra due nodi nei cerchi d'accesso
+                    // con la rete principale ([mainRoads]) anche le primarie ovunque, come le superstrade
                     val kind = when (rc) {
                         RoadClass.MOTORWAY, RoadClass.TRUNK -> if (accessOnly) continue else KIND_MAJOR
-                        RoadClass.PRIMARY, RoadClass.SECONDARY -> if (tailNear and 1 != 0) KIND_MAIN else continue
+                        RoadClass.PRIMARY -> if (mainRoads) { if (accessOnly) continue else KIND_MAJOR } else if (tailNear and 1 != 0) KIND_MAIN else continue
+                        RoadClass.SECONDARY -> if (tailNear and 1 != 0) KIND_MAIN else continue
                         RoadClass.TERTIARY -> if (tailNear and 2 != 0) KIND_TERTIARY else continue
                         else -> continue
                     }
@@ -314,7 +322,7 @@ class MotorwayNet internal constructor(
             }
             val net = of(nodes.toArray(), BooleanArray(nodes.size()) { restricted.get(it) != 0 }, tails.toArray(), heads.toArray(), edges.toArray(),
                 BooleanArray(revs.size()) { revs.get(it) != 0 }, ws.toArray(), mss.toArray(), ms.toArray(), base?.region ?: region, truncated, lats.toArray(), lons.toArray(),
-                access, if (access.isEmpty()) ByteArray(0) else kinds.toArray(), capped)
+                access, if (access.isEmpty()) ByteArray(0) else kinds.toArray(), capped, mainRoads)
             val tcp = a.turnCosts
             if (tcp != null) net.turnBans = bans(net, tcp, base?.turnBans, if (base?.turnBans != null) baseArcs else 0, cancel)
             return net
@@ -364,7 +372,7 @@ class MotorwayNet internal constructor(
         internal fun of(nodeGraph: IntArray, restricted: BooleanArray, tails: IntArray, heads: IntArray, edges: IntArray, revs: BooleanArray,
                         w: DoubleArray, ms: IntArray, m: FloatArray, region: Region, truncated: Boolean = false,
                         lat: DoubleArray = DoubleArray(0), lon: DoubleArray = DoubleArray(0),
-                        access: List<Circle> = emptyList(), kinds: ByteArray = ByteArray(0), accessCapped: Boolean = false): MotorwayNet {
+                        access: List<Circle> = emptyList(), kinds: ByteArray = ByteArray(0), accessCapped: Boolean = false, mainRoads: Boolean = false): MotorwayNet {
             val n = nodeGraph.size
             fun csr(key: IntArray): Pair<IntArray, IntArray> {
                 val start = IntArray(n + 1)
@@ -378,7 +386,7 @@ class MotorwayNet internal constructor(
             val (outStart, outArcs) = csr(tails)
             val (inStart, inArcs) = csr(heads)
             return MotorwayNet(nodeGraph, restricted, tails, heads, edges, revs, w, ms, m, outStart, outArcs, inStart, inArcs, region, truncated, lat, lon,
-                access, kinds, accessCapped)
+                access, kinds, accessCapped, mainRoads)
         }
     }
 }

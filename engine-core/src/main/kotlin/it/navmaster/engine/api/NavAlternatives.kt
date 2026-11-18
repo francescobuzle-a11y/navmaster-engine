@@ -30,7 +30,7 @@ enum class VariantSource(val json: String) { BEST("best"), MOTORWAY("motorway"),
 /**
  * Estensione NavMaster `{"navmaster": {"alternatives": {…}}}`: varianti del percorso migliore con
  * qualunque numero di punti (non le `alternative_routes` di ORS). [count]: i percorsi in tutto,
- * migliore compreso (2..6). Livello 1: durata ≤ [tier1Factor] e km ≤ [tier1KmFactor] del migliore;
+ * migliore compreso (2..9, [MAX_COUNT]). Livello 1: durata ≤ [tier1Factor] e km ≤ [tier1KmFactor] del migliore;
  * livello 2 («di poco più lunghe»): ≤ [maxFactor] e ≤ [maxKmFactor]. [allowFewerKm]: una variante
  * con meno km del migliore vale al livello 1 fino a [maxFactor] di durata. [fill]: in mancanza,
  * anche il livello 3 (riempimento). [budgetMs]: il tempo della richiesta di varianti; alle fonti va
@@ -67,7 +67,7 @@ class NavAlternativesOptions(
             fun num(key: String): Double? = m[key]?.let { x -> (x as? Number)?.toDouble() ?: throw bad("Parameter 'navmaster.alternatives.$key' must be a number.") }
             fun flag(key: String): Boolean? = m[key]?.let { x -> x as? Boolean ?: throw bad("Parameter 'navmaster.alternatives.$key' must be true or false.") }
             val count = num("count")?.let { c -> if (c != Math.floor(c)) throw bad("Parameter 'navmaster.alternatives.count' must be an integer."); c.toInt() } ?: 3
-            if (count !in 2..6) throw bad("Parameter 'navmaster.alternatives.count' has incorrect value of '$count' (2 to 6).")
+            if (count !in 2..MAX_COUNT) throw bad("Parameter 'navmaster.alternatives.count' has incorrect value of '$count' (2 to $MAX_COUNT).")
             val tier1 = num("tier1_factor") ?: 1.3
             if (tier1 !in 1.05..1.5) throw bad("Parameter 'navmaster.alternatives.tier1_factor' must be between 1.05 and 1.5.")
             val max = num("max_factor") ?: maxOf(1.5, tier1)
@@ -81,6 +81,11 @@ class NavAlternativesOptions(
             return NavAlternativesOptions(count, tier1, max, budget, flag("exclude_best") ?: false, tier1Km, maxKm, flag("allow_fewer_km") ?: false, flag("fill") ?: false)
         }
 
+        /**
+         * I percorsi al più (migliore compreso): 9, perché «Altri percorsi» chiede anche le varianti
+         * già a schermo (tornano fra le prime e l'app le scarta come doppioni) più 3 nuove.
+         */
+        const val MAX_COUNT = 9
         private val KNOWN = setOf("count", "tier1_factor", "max_factor", "tier1_km_factor", "max_km_factor", "allow_fewer_km", "fill", "budget_ms", "exclude_best")
         private fun bad(msg: String) = ApiException(400, RoutingErrorCodes.INVALID_PARAMETER_VALUE, msg)
     }
@@ -281,6 +286,13 @@ internal object VariantRules {
     const val LOCAL_SAMPLE_M = 1_000.0
     const val LOCAL_MAX_GAIN = 0.1
 
+    /**
+     * Un ref da strada statale o nazionale (SS, SR, B, N, D, E seguiti da cifre: SS12, SR450, B37,
+     * N7, D1075, E45): con la rete principale ([VariantJudge.mainRoads]) vale come strada nuova del bonus.
+     */
+    private val MAIN_REF = Regex("^(SS|SR|B|N|D|E)\\d+[A-Z]?$")
+    fun isMainRef(ref: String): Boolean = MAIN_REF.matches(ref)
+
     /** I nomi di gallerie e ponti (mai nel titolo di una variante se c'è un'altra strada). */
     private val STRUCTURE = Regex("^(galleria|ponte|viadotto|traforo|sottopasso|sovrappasso|cavalcavia|tunnel)\\b|(tunnel|brücke|bruecke)$", RegexOption.IGNORE_CASE)
     fun isStructureName(n: String): Boolean = STRUCTURE.containsMatchIn(n.trim())
@@ -360,6 +372,12 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
     }
     val tier1Factor: Double get() = opt.tier1Factor
     val bestMwShare: Double get() = facts(best).mwMeters / maxOf(1.0, best.meters)
+    /**
+     * La richiesta cerca anche sulla rete principale (evita autostrade o pedaggi, o il migliore ha
+     * poca autostrada): nel punteggio il bonus delle strade nuove vale anche per le statali con un
+     * ref ([VariantRules.isMainRef]: SS, SR, B, N, D, E), non solo per le autostrade ([motorwayRefs]).
+     */
+    @Volatile var mainRoads = false
 
     fun facts(d: Draft): DraftFacts {
         d.facts?.let { return it }
@@ -568,7 +586,8 @@ internal class VariantJudge(val best: Draft, private val info: EdgeInfo, private
         val f = facts(v)
         return newRefs.filter { ref ->
             val id = info.idOf(ref)
-            id >= 0 && f.refMotorwayMeters.getOrDefault(id, 0.0) >= VariantRules.NEW_REF_MW_SHARE * f.refMeters.getOrDefault(id, 0.0)
+            id >= 0 && (f.refMotorwayMeters.getOrDefault(id, 0.0) >= VariantRules.NEW_REF_MW_SHARE * f.refMeters.getOrDefault(id, 0.0) ||
+                mainRoads && VariantRules.isMainRef(ref))
         }
     }
 
@@ -1001,6 +1020,23 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         /** La regione della rete autostradale per tratto: somma delle distanze dai punti ≤ 1,25 volte il tratto più 20 km. */
         const val REGION_FACTOR = 1.25
         const val REGION_EXTRA_M = 20_000.0
+        /**
+         * La regione della rete principale ([MotorwayNet.mainRoads]): 1,1 volte il tratto più 10 km
+         * (le strade primarie sono molte di più delle autostrade: sul tablet 30-80 mila nodi letti una volta).
+         */
+        const val MAIN_REGION_FACTOR = 1.1
+        const val MAIN_REGION_EXTRA_M = 10_000.0
+        /** Sotto questi semi autostradali (nodi del migliore su autostrada o superstrada) anche la rete principale. */
+        const val MIN_MW_SEEDS = 10
+
+        /**
+         * Vero se la fonte M cerca anche sulla rete principale ([MotorwayNet.mainRoads]): la richiesta
+         * evita le autostrade o i pedaggi ([avoidFeatures]), o il migliore ha meno di
+         * [VariantRules.MW_BEST_SHARE] di autostrada o superstrada ([bestMwShare]), o meno di
+         * [MIN_MW_SEEDS] nodi autostradali ([mwSeeds]): le varianti su statali e provinciali.
+         */
+        internal fun mainRoadsWanted(avoidFeatures: Int, bestMwShare: Double, mwSeeds: Int): Boolean =
+            avoidFeatures and (AvoidFeatureFlags.HIGHWAYS or AvoidFeatureFlags.TOLLWAYS) != 0 || bestMwShare < VariantRules.MW_BEST_SHARE || mwSeeds < MIN_MW_SEEDS
         /** Il margine di peso di una deviazione, riferito al suo tratto, al più questo (un tratto corto in un viaggio lungo). */
         const val MAX_LEG_FACTOR = 3.0
         /**
@@ -1247,7 +1283,10 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
     /**
      * La fonte M: deviazioni del migliore sulla rete autostradale in RAM ([MotorwayNet], dalla cache
      * del servizio se copre il viaggio; [DetourSearch]), singole e combinate, cucite nel migliore
-     * ([Router.splice], leggere) senza nessuna ricerca. Non vale se la richiesta evita le autostrade.
+     * ([Router.splice], leggere) senza nessuna ricerca. Con la «rete principale» ([mainRoadsWanted]:
+     * la richiesta evita autostrade o pedaggi, o il migliore ha poca autostrada) anche una seconda
+     * rete con le strade primarie ([MotorwayNet.mainRoads]): le deviazioni su statali e superstrade,
+     * con la stessa regola. Evitando le autostrade solo questa.
      */
     private inner class MotorwayProvider : VariantProvider {
         override val source = VariantSource.MOTORWAY
@@ -1255,12 +1294,13 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         private var combos = 0
         private var truncated = false
 
-        override fun supported(ctx: VariantContext): Boolean =
-            ctx.request.avoidFeatures and AvoidFeatureFlags.HIGHWAYS == 0 && ctx.trace.node.isNotEmpty()
+        override fun supported(ctx: VariantContext): Boolean = ctx.trace.node.isNotEmpty()
 
-        /** La rete della richiesta, i nodi usabili ([MotorwayNet.mask]) e il tempo di [prepare]. */
-        private var net: MotorwayNet? = null
-        private var allowed: BooleanArray? = null
+        /** Una rete della richiesta: la rete, i nodi usabili ([MotorwayNet.mask]), rete principale o no. */
+        private inner class NetRun(val net: MotorwayNet, val allowed: BooleanArray?, val main: Boolean) {
+            var singles = 0; var combos = 0
+        }
+        private val nets = ArrayList<NetRun>()
         private var t0 = 0L
 
         /**
@@ -1289,65 +1329,97 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         }
 
         /**
-         * La rete autostradale attorno al viaggio: dalla cache del servizio se ne ha una che lo copre
-         * (con [RequestContext.useCache]), se no costruita col solo annullamento della richiesta
-         * (mai fermata dal tempo dei candidati, che però la conta: una costruzione fermata a metà non
-         * resterebbe in cache e le richieste dopo perderebbero le varianti).
+         * La rete autostradale attorno al viaggio (e, con [mainRoadsWanted], la rete principale): dalla
+         * cache del servizio se ne ha una che lo copre (con [RequestContext.useCache]), se no costruita
+         * col solo annullamento della richiesta (mai fermata dal tempo dei candidati, che però la
+         * conta: una costruzione fermata a metà non resterebbe in cache e le richieste dopo perderebbero
+         * le varianti). La rete principale, molto più grande, al più fino alla fine di `budget_ms`.
          */
         override fun prepare(ctx: VariantContext) {
             if (!supported(ctx)) return
             t0 = System.nanoTime()
+            val trace = ctx.trace
+            // i semi: i nodi del migliore su un'autostrada o una superstrada (rampe comprese); per la rete principale anche sulle primarie
+            val mwSeeds = com.carrotsearch.hppc.IntArrayList()
+            val mainSeeds = com.carrotsearch.hppc.IntArrayList()
+            for (k in trace.node.indices) {
+                val a = trace.inEdge[k]; val b = trace.outEdge[k]
+                if (ctx.info.isMotorwayOrTrunk(a) || ctx.info.isMotorwayOrTrunk(b)) mwSeeds.add(trace.node[k])
+                if (ctx.info.isMainRoad(a) || ctx.info.isMainRoad(b)) mainSeeds.add(trace.node[k])
+            }
+            val avoidMw = ctx.request.avoidFeatures and AvoidFeatureFlags.HIGHWAYS != 0
+            val main = mainRoadsWanted(ctx.request.avoidFeatures, ctx.pool.judge.bestMwShare, mwSeeds.size())
+            if (main) ctx.pool.judge.mainRoads = true
+            // la rete autostradale come sempre (non evitando le autostrade), poi la rete principale
+            if (!avoidMw) {
+                if (mwSeeds.isEmpty) log("varianti: M nessun tratto autostradale nel migliore") else build(ctx, mwSeeds, false)?.let { nets += it }
+            }
+            // la rete principale (molte più strade: col Centro-Sud o la Germania secondi a freddo) al più fino alla fine
+            // del tempo delle varianti: oltre, senza (non resta in cache), le fonti hanno comunque il loro minimo
+            if (main) try { build(ctx, mainSeeds, true)?.let { nets += it } } catch (e: SearchCancelledException) {
+                if (e.reason != SearchCancelledException.Reason.DEADLINE || rc.cancel.isCancelled) throw e
+                log("varianti: M rete principale fermata dal tempo (${(System.nanoTime() - t0) / 1_000_000} ms)")
+            }
+        }
+
+        /** Una rete della richiesta dai semi [seeds0] (più quelli d'accesso), autostradale o principale ([main]); null senza semi. */
+        private fun build(ctx: VariantContext, seeds0: com.carrotsearch.hppc.IntArrayList, main: Boolean): NetRun? {
+            val tStart = System.nanoTime()
             val graphs = service.routingGraph
-            val solved = ctx.solved; val trace = ctx.trace
-            // i semi: i nodi del migliore su un'autostrada o una superstrada (rampe comprese)
-            val seeds = com.carrotsearch.hppc.IntArrayList()
-            for (k in trace.node.indices) if (ctx.info.isMotorwayOrTrunk(trace.inEdge[k]) || ctx.info.isMotorwayOrTrunk(trace.outEdge[k])) seeds.add(trace.node[k])
-            if (seeds.isEmpty) { log("varianti: M nessun tratto autostradale nel migliore"); return }
-            val mwSeeds = seeds.size()
-            val mwSeedArr = seeds.toArray()
+            val solved = ctx.solved
+            val seeds = com.carrotsearch.hppc.IntArrayList(seeds0)
+            val coreSeeds = seeds.size()
+            val coreSeedArr = seeds.toArray()
             // i cerchi d'accesso attorno ai punti, e i nodi del migliore dentro (la parte urbana: deviazioni che escono lì)
             val circles = accessCircles(ctx.solved, ctx.info)
             addAccessSeeds(ctx, circles, seeds)
             val seedArr = seeds.toArray()
-            // la regione: un'ellisse per tratto coi fuochi sui suoi punti
+            if (seedArr.isEmpty()) { log("varianti: M rete principale: nessun seme"); return null }
+            val what = if (main) "M rete principale" else "M rete"
+            // la regione: un'ellisse per tratto coi fuochi sui suoi punti (più stretta per la rete principale: le strade sono molte di più)
+            val factor = if (main) MAIN_REGION_FACTOR else REGION_FACTOR
+            val extra = if (main) MAIN_REGION_EXTRA_M else REGION_EXTRA_M
             val need = Region(solved.legs.indices.map { j ->
                 val a = solved.snaps[j]; val b = solved.snaps[j + 1]
-                Ellipse(a.snappedLat, a.snappedLon, b.snappedLat, b.snappedLon, REGION_FACTOR * solved.legs[j].distance + REGION_EXTRA_M)
+                Ellipse(a.snappedLat, a.snappedLon, b.snappedLat, b.snappedLon, factor * solved.legs[j].distance + extra)
             })
             val access = ctx.router.access(graphs.encoding.shared)
+            // la rete principale non oltre il tempo delle varianti (vedi [prepare]); quella autostradale, piccola, mai fermata dal tempo
+            val cancel = if (main) rc.cancel.child(t0 + ctx.opt.budgetMs * 1_000_000) else rc.cancel
             var built = false; var accessBuilt = false
             val counts = if (ctx.opt.trace != null) IntArray(4) else null
-            // la parte autostradale (dai soli semi autostradali): in cache per i viaggi che la regione copre
-            val buildNet = { built = true; MotorwayNet.build(access, mwSeedArr, need, cancel = rc.cancel, counts = counts) }
-            val base = if (!rc.useCache) buildNet()
-                else service.netCache.get(graphs.routerKey(solved.options), need, fits = { c -> mwSeedArr.all { c.netNode(it) >= 0 } }, cancel = rc.cancel, build = buildNet)
-            val tBase = (System.nanoTime() - t0) / 1_000_000
+            // la parte autostradale (o principale, dai soli semi della rete): in cache per i viaggi che la regione copre
+            val buildNet = { built = true; MotorwayNet.build(access, coreSeedArr, need, cancel = cancel, counts = counts, mainRoads = main) }
+            val cache = if (main) service.mainNetCache else service.netCache
+            val base = if (!rc.useCache || coreSeedArr.isEmpty()) buildNet()
+                else cache.get(graphs.routerKey(solved.options), need, fits = { c -> coreSeedArr.all { c.netNode(it) >= 0 } }, cancel = cancel, build = buildNet)
+            val tBase = (System.nanoTime() - tStart) / 1_000_000
             // le strade d'accesso dei cerchi di questo viaggio, sopra la parte autostradale (letti solo i nodi nei cerchi)
-            val buildAccess = { accessBuilt = true; MotorwayNet.withAccess(access, base, seedArr, need, circles, cancel = rc.cancel, counts = counts) }
+            val buildAccess = { accessBuilt = true; MotorwayNet.withAccess(access, base, seedArr, need, circles, cancel = cancel, counts = counts) }
             val n = when {
                 circles.isEmpty() -> base
                 !rc.useCache -> buildAccess()
-                else -> service.netCache.overlay(base, need, circles, fits = { c -> seedArr.all { c.netNode(it) >= 0 } }, build = buildAccess)
+                else -> cache.overlay(base, need, circles, fits = { c -> seedArr.all { c.netNode(it) >= 0 } }, build = buildAccess)
             }
             // una rete della cache per una regione più grande: solo i nodi che una nuova avrebbe
-            allowed = if (built) null else n.mask(need, seedArr)
-            net = n
-            truncated = n.truncated
-            val tNet = (System.nanoTime() - t0) / 1_000_000
-            log("varianti: M rete ${n.arcCount} archi (${n.accessArcs} d'accesso in ${circles.size} cerchi" + (if (n.accessCapped) ", al tetto" else "") +
-                "), ${n.nodeCount} nodi (${n.accessNodes} solo d'accesso), ${seedArr.size} semi (${seedArr.size - mwSeeds} d'accesso), svolte vietate ${n.turnBans?.size() ?: 0}; autostrade " +
-                (if (built) "costruite in $tBase ms" else "dalla cache") + ", strade d'accesso " +
+            val allowed = if (built) null else n.mask(need, seedArr)
+            if (n.truncated) truncated = true
+            val tNet = (System.nanoTime() - tStart) / 1_000_000
+            log("varianti: $what ${n.arcCount} archi (${n.accessArcs} d'accesso in ${circles.size} cerchi" + (if (n.accessCapped) ", al tetto" else "") +
+                "), ${n.nodeCount} nodi (${n.accessNodes} solo d'accesso), ${seedArr.size} semi (${seedArr.size - coreSeeds} d'accesso), svolte vietate ${n.turnBans?.size() ?: 0}; " +
+                (if (main) "strade principali " else "autostrade ") + (if (built) "costruite in $tBase ms" else "dalla cache") + ", strade d'accesso " +
                 (if (circles.isEmpty()) "nessuna" else if (accessBuilt) "costruite in ${tNet - tBase} ms" else "dalla cache") + (if (n.truncated) " (troncata)" else ""))
-            if (ctx.opt.trace != null) traceNet(ctx, n, seedArr, need, if (built) counts else null)
+            if (ctx.opt.trace != null) traceNet(ctx, n, seedArr, need, if (built) counts else null, allowed)
+            return NetRun(n, allowed, main)
         }
 
         /** Traccia: i semi, la parte del migliore coperta dalla rete, i versi lasciati fuori, il migliore per classe di strada. */
-        private fun traceNet(ctx: VariantContext, n: MotorwayNet, seeds: IntArray, need: Region, counts: IntArray?) {
+        private fun traceNet(ctx: VariantContext, n: MotorwayNet, seeds: IntArray, need: Region, counts: IntArray?, allowed: BooleanArray?) {
             val trace = ctx.trace
             var inNet = 0; var first = -1; var last = -1
             for (k in trace.node.indices) if (n.netNode(trace.node[k]) >= 0) { inNet++; if (first < 0) first = k; last = k }
             fun km(k: Int) = if (k < 0) "-" else "%.1f".format(trace.preM[k] / 1000)
-            log("varianti: traccia M rete: ${seeds.size} semi, ${trace.node.size} posizioni del migliore, $inNet nella rete (dalla posizione $first al km ${km(first)} alla $last al km ${km(last)}), " +
+            log("varianti: traccia M rete${if (n.mainRoads) " principale" else ""}: ${seeds.size} semi, ${trace.node.size} posizioni del migliore, $inNet nella rete (dalla posizione $first al km ${km(first)} alla $last al km ${km(last)}), " +
                 "troncata ${if (n.truncated) "sì" else "no"}, maschera ${allowed?.count { !it }?.let { "$it nodi esclusi" } ?: "nessuna"}, regione " +
                 need.ellipses.joinToString { "somma %.0f km".format(it.sumM / 1000) } +
                 (counts?.let { c -> "; versi lasciati fuori: filtro del veicolo ${c[0]}, fuori regione ${c[1]}, peso infinito nei due versi ${c[2]}, in avanti ${c[3]}" } ?: "; versi lasciati fuori: rete dalla cache, non contati"))
@@ -1375,12 +1447,19 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
         }
 
         override fun run(ctx: VariantContext, budget: CancelToken) {
-            val net = net ?: return
+            for (nr in nets) runNet(ctx, nr, budget)
+            singles = nets.sumOf { it.singles }; combos = nets.sumOf { it.combos }
+        }
+
+        /** Le deviazioni di una rete ([NetRun]) cucite nel migliore e offerte (gli insiemi al più [MAX_M_SETS] per rete). */
+        private fun runNet(ctx: VariantContext, nr: NetRun, budget: CancelToken) {
+            val net = nr.net
+            val what = if (nr.main) "M rete principale" else "M"
             val graphs = service.routingGraph
             val solved = ctx.solved; val trace = ctx.trace; val router = ctx.router
             val access = router.access(graphs.encoding.shared)
             // le deviazioni per tratto: il margine di peso è quello del viaggio (1,2 volte max_factor − 1), riferito al tratto
-            val search = DetourSearch(net, trace, access.turnCosts, allowed)
+            val search = DetourSearch(net, trace, access.turnCosts, nr.allowed)
             // il margine e la deviazione minima sul viaggio intero (con gli altri pezzi di un viaggio tra Paesi)
             val w0 = trace.legW.sum() + ctx.trip.extraWeight
             val scale = ctx.opt.minDetourScale
@@ -1416,21 +1495,22 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             all.sortWith(compareBy({ it.rankClass }, tripKey, { it.leg }, { it.fromPos }))
             val comboSets = search.combos(all, key = tripKey)
             val sets = offeredSets(all, comboSets)
-            combos = comboSets.size; singles = sets.size - combos
-            if (singles < all.size) log("varianti: M ${all.size - singles} deviazioni oltre il tetto di $MAX_M_SETS insiemi")
+            nr.combos = comboSets.size; nr.singles = sets.size - nr.combos
+            if (nr.singles < all.size) log("varianti: $what ${all.size - nr.singles} deviazioni oltre il tetto di $MAX_M_SETS insiemi")
             budget.check()
             // ogni insieme cucito nel migliore, leggero; la regola sceglie
+            val tag = if (nr.main) "Mp " else "M "
             val drafts = sets.map { parts ->
                 val legs = solved.legs.mapIndexed { j, leg ->
                     val cuts = parts.filter { it.leg == j }.map { net.cut(it) }
                     if (cuts.isEmpty()) leg else router.splice(leg, cuts, light = true)
                 }
-                Draft(legs, VariantSource.MOTORWAY, parts, parts.size, "M " + parts.joinToString(" + ") { d ->
+                Draft(legs, VariantSource.MOTORWAY, parts, parts.size, tag + parts.joinToString(" + ") { d ->
                     "t${d.leg} ${d.fromPos}→${d.toPos} ${"%+d".format(d.dMs / 1000)} s ${Math.round(d.detourM / 100) / 10.0} km" }, turnsChecked = true)
             }
             val before = ctx.pool.accepted.size
             ctx.pool.offerAll(drafts)
-            log("varianti: M ${singles} deviazioni, ${combos} combinazioni, ${(System.nanoTime() - t0) / 1_000_000} ms")
+            log("varianti: $what ${nr.singles} deviazioni, ${nr.combos} combinazioni, ${(System.nanoTime() - t0) / 1_000_000} ms")
             if (diag != null) traceDetours(ctx, net, search, all, sets, drafts, diag, tripKey)
             for ((d, v) in ctx.pool.accepted.drop(before)) log("varianti: ${d.tag} → tenuta (livello ${v.tier}, ${v.label})")
         }
@@ -1477,7 +1557,7 @@ internal class NavAlternativesEngine(private val service: DirectionsService, pri
             }
         }
 
-        override fun summary(): String = "M $singles ($combos combo)"
+        override fun summary(): String = "M $singles ($combos combo)" + nets.firstOrNull { it.main }?.let { ", rete principale ${it.singles} (${it.combos} combo)" }.orEmpty()
         override fun note(): String? = if (truncated) "rete autostradale troncata" else null
     }
 

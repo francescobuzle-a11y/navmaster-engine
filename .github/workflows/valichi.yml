@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       countries:
-        description: "Paesi separati da virgola (es. italy,austria)"
+        description: "Paesi separati da virgola (es. italy,austria), o un gruppo della matrice delle varianti: gruppo-A … gruppo-F, gruppo-I (Paesi e viaggi)"
         default: "italy,austria"
       test:
         description: "Prova da eseguire"
@@ -16,7 +16,7 @@ on:
         description: "Viaggi (lat,lon;lat,lon|…), vuoto per quelli della prova"
         default: ""
       avoid:
-        description: "Strade da evitare nella diagnosi (es. tollways,ferries); vuoto: ferries"
+        description: "Strade da evitare (es. tollways,ferries); vuoto: ferries. Più combinazioni separate da ';' (es. ';tollways,ferries;highways,ferries')"
         default: ""
       window:
         description: "Finestre delle ricerche di limite da provare (fattore,secondi,fattore capo,secondi capo|…); vuoto: quella del motore"
@@ -28,10 +28,13 @@ on:
         description: "Traccia delle varianti (1 accesa, 0 spenta); vuoto: accesa solo con le sonde"
         default: ""
       alt:
-        description: "Varianti: count,max_factor[,tier1_factor] (es. 4,1.2 o 6,1.5); vuoto: 4,1.2"
+        description: "Varianti: count,max[,tier1[,max_km[,fewer]]] (4,1.2,1.1 automatico; 6,1.5,1.25,1.6,fewer Altri percorsi); più voci separate da ';'"
         default: ""
       sources:
         description: "Fonti delle varianti (motorway,penalty,crossing); vuoto: tutte"
+        default: ""
+      profile:
+        description: "Profilo delle varianti: vuoto camion (driving-hgv), car per auto e camper (driving-car)"
         default: ""
   push:
     branches: [main]
@@ -52,8 +55,35 @@ jobs:
       - name: Grafi dei Paesi
         env:
           COUNTRIES: ${{ inputs.countries || 'italy,austria' }}
+          TRIPS: ${{ inputs.trips }}
         run: |
           set -euo pipefail
+          # i gruppi della matrice delle prove delle varianti: al più 5 grafi (come sul tablet), sotto 16 GB scompattati.
+          # I viaggi del gruppo solo se l'input trips è vuoto
+          group_trips=""
+          case "$COUNTRIES" in
+            gruppo-A) COUNTRIES=italy,austria,switzerland,germany,slovenia
+              # Milano→München, Bolzano→Stuttgart, Bologna→Innsbruck, Trieste→Graz, Innsbruck→Salzburg (un Paese: Deutsches Eck), Milano→Innsbruck (tappa)→München
+              group_trips='45.4642,9.1900;48.1372,11.5756|46.4983,11.3548;48.7758,9.1829|44.4949,11.3426;47.2692,11.4041|45.6495,13.7768;47.0707,15.4395|47.2692,11.4041;47.8095,13.0550|45.4642,9.1900;47.2692,11.4041;48.1372,11.5756' ;;
+            gruppo-B) COUNTRIES=italy,austria,czech-republic,germany,slovakia
+              # Padova→Praha, Padova→Wien (tappa)→Praha
+              group_trips='45.4064,11.8768;50.0755,14.4378|45.4064,11.8768;48.2082,16.3738;50.0755,14.4378' ;;
+            gruppo-C) COUNTRIES=italy,austria,slovakia,hungary,slovenia
+              # Canneto→Komjatice, Wien→Budapest
+              group_trips='45.1508,10.3794;48.1547,18.1736|48.2082,16.3738;47.4979,19.0402' ;;
+            gruppo-D) COUNTRIES=italy,slovenia,croatia,austria,hungary
+              # Verona→Zagreb, Venezia→Budapest
+              group_trips='45.4384,10.9916;45.8150,15.9819|45.4408,12.3155;47.4979,19.0402' ;;
+            gruppo-E) COUNTRIES=italy,france,switzerland,spain,andorra
+              # Torino→Lyon, Genova→Marseille, Milano→Barcelona
+              group_trips='45.0703,7.6869;45.7640,4.8357|44.4056,8.9463;43.2965,5.3698|45.4642,9.1900;41.3874,2.1686' ;;
+            gruppo-F) COUNTRIES=france,germany,switzerland,luxembourg,belgium
+              # Lyon→Frankfurt, Strasbourg→Mulhouse (un Paese: la A5 tedesca)
+              group_trips='45.7640,4.8357;50.1109,8.6821|48.5734,7.7521;47.7508,7.3359' ;;
+            gruppo-I) COUNTRIES=italy ;;
+          esac
+          if [ -z "$TRIPS" ] && [ -n "$group_trips" ]; then echo "NM_GROUP_TRIPS=$group_trips" >> "$GITHUB_ENV"; fi
+          echo "Paesi: $COUNTRIES"
           spec=""
           for c in ${COUNTRIES//,/ }; do
             d=/mnt/grafi/$c
@@ -80,8 +110,12 @@ jobs:
           NM_TRACE: ${{ inputs.trace }}
           NM_ALT: ${{ inputs.alt }}
           NM_SOURCES: ${{ inputs.sources }}
+          NM_PROFILE: ${{ inputs.profile }}
         run: |
           chmod +x gradlew
+          # i viaggi del gruppo della matrice (gruppo-…), se l'input trips è vuoto
+          [ -n "$NM_TRIPS" ] || NM_TRIPS="${NM_GROUP_TRIPS:-}"
+          [ -n "$NM_TRIPS" ] && export NM_TRIPS
           [ -n "$NM_TRIPS" ] || unset NM_TRIPS
           [ -n "$NM_AVOID" ] || unset NM_AVOID
           [ -n "$NM_WINDOW" ] || unset NM_WINDOW
@@ -89,6 +123,7 @@ jobs:
           [ -n "$NM_TRACE" ] || unset NM_TRACE
           [ -n "$NM_ALT" ] || unset NM_ALT
           [ -n "$NM_SOURCES" ] || unset NM_SOURCES
+          [ -n "$NM_PROFILE" ] || unset NM_PROFILE
           ./gradlew --no-daemon :engine-core:test --tests "$TEST" -i 2>&1 | tee prova.log | grep -vE "^(> Task|Skipping|Caching|Resolving|Downloading|Download|Starting process|Successfully started|Finished generating)" | grep -E "^\s{4}|PASSED|FAILED|BUILD" || true
           grep -q "BUILD SUCCESSFUL" prova.log
       - name: Registro

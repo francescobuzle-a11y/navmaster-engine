@@ -652,13 +652,67 @@ class NavAlternativesServiceTest {
             }
             // nessuna ricerca oltre al migliore: la fonte M cuce soltanto
             assertTrue(rc.stats.children.none { (name, st) -> name == "varianti" && st.legs.any { it.source == LegStats.Source.PENALIZED } })
-            // evitando le autostrade la fonte M non vale
+            // evitando le autostrade la fonte M cerca sulla sola rete principale (statali, superstrade)
             val avoid = DirectionsRequest.fromJson("driving-hgv", Heidelberg.body(pts, ""","options":{"avoid_features":["highways"]}""")).withNavAlternatives(mOnly)
-            val am = ((service.handle(avoid, ResponseFormat.GEOJSON)["metadata"] as Map<*, *>)["navmaster"] as Map<*, *>)["alternatives"] as Map<*, *>
-            assertEquals("nessuna fonte", (am["candidates"] as String).substringBefore(" |"))
+            val am = try { ((service.handle(avoid, ResponseFormat.GEOJSON)["metadata"] as Map<*, *>)["navmaster"] as Map<*, *>)["alternatives"] as Map<*, *> } catch (e: ApiException) { null }
+            if (am != null) assertTrue((am["candidates"] as String).startsWith("M ") && "rete principale" in (am["candidates"] as String), "${am["candidates"]}")
         }
         println("fonte M su Heidelberg: $withDetours viaggi con deviazioni, $variants varianti")
         assertTrue(withDetours > 0, "nessuna deviazione autostradale su Heidelberg")
+    }
+
+    /**
+     * «Senza autostrade» e «senza pedaggi»: la fonte M non si spegne, cerca le deviazioni sulla rete
+     * principale (superstrade e primarie in RAM, [MotorwayNet.mainRoads]) con i pesi della richiesta.
+     * Evitando le autostrade nessuna variante ne usa una, la rete autostradale non si costruisce; le
+     * varianti sono percorsi leciti, cuciti senza ricerche; il migliore è quello di sempre.
+     */
+    @Test
+    fun `avoiding motorways or tolls the main roads net gives variants on the other roads`() {
+        val service = DirectionsService(g)
+        val mOnly = NavAlternativesOptions(count = 4, tier1Factor = 1.5, maxFactor = 2.0, sources = setOf(VariantSource.MOTORWAY), minDetourScale = 0.3)
+        val info = EdgeInfo(g.graph, g.encoding.shared, g.guidance)
+        var trips = 0; var variants = 0; var tripsWith = 0
+        for (seed in 1L..30L) for (avoid in listOf("highways", "tollways")) {
+            val pts = Heidelberg.points(2, seed + 300)
+            val body = Heidelberg.body(pts, ""","options":{"avoid_features":["$avoid"]}""")
+            val plain = try { service.solve(DirectionsRequest.fromJson("driving-hgv", body)) } catch (e: ApiException) { continue }
+            val lines = java.util.Collections.synchronizedList(ArrayList<String>())
+            val rc = RequestContext(log = { lines += it })
+            val r = NavAlternativesEngine(service, rc).run(DirectionsRequest.fromJson("driving-hgv", body).withNavAlternatives(mOnly), mOnly)
+            trips++
+            // il migliore di sempre
+            assertEquals(plain.legs.map { l -> l.edges.map { it.edge } }, r.best.legs.map { l -> l.edges.map { it.edge } })
+            assertTrue(lines.any { it.startsWith("varianti: M rete principale") }, "seme $seed $avoid: ${lines.joinToString("\n")}")
+            if (avoid == "highways") assertTrue(lines.none { it.startsWith("varianti: M rete ") && "principale" !in it }, "rete autostradale costruita evitando le autostrade")
+            val router = service.routingGraph.router(r.best.options)
+            for (a in r.variants) {
+                assertEquals(VariantSource.MOTORWAY, a.draft.source)
+                for (leg in a.legs) {
+                    assertTrue(router.isLegal(leg), "seme $seed $avoid")
+                    if (avoid == "highways") assertTrue(leg.edges.none { info.isMotorway(it.edge) }, "seme $seed: variante in autostrada evitando le autostrade")
+                }
+                variants++
+            }
+            if (r.variants.isNotEmpty()) tripsWith++
+            // nessuna ricerca oltre al migliore: la rete principale cuce soltanto
+            assertTrue(rc.stats.children.none { (name, st) -> name == "varianti" && st.legs.any { it.source == LegStats.Source.PENALIZED } })
+        }
+        println("rete principale su Heidelberg (senza autostrade / pedaggi): $trips viaggi, $tripsWith con varianti, $variants varianti")
+        assertTrue(trips >= 20, "viaggi: $trips")
+        assertTrue(variants > 0, "nessuna variante sulla rete principale")
+    }
+
+    @Test
+    fun `the main roads net is wanted when avoiding motorways or tolls or with little motorway`() {
+        assertTrue(NavAlternativesEngine.mainRoadsWanted(it.navmaster.engine.profile.AvoidFeatureFlags.HIGHWAYS, 0.9, 500))
+        assertTrue(NavAlternativesEngine.mainRoadsWanted(it.navmaster.engine.profile.AvoidFeatureFlags.TOLLWAYS, 0.9, 500))
+        assertTrue(NavAlternativesEngine.mainRoadsWanted(0, 0.1, 500))
+        assertTrue(NavAlternativesEngine.mainRoadsWanted(0, 0.9, 3))
+        // un viaggio autostradale normale: la sola rete autostradale, come prima
+        assertTrue(!NavAlternativesEngine.mainRoadsWanted(it.navmaster.engine.profile.AvoidFeatureFlags.FERRIES, 0.9, 500))
+        assertTrue(VariantRules.isMainRef("SS12") && VariantRules.isMainRef("B37") && VariantRules.isMainRef("SR450") && VariantRules.isMainRef("N7"))
+        assertTrue(!VariantRules.isMainRef("SP12") && !VariantRules.isMainRef("A22") && !VariantRules.isMainRef("L534"))
     }
 
     @Test
@@ -712,7 +766,7 @@ class NavAlternativesServiceTest {
         val req = (301L..380L).asSequence().map { DirectionsRequest.fromJson("driving-hgv", Heidelberg.body(Heidelberg.points(2, it))) }.first { rq ->
             val ls = ArrayList<String>()
             NavAlternativesEngine(service, RequestContext(log = { ls += it }, useCache = false)).run(rq, opt0)
-            ls.any { "M rete" in it }
+            ls.any { it.startsWith("varianti: M rete ") && "principale" !in it }
         }
         assertEquals(0, service.netCache.size)
         // tempo dei candidati finito subito (budget_ms 0: nemmeno il minimo delle fonti): nessuna variante, ma la rete è costruita per intero e resta
@@ -772,7 +826,10 @@ class NavAlternativesServiceTest {
         val service = DirectionsService(g)
         val coords = """{"coordinates":[[8.6937,49.4094],[8.7606,49.4186]]"""
         fun parse(s: String) = DirectionsRequest.fromJson("driving-hgv", Json.parse(s) as Map<String, Any?>)
-        assertEquals(RoutingErrorCodes.INVALID_PARAMETER_VALUE, assertFailsWith<ApiException> { parse("""$coords,"navmaster":{"alternatives":{"count":7}}}""") }.code)
+        assertEquals(RoutingErrorCodes.INVALID_PARAMETER_VALUE, assertFailsWith<ApiException> { parse("""$coords,"navmaster":{"alternatives":{"count":10}}}""") }.code)
+        assertEquals(RoutingErrorCodes.INVALID_PARAMETER_VALUE, assertFailsWith<ApiException> { parse("""$coords,"navmaster":{"alternatives":{"count":1}}}""") }.code)
+        // «Altri percorsi» chiede anche le varianti già a schermo: fino a 9 percorsi
+        assertEquals(9, parse("""$coords,"navmaster":{"alternatives":{"count":9}}}""").navAlternatives!!.count)
         assertEquals(RoutingErrorCodes.INVALID_PARAMETER_VALUE, assertFailsWith<ApiException> { parse("""$coords,"navmaster":{"alternatives":{"count":3,"tier1_factor":1.6}}}""") }.code)
         assertEquals(RoutingErrorCodes.INVALID_PARAMETER_VALUE, assertFailsWith<ApiException> { parse("""$coords,"navmaster":{"alternatives":{"tier1_factor":1.3,"max_factor":1.2}}}""") }.code)
         assertEquals(RoutingErrorCodes.INCOMPATIBLE_PARAMETERS, assertFailsWith<ApiException> {
