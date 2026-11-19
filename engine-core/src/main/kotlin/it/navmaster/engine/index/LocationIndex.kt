@@ -1,5 +1,6 @@
 package it.navmaster.engine.index
 
+import it.navmaster.engine.isReadableGraphFormat
 import it.navmaster.engine.storage.IntSource
 
 import com.carrotsearch.hppc.IntArrayList
@@ -192,7 +193,7 @@ class LocationIndex private constructor(
             val da = dir.open("location_index", 1 shl 20) ?: return null
             var keep = false
             try {
-                if (da.getHeader(0) != it.navmaster.engine.GRAPH_FORMAT_VERSION || da.getHeader(1) != (graph.nodeCount xor graph.edgeCount)) return null
+                if (!isReadableGraphFormat(da.getHeader(0)) || da.getHeader(1) != (graph.nodeCount xor graph.edgeCount)) return null
                 val rows = da.getHeader(2); val cols = da.getHeader(3); val entries = da.getHeader(4)
                 fun dbl(lo: Int, hi: Int) = java.lang.Double.longBitsToDouble((da.getHeader(lo).toLong() and 0xFFFFFFFFL) or (da.getHeader(hi).toLong() shl 32))
                 val minLat = dbl(5, 6); val minLon = dbl(7, 8); val cell = dbl(9, 10)

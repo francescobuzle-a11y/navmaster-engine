@@ -1,5 +1,6 @@
 package it.navmaster.engine.storage
 
+import it.navmaster.engine.isReadableGraphFormat
 import it.navmaster.engine.GRAPH_FORMAT_VERSION
 import java.io.Closeable
 import java.io.File
@@ -95,7 +96,7 @@ class BaseGraph(
 
     var nodeCount = 0; private set
     var edgeCount = 0; private set
-    private var nextGeoRef = 4L // in unità int; 0 riservato a "nessuna geometria"
+    private var nextGeoRef = 4L // in byte (formato 5) o in int (formato 4); 0 riservato a "nessuna geometria"
     val bounds = BBox.empty()
     var frozen = false; private set
 
@@ -118,6 +119,8 @@ class BaseGraph(
     fun lon(node: Int): Double = intToDeg(nodes.getInt(node.toLong() * nodeEntryBytes + 8))
     fun ele(node: Int): Double = if (is3D) intToEle(nodes.getInt(node.toLong() * nodeEntryBytes + 12)) else Double.NaN
     fun setNodeCoords(node: Int, lat: Double, lon: Double, ele: Double = Double.NaN) {
+        // la geometria degli archi è salvata a scarti dal nodo A: spostare un nodo dopo la sposterebbe
+        check(nextGeoRef == 4L) { "nodo spostato dopo la scrittura della geometria" }
         val p = node.toLong() * nodeEntryBytes
         nodes.setInt(p + 4, degToInt(lat)); nodes.setInt(p + 8, degToInt(lon))
         if (is3D) nodes.setInt(p + 12, eleToInt(ele))
@@ -185,41 +188,78 @@ class BaseGraph(
     fun name(edge: Int): String = names.get(nameRef(edge))
 
     // ---------------------------------------------------------------- geometria
+    //
+    // Formato 5 ([geoVarint]): a ogni arco con punti intermedi un record al byte geoRef del file
+    // `geometry`: varint del numero di punti, poi per ogni punto gli scarti zigzag-varint di lat, lon
+    // (ed ele) in unità di 1e-7 gradi (mm), dal punto precedente; il primo dal nodo A. Valori identici
+    // al bit al formato 4, che salvava ogni coordinata come int assoluto (8 byte per punto; in Germania
+    // 366 MB contro circa 190). Il record si legge con una copia in blocco (una chiamata nativa sul
+    // tablet invece di 1 + 2 per punto). Formato 4 (ancora letto): geoRef in int, count, poi gli int.
+
+    /** Vero per la geometria a scarti varint (formato 5); falso per i grafi di formato 4. */
+    private var geoVarint = true
 
     /** Memorizza i punti intermedi, dati nell'ordine nodeA→nodeB. */
     fun setWayGeometry(edge: Int, pillars: PointList) {
-        val dim = if (is3D) 3 else 2
         val p = edge.toLong() * edgeEntryBytes + eGeo
         if (pillars.size == 0) { edges.setInt(p, 0); return }
-        val existing = edges.getInt(p).toLong() and 0xFFFFFFFFL
-        val ref: Long
-        if (existing != 0L && geometry.getInt(existing * 4) >= pillars.size) {
-            ref = existing // riscrittura in loco
-        } else {
-            ref = nextGeoRef
-            nextGeoRef += 1 + pillars.size.toLong() * dim
-            geometry.ensureCapacity(nextGeoRef * 4)
-        }
-        var pos = ref * 4
-        geometry.setInt(pos, pillars.size); pos += 4
-        for (i in 0 until pillars.size) {
-            geometry.setInt(pos, degToInt(pillars.lat(i))); pos += 4
-            geometry.setInt(pos, degToInt(pillars.lon(i))); pos += 4
-            if (is3D) { geometry.setInt(pos, eleToInt(pillars.ele(i))); pos += 4 }
-        }
+        check(geoVarint) { "geometria di un grafo di formato 4: sola lettura" }
+        val buf = GeoCodec.encode(pillars, nodes.getInt(nodeA(edge).toLong() * nodeEntryBytes + 4), nodes.getInt(nodeA(edge).toLong() * nodeEntryBytes + 8),
+            if (is3D) nodes.getInt(nodeA(edge).toLong() * nodeEntryBytes + 12) else 0, is3D)
+        // sempre in coda (l'import scrive la geometria di ogni arco una volta sola)
+        val ref = nextGeoRef
+        require(ref + buf.size <= 0xFFFFFFFFL) { "geometria oltre 4 GB" }
+        nextGeoRef += buf.size
+        geometry.ensureCapacity(nextGeoRef)
+        geometry.setBytes(ref, buf, buf.size)
         edges.setInt(p, ref.toInt())
     }
 
     /** Geometria dell'arco nella direzione base→adj data da [reverse]. */
     fun fetchWayGeometry(edge: Int, reverse: Boolean, mode: FetchMode): PointList {
         val ref = edges.getInt(edge.toLong() * edgeEntryBytes + eGeo).toLong() and 0xFFFFFFFFL
-        val count = if (ref == 0L) 0 else geometry.getInt(ref * 4)
         val withBase = mode == FetchMode.ALL || mode == FetchMode.BASE_AND_PILLAR || mode == FetchMode.TOWER_ONLY
         val withAdj = mode == FetchMode.ALL || mode == FetchMode.PILLAR_AND_ADJ || mode == FetchMode.TOWER_ONLY
         val withPillars = mode != FetchMode.TOWER_ONLY
         val a = nodeA(edge); val b = nodeB(edge)
-        val pl = PointList(count + 2, is3D)
+        if (!geoVarint) return fetchLegacyGeometry(ref, a, b, reverse, withBase, withAdj, withPillars)
         // costruiamo sempre in ordine di memorizzazione (A→B) e poi invertiamo se serve
+        val first = if (reverse) withAdj else withBase
+        val last = if (reverse) withBase else withAdj
+        if (ref == 0L || !withPillars) {
+            val pl = PointList(2, is3D)
+            if (first) pl.add(lat(a), lon(a), ele(a))
+            if (last) pl.add(lat(b), lon(b), ele(b))
+            if (reverse) pl.reverse()
+            return pl
+        }
+        val pa = a.toLong() * nodeEntryBytes
+        val aLat = nodes.getInt(pa + 4); val aLon = nodes.getInt(pa + 8); val aEle = if (is3D) nodes.getInt(pa + 12) else 0
+        val avail = (nextGeoRef - ref).toInt()
+        val tl = geoBuf.get()
+        // prima un pezzo piccolo (il numero dei punti), poi, se serve, tutto il record
+        var buf = tl
+        var have = minOf(avail, GEO_FIRST_READ)
+        geometry.getBytes(ref, buf, have)
+        val count = GeoCodec.count(buf)
+        val need = minOf(avail, GeoCodec.maxBytes(count, is3D))
+        if (need > have) {
+            if (buf.size < need) { buf = ByteArray(maxOf(need, buf.size * 2)); if (buf.size <= GEO_BUF_KEEP) geoBuf.set(buf) }
+            geometry.getBytes(ref, buf, need)
+            have = need
+        }
+        val pl = PointList(count + 2, is3D)
+        if (first) pl.add(intToDeg(aLat), intToDeg(aLon), if (is3D) intToEle(aEle) else Double.NaN)
+        GeoCodec.decodeInto(buf, have, aLat, aLon, aEle, is3D, pl)
+        if (last) pl.add(lat(b), lon(b), ele(b))
+        if (reverse) pl.reverse()
+        return pl
+    }
+
+    /** La geometria nel formato 4: count e int assoluti a geoRef·4. */
+    private fun fetchLegacyGeometry(ref: Long, a: Int, b: Int, reverse: Boolean, withBase: Boolean, withAdj: Boolean, withPillars: Boolean): PointList {
+        val count = if (ref == 0L) 0 else geometry.getInt(ref * 4)
+        val pl = PointList(count + 2, is3D)
         val first = if (reverse) withAdj else withBase
         val last = if (reverse) withBase else withAdj
         if (first) pl.add(lat(a), lon(a), ele(a))
@@ -236,6 +276,9 @@ class BaseGraph(
         if (reverse) pl.reverse()
         return pl
     }
+
+    /** Il buffer di lettura della geometria, uno per thread (le ricerche e l'aggancio girano in parallelo). */
+    private val geoBuf = ThreadLocal.withInitial { ByteArray(GEO_FIRST_READ.coerceAtLeast(1024)) }
 
     // ---------------------------------------------------------------- iterazione
 
@@ -316,6 +359,7 @@ class BaseGraph(
         edges.setHeader(0, GRAPH_FORMAT_VERSION); edges.setHeader(1, edgeEntryBytes); edges.setHeader(2, edgeCount)
         geometry.setHeader(0, GRAPH_FORMAT_VERSION)
         geometry.setHeader(1, nextGeoRef.toInt()); geometry.setHeader(2, (nextGeoRef ushr 32).toInt())
+        geometry.setHeader(3, if (geoVarint) GEO_CODEC_VARINT else 0)
         nodes.flush(); edges.flush(); geometry.flush(); names.flush()
         GraphProperties(File(dir.dir, "properties")).apply {
             set("graph.format_version", GRAPH_FORMAT_VERSION.toString() + (if (formatVariant.isEmpty()) "" else ".$formatVariant"))
@@ -340,7 +384,7 @@ class BaseGraph(
         val g = dir.open("geometry") ?: return false
         val props = GraphProperties(File(dir.dir, "properties")).also { it.load() }
         val format = props.get("graph.format_version").orEmpty()
-        check(format.substringBefore('.') == GRAPH_FORMAT_VERSION.toString()) { "formato grafo incompatibile: $format" }
+        check(format.substringBefore('.').toIntOrNull()?.let(::isReadableGraphFormat) == true) { "formato grafo incompatibile: $format" }
         formatVariant = format.substringAfter('.', "")
         check(props.get("graph.encoded_values") == encodedValues.describe()) { "valori codificati diversi da quelli del grafo" }
         check(n.getHeader(1) == nodeEntryBytes && e.getHeader(1) == edgeEntryBytes) { "layout record diverso" }
@@ -350,6 +394,7 @@ class BaseGraph(
         frozen = n.getHeader(7) == 1
         edgeCount = e.getHeader(2)
         nextGeoRef = (g.getHeader(1).toLong() and 0xFFFFFFFFL) or (g.getHeader(2).toLong() shl 32)
+        geoVarint = g.getHeader(3) == GEO_CODEC_VARINT
         // sostituisce i DataAccess vuoti creati nel costruttore con quelli caricati
         nodes.close(); edges.close(); geometry.close()
         nodes = n; edges = e; geometry = g
@@ -378,10 +423,77 @@ class BaseGraph(
         private const val EDGE_SEGMENT = 1 shl 20
         private const val MAX_DIST_MM = Int.MAX_VALUE.toLong() - 1
         private const val DEG_FACTOR = 1e7
+        /** L'intestazione [3] del file `geometry` con la geometria a scarti varint (formato 5); 0 nel formato 4. */
+        const val GEO_CODEC_VARINT = 1
+        /** I byte letti per primi di un record di geometria: il numero dei punti e, di solito, tutto il record. */
+        private const val GEO_FIRST_READ = 96
+        /** Il buffer di lettura più grande tenuto per thread (oltre si alloca per la chiamata). */
+        private const val GEO_BUF_KEEP = 1 shl 16
 
         fun degToInt(deg: Double): Int = (deg * DEG_FACTOR).toInt()
         fun intToDeg(i: Int): Double = i / DEG_FACTOR
         fun eleToInt(ele: Double): Int = if (ele.isNaN()) 0 else (ele * 1000).toInt()
         fun intToEle(i: Int): Double = i / 1000.0
+    }
+}
+
+/**
+ * Codifica della geometria di un arco (formato 5): varint del numero di punti, poi per ogni punto gli
+ * scarti zigzag-varint (a 64 bit) di lat, lon ed ele (se 3D) dal punto precedente, il primo dal nodo A;
+ * coordinate in 1e-7 gradi ([BaseGraph.degToInt]) ed ele in mm, gli stessi interi del formato 4.
+ */
+internal object GeoCodec {
+    fun encode(pillars: PointList, aLat: Int, aLon: Int, aEle: Int, is3D: Boolean): ByteArray {
+        val out = java.io.ByteArrayOutputStream(5 + pillars.size * (if (is3D) 9 else 6))
+        writeVar(out, pillars.size.toLong())
+        var pLat = aLat.toLong(); var pLon = aLon.toLong(); var pEle = aEle.toLong()
+        for (i in 0 until pillars.size) {
+            val la = BaseGraph.degToInt(pillars.lat(i)).toLong()
+            val lo = BaseGraph.degToInt(pillars.lon(i)).toLong()
+            writeVar(out, zig(la - pLat)); writeVar(out, zig(lo - pLon))
+            pLat = la; pLon = lo
+            if (is3D) { val el = BaseGraph.eleToInt(pillars.ele(i)).toLong(); writeVar(out, zig(el - pEle)); pEle = el }
+        }
+        return out.toByteArray()
+    }
+
+    /** Il numero dei punti del record che inizia in [buf]. */
+    fun count(buf: ByteArray): Int {
+        var r = 0L; var s = 0; var i = 0
+        while (true) { val b = buf[i++].toInt(); r = r or ((b and 0x7F).toLong() shl s); if (b and 0x80 == 0) break; s += 7 }
+        return r.toInt()
+    }
+
+    /** I byte massimi di un record di [count] punti. */
+    fun maxBytes(count: Int, is3D: Boolean): Int = 5 + count * (if (is3D) 3 else 2) * 10
+
+    /** Aggiunge a [pl] i punti del record in [buf] (i primi [len] byte), dal nodo A di coordinate intere date. */
+    fun decodeInto(buf: ByteArray, len: Int, aLat: Int, aLon: Int, aEle: Int, is3D: Boolean, pl: PointList) {
+        var i = 0
+        fun next(): Long {
+            var r = 0L; var s = 0
+            while (true) {
+                check(i < len) { "record di geometria troncato" }
+                val b = buf[i++].toInt()
+                r = r or ((b and 0x7F).toLong() shl s)
+                if (b and 0x80 == 0) return r
+                s += 7
+            }
+        }
+        val n = next().toInt()
+        var la = aLat.toLong(); var lo = aLon.toLong(); var el = aEle.toLong()
+        for (k in 0 until n) {
+            la += unzig(next()); lo += unzig(next())
+            if (is3D) el += unzig(next())
+            pl.add(BaseGraph.intToDeg(la.toInt()), BaseGraph.intToDeg(lo.toInt()), if (is3D) BaseGraph.intToEle(el.toInt()) else Double.NaN)
+        }
+    }
+
+    private fun zig(d: Long): Long = (d shl 1) xor (d shr 63)
+    private fun unzig(z: Long): Long = (z ushr 1) xor -(z and 1)
+    private fun writeVar(out: java.io.ByteArrayOutputStream, v: Long) {
+        var x = v
+        while (x and 0x7FL.inv() != 0L) { out.write(((x and 0x7F) or 0x80).toInt()); x = x ushr 7 }
+        out.write(x.toInt())
     }
 }

@@ -9,31 +9,60 @@ import java.io.Closeable
  * (1 bit: svolta vietata). Stesso schema di GraphHopper `TurnCostStorage`.
  *
  * File `turn_costs`: record da 16 byte `FROM@0 | TO@4 | FLAGS@8 | NEXT@12` (-1 = fine lista).
- * File `turn_heads`: un int per nodo con l'indice della prima voce (-1 = nessuna).
+ *
+ * Le teste delle liste (la prima voce di ogni nodo con divieti):
+ * - formato 5, file `turn_index`: una bitmap dei nodi con voci e le teste dei soli nodi con voci, in
+ *   ordine di nodo, caricate nell'heap all'apertura. Intestazione [1] = nodi coperti dalla bitmap
+ *   ([nodeLimit]), [2] = teste; dati: le parole della bitmap (64 bit, ognuna come due int, prima il
+ *   basso), poi le teste. In Germania 116 mila nodi su 13,5 milioni hanno voci: 2,3 MB invece di 74,5,
+ *   e [hasEntries], letto per ogni nodo via delle ricerche edge-based, diventa un bit nell'heap invece
+ *   di una lettura del file mappato (una chiamata nativa sul tablet);
+ * - formato 4, file `turn_heads` (ancora letto): un int per nodo con l'indice della prima voce (-1 = nessuna).
+ *
+ * Durante l'import le teste si scrivono come nel formato 4 (file `turn_heads` di lavoro); [flush] le
+ * compatta in `turn_index`, cancella il file di lavoro e da lì risponde dall'heap.
  */
 class TurnCostStorage(private val dir: GraphDirectory, val encoding: TurnCostEncoding) : Closeable {
     private var costs: DataAccess = dir.create("turn_costs", 1 shl 16)
-    private var heads: DataAccess = dir.create("turn_heads", 1 shl 16)
+    /** Le teste per nodo (import e grafi di formato 4); null dopo la compattazione o con `turn_index`. */
+    private var heads: DataAccess? = dir.create(LEGACY_HEADS, 1 shl 16)
     var count = 0; private set
     private var nodeCapacity = 0
 
+    // le teste compatte (formato 5): bitmap dei nodi con voci, ranghi per parola, teste in ordine di nodo
+    private var compact = false
+    private var nodeLimit = 0
+    private var words = LongArray(0)
+    private var ranks = IntArray(0)
+    private var headOf = IntArray(0)
+
     private fun head(node: Int): Int {
+        if (compact) {
+            if (node < 0 || node >= nodeLimit) return NO_ENTRY
+            val w = node ushr 6
+            val bit = 1L shl (node and 63)
+            val word = words[w]
+            if (word and bit == 0L) return NO_ENTRY
+            return headOf[ranks[w] + java.lang.Long.bitCount(word and (bit - 1))]
+        }
         if (node >= nodeCapacity) return NO_ENTRY
-        return heads.getInt(node.toLong() * 4)
+        return heads!!.getInt(node.toLong() * 4)
     }
 
     private fun setHead(node: Int, entry: Int) {
+        val h = heads ?: error("costi di svolta già compattati: nessuna scrittura dopo flush")
         if (node >= nodeCapacity) {
             val newCap = maxOf(node + 1, nodeCapacity * 2, 1024)
-            heads.ensureCapacity(newCap.toLong() * 4)
-            for (n in nodeCapacity until newCap) heads.setInt(n.toLong() * 4, NO_ENTRY)
+            h.ensureCapacity(newCap.toLong() * 4)
+            for (n in nodeCapacity until newCap) h.setInt(n.toLong() * 4, NO_ENTRY)
             nodeCapacity = newCap
         }
-        heads.setInt(node.toLong() * 4, entry)
+        h.setInt(node.toLong() * 4, entry)
     }
 
     /** Imposta i flag della svolta (da, via, a); se la voce esiste, i flag vengono uniti con OR. */
     fun set(fromEdge: Int, viaNode: Int, toEdge: Int, flags: Int) {
+        check(!compact) { "costi di svolta già compattati: nessuna scrittura dopo flush" }
         var e = head(viaNode)
         var last = NO_ENTRY
         while (e != NO_ENTRY) {
@@ -65,34 +94,95 @@ class TurnCostStorage(private val dir: GraphDirectory, val encoding: TurnCostEnc
 
     fun hasEntries(viaNode: Int) = head(viaNode) != NO_ENTRY
 
+    /** Scrive le voci e le teste compatte (`turn_index`); il file di lavoro `turn_heads` viene cancellato. */
     fun flush() {
         costs.setHeader(0, GRAPH_FORMAT_VERSION); costs.setHeader(1, count)
-        heads.setHeader(0, GRAPH_FORMAT_VERSION); heads.setHeader(1, nodeCapacity)
-        costs.flush(); heads.flush()
+        costs.flush()
+        if (!compact) compactHeads()
+        val da = dir.create(INDEX, 1 shl 16)
+        try {
+            da.setHeader(0, GRAPH_FORMAT_VERSION); da.setHeader(1, nodeLimit); da.setHeader(2, headOf.size)
+            da.ensureCapacity(maxOf(4L, words.size.toLong() * 8 + headOf.size.toLong() * 4))
+            var p = 0L
+            for (w in words) { da.setInt(p, w.toInt()); da.setInt(p + 4, (w ushr 32).toInt()); p += 8 }
+            for (h in headOf) { da.setInt(p, h); p += 4 }
+            da.flush()
+        } finally { da.close() }
+    }
+
+    /** Le teste per nodo diventano bitmap + teste dei soli nodi con voci; il file di lavoro sparisce. */
+    private fun compactHeads() {
+        val h = heads
+        var limit = 0
+        var n = 0
+        for (node in 0 until nodeCapacity) if (h!!.getInt(node.toLong() * 4) != NO_ENTRY) { limit = node + 1; n++ }
+        val w = LongArray((limit + 63) ushr 6)
+        val hs = IntArray(n)
+        var k = 0
+        for (node in 0 until limit) {
+            val e = h!!.getInt(node.toLong() * 4)
+            if (e == NO_ENTRY) continue
+            w[node ushr 6] = w[node ushr 6] or (1L shl (node and 63))
+            hs[k++] = e
+        }
+        setCompact(limit, w, hs)
+        h?.close()
+        heads = null
+        java.io.File(dir.dir, LEGACY_HEADS).delete()
+    }
+
+    private fun setCompact(limit: Int, w: LongArray, hs: IntArray) {
+        nodeLimit = limit; words = w; headOf = hs
+        ranks = IntArray(w.size)
+        var r = 0
+        for (i in w.indices) { ranks[i] = r; r += java.lang.Long.bitCount(w[i]) }
+        check(r == hs.size) { "teste dei costi di svolta incoerenti: $r bit, ${hs.size} teste" }
+        compact = true
     }
 
     fun loadExisting(): Boolean {
         val c = dir.open("turn_costs", 1 shl 16) ?: return false
-        val h = dir.open("turn_heads", 1 shl 16) ?: return false
-        costs.close(); heads.close()
+        val idx = dir.open(INDEX, 1 shl 16)
+        if (idx != null) {
+            try {
+                val limit = idx.getHeader(1); val n = idx.getHeader(2)
+                val nw = (limit + 63) ushr 6
+                val raw = IntArray(nw * 2)
+                if (raw.isNotEmpty()) idx.getInts(0, raw, 0, raw.size)
+                val w = LongArray(nw) { (raw[2 * it].toLong() and 0xFFFFFFFFL) or (raw[2 * it + 1].toLong() shl 32) }
+                val hs = IntArray(n)
+                if (n > 0) idx.getInts(nw * 8L, hs, 0, n)
+                setCompact(limit, w, hs)
+            } finally { idx.close() }
+            costs.close(); heads?.close(); heads = null
+            costs = c
+            count = c.getHeader(1)
+            return true
+        }
+        val h = dir.open(LEGACY_HEADS, 1 shl 16) ?: run { c.close(); return false }
+        costs.close(); heads?.close()
         costs = c; heads = h
         count = c.getHeader(1); nodeCapacity = h.getHeader(1)
         return true
     }
 
-    /** Riscaldamento (vedi [DataAccess.touch]): teste delle liste e voci. Byte toccati. */
+    /** Riscaldamento (vedi [DataAccess.touch]): teste delle liste (solo nel formato 4: nel 5 sono nell'heap) e voci. Byte toccati. */
     fun touch(progress: ((Long) -> Unit)? = null): Long {
-        val a = heads.touch(progress)
+        val a = heads?.touch(progress) ?: 0L
         return a + costs.touch(progress?.let { p -> { b: Long -> p(a + b) } })
     }
     /** I byte che [touch] leggerebbe. */
-    val touchBytes: Long get() = heads.touchBytes + costs.touchBytes
+    val touchBytes: Long get() = (heads?.touchBytes ?: 0L) + costs.touchBytes
 
-    override fun close() { costs.close(); heads.close() }
+    override fun close() { costs.close(); heads?.close() }
 
     companion object {
         const val NO_ENTRY = -1
         const val ENTRY_BYTES = 16L
+        /** Le teste compatte (formato 5). */
+        const val INDEX = "turn_index"
+        /** Le teste per nodo (formato 4, e file di lavoro durante l'import). */
+        const val LEGACY_HEADS = "turn_heads"
     }
 }
 

@@ -6,18 +6,22 @@ import java.io.File
 import java.util.Properties
 
 /**
- * Deposito di stringhe (nomi delle strade) con de-duplicazione.
+ * Deposito di stringhe (nomi delle strade e stringhe di guida) con de-duplicazione.
  * Record: u16 lunghezza in byte UTF-8 + byte. Puntatore 0 = stringa vuota. I puntatori partono da 1.
+ *
+ * Ogni stringa è scritta una volta sola: durante l'import una mappa di tutte le stringhe già scritte
+ * dà il puntatore di quelle ripetute (fino al formato 4 si ricordavano solo le ultime 1000, e in
+ * Germania 3,2 M record erano 0,65 M stringhe diverse: 56 MB invece di 14). Il formato del file e i
+ * lettori non cambiano; i puntatori di stringhe uguali ora coincidono.
  */
 class StringStore(private var da: DataAccess) : Closeable {
     private var bytePointer = 1L
-    private val recent = object : LinkedHashMap<String, Int>(2048, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Int>?) = size > 1000
-    }
+    /** Le stringhe scritte e i loro puntatori (solo in scrittura: un grafo caricato non scrive). */
+    private val written = HashMap<String, Int>()
 
     fun put(value: String): Int {
         if (value.isEmpty()) return 0
-        recent[value]?.let { return it }
+        written[value]?.let { return it }
         var bytes = value.toByteArray(Charsets.UTF_8)
         if (bytes.size > MAX_BYTES) bytes = bytes.copyOf(MAX_BYTES)
         var ptr = bytePointer
@@ -28,7 +32,7 @@ class StringStore(private var da: DataAccess) : Closeable {
         da.setShort(ptr, bytes.size.toShort())
         da.setBytes(ptr + 2, bytes, bytes.size)
         bytePointer = ptr + 2 + bytes.size
-        recent[value] = ptr.toInt()
+        written[value] = ptr.toInt()
         return ptr.toInt()
     }
 

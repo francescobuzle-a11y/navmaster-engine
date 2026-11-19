@@ -1,5 +1,6 @@
 package it.navmaster.engine.ch
 
+import it.navmaster.engine.isReadableGraphFormat
 import it.navmaster.engine.GRAPH_FORMAT_VERSION
 import it.navmaster.engine.routing.NodeHeap
 import it.navmaster.engine.storage.GraphDirectory
@@ -190,7 +191,7 @@ class CoreLandmarks private constructor(
             val da = dir.open("landmarks_$name", 1 shl 20) ?: return null
             var keep = false
             try {
-                if (da.getHeader(0) != GRAPH_FORMAT_VERSION || da.getHeader(3) != nodeCount) return null
+                if (!isReadableGraphFormat(da.getHeader(0)) || da.getHeader(3) != nodeCount) return null
                 val k = da.getHeader(1); val coreCount = da.getHeader(2)
                 val avoid = da.getHeader(4); val sharedIndex = da.getHeader(5) == 1
                 if (sharedIndex && (base == null || base.coreIndex.size != nodeCount)) return null

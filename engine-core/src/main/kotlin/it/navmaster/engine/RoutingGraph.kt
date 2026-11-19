@@ -470,7 +470,7 @@ class RoutingGraph private constructor(
             val gdir = GraphDirectory(dir, mmap)
             val graph = BaseGraph(gdir, encoding.registry)
             val tc = TurnCostStorage(gdir, TurnCostEncoding(profiles.map { it.name }))
-            val guidance = if (importOptions.guidance) GuidanceStore(gdir.create("guidance"), graph.names) else null
+            val guidance = if (importOptions.guidance) GuidanceStore.forImport(gdir, graph.names) else null
             val points = if (importOptions.guidance) PointStore(gdir.create("points")) else null
             val rg = RoutingGraph(dir, encoding, graph, tc, guidance, points)
             val stats = OsmGraphImporter(graph, encoding, tc, importOptions, guidance, points).import(source)

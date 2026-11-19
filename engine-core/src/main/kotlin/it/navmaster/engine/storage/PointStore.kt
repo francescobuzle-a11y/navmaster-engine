@@ -1,5 +1,6 @@
 package it.navmaster.engine.storage
 
+import it.navmaster.engine.isReadableGraphFormat
 import it.navmaster.engine.GRAPH_FORMAT_VERSION
 import java.io.Closeable
 
@@ -60,7 +61,7 @@ class PointStore(private var da: DataAccess) : Closeable {
 
         fun load(dir: GraphDirectory): PointStore? {
             val da = dir.open("points") ?: return null
-            if (da.getHeader(0) != GRAPH_FORMAT_VERSION || da.getHeader(1) != ENTRY_BYTES) { da.close(); return null }
+            if (!isReadableGraphFormat(da.getHeader(0)) || da.getHeader(1) != ENTRY_BYTES) { da.close(); return null }
             return PointStore(da).also { it.count = da.getHeader(2) }
         }
     }
