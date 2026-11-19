@@ -114,6 +114,10 @@ jobs:
         if: inputs.probe != 'no' && contains(inputs.countries || 'austria,czech-republic', 'czech-republic') && contains(inputs.countries || 'austria,czech-republic', 'austria')
         run: |
           ./gradlew --no-daemon :engine-core:test --tests it.navmaster.engine.api.BrnoMikulovProbeTest -i 2>&1 | tee sonda.log | grep -E "^\s{4}sonda|PASSED|FAILED|BUILD" || true
+      - name: Sonda alpina (Canneto → Wien e Bielsko-Biała per Tarvisio, Pusteria e Brennero)
+        if: inputs.probe != 'no' && contains(inputs.countries || 'austria,czech-republic', 'italy') && contains(inputs.countries || 'austria,czech-republic', 'austria')
+        run: |
+          ./gradlew --no-daemon :engine-core:test --tests it.navmaster.engine.api.AlpineRouteProbeTest -i 2>&1 | tee sonda-alpi.log | grep -E "^\s{4}sonda|PASSED|FAILED|BUILD" || true
       - name: Prova del modello delle velocità
         run: |
           ./gradlew --no-daemon :engine-core:test --tests it.navmaster.engine.SpeedModelRealTest -i 2>&1 | tee prova.log | grep -E "^\s{4}velocità|PASSED|FAILED|BUILD|AssertionError" || true
@@ -127,4 +131,5 @@ jobs:
             /mnt/w/import-*.log
             /mnt/w/dem-*.log
             sonda.log
+            sonda-alpi.log
             prova.log
