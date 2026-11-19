@@ -130,16 +130,36 @@ class AlpineRouteProbeTest {
         // il migliore del motore tra Paesi, e lo stesso obbligato per ogni valico (punto di passaggio 3 km dopo il valico)
         val pool = Executors.newFixedThreadPool(1) { r -> Thread(r, "nm-leg").also { t -> t.isDaemon = true } }
         try {
-            val cb = CrossBorderDirections(graphs, { a, b -> if (setOf(a.id, b.id) == setOf("italy", "austria")) all else Transfers.find(a.graph, b.graph) }, { })
+            val tcache = HashMap<String, List<Transfer>>()
+            val transfers = { a: CountryGraph, b: CountryGraph -> synchronized(tcache) { tcache.getOrPut(listOf(a.id, b.id).sorted().joinToString("-")) { Transfers.find(a.graph, b.graph) } } }
+            var verbose = false
+            val vlog: (String) -> Unit = { line -> if (verbose) println("sonda registro: $line") }
+            val cb = CrossBorderDirections(graphs, transfers, vlog)
             fun trip(tag: String, pts: List<Pair<Double, Double>>) {
                 val via = pts.indices.map { i -> i in 1 until pts.size - 1 }
                 val t0 = System.currentTimeMillis()
-                val doc = try { cb.handle(request(pts, via), List(pts.size) { null }, RequestContext(CancelToken(), RequestContext.MAIN, pool, SearchSlots(2), { })) }
+                val doc = try { cb.handle(request(pts, via), List(pts.size) { null }, RequestContext(CancelToken(), RequestContext.MAIN, pool, SearchSlots(2), vlog)) }
                     catch (e: Exception) { println("$tag: errore ${e.message}"); return }
                 @Suppress("UNCHECKED_CAST") val f = (doc["features"] as List<Map<String, Any?>>).first()
                 val summary = (f["properties"] as Map<*, *>)["summary"] as Map<*, *>
                 println("$tag: %.1f min, %.1f km, peso %.0f, valichi %s, in %d ms".format((summary["duration"] as Number).toDouble() / 60,
                     (summary["distance"] as Number).toDouble() / 1000, cb.lastWeight, cb.lastCrossings.joinToString { c -> "%.5f,%.5f".format(c.lat, c.lon) }, System.currentTimeMillis() - t0))
+            }
+            // con Cechia e Polonia: Canneto → Bielsko-Biała, il migliore (col registro del motore) e obbligato per ogni valico alpino
+            if (graphs.any { g -> g.id == "czech-republic" } && graphs.any { g -> g.id == "poland" }) {
+                val bielsko = 49.8224 to 19.0444
+                verbose = true
+                trip("sonda motore Canneto → Bielsko-Biała migliore", listOf(canneto, bielsko))
+                verbose = false
+                for (f in best) {
+                    val (lat, lon) = f.atLeg.points().let { p -> val i = minOf(p.size - 1, p.size / 40); p.lat(i) to p.lon(i) }
+                    trip("sonda motore Canneto → Bielsko-Biała per ${f.place}", listOf(canneto, lat to lon, bielsko))
+                }
+                // e obbligato per Tarvisio e poi Mikulov (A5 prima del confine)
+                best.firstOrNull { f -> f.place == "Tarvisio" }?.let { f ->
+                    val (lat, lon) = f.atLeg.points().let { p -> val i = minOf(p.size - 1, p.size / 40); p.lat(i) to p.lon(i) }
+                    trip("sonda motore Canneto → Bielsko-Biała per Tarvisio e Drasenhofen", listOf(canneto, lat to lon, 48.7505 to 16.6380, bielsko))
+                }
             }
             trip("sonda motore Canneto → Wien migliore", listOf(canneto, wien))
             for (f in best) {
