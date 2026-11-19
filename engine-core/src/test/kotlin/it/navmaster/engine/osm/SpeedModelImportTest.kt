@@ -20,9 +20,11 @@ import it.navmaster.engine.weighting.WeightingFactory
 import it.navmaster.engine.weighting.WeightingMethod
 import java.io.File
 import java.nio.file.Files
+import kotlin.math.abs
 import kotlin.math.min
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /** Il modello delle velocità all'import: ORS identico a prima, NAVMASTER senza gli artefatti delle way corte. */
@@ -295,6 +297,112 @@ class SpeedModelImportTest {
             val middle = g.getFlags(edgeOf(13))
             assertEquals(signal, hgv.delay!!.get(middle, false)); assertEquals(signal, hgv.delay!!.get(middle, true))
         }
+    }
+
+    /**
+     * Divieti di transito (HgvTransit): una secondaria corta A–M–B vietata al transito dei camion sopra
+     * 7,5 t (Fernpass, `maxweightrating:hgv=7.5` + `none @ destination; none @ delivery`) e una statale
+     * più lunga A–D1–D2–B; più qualche way di prova attaccata a B.
+     */
+    private fun transitArea(): MemoryOsm {
+        val nodes = listOf(
+            Node(1, 47.0, 10.0), Node(3, 47.0, 10.05), Node(2, 47.0, 10.1),          // A, M, B
+            Node(4, 47.05, 10.0), Node(5, 47.05, 10.1),                              // D1, D2
+            Node(6, 46.99, 10.1), Node(7, 46.98, 10.1), Node(8, 46.97, 10.1), Node(9, 46.96, 10.1), Node(20, 46.95, 10.1),
+            Node(21, 46.94, 10.1), Node(22, 46.93, 10.1),
+        )
+        val fernpass = mapOf("highway" to "secondary", "ref" to "B 179", "maxweightrating:hgv" to "7.5", "maxweightrating:hgv:conditional" to "none @ destination; none @ delivery")
+        val ways = listOf(
+            OsmWay(10, fernpass, longArrayOf(1, 3)),
+            OsmWay(11, fernpass, longArrayOf(3, 2)),
+            OsmWay(12, mapOf("highway" to "primary"), longArrayOf(1, 4, 5, 2)),
+            // B171: il divieto solo nel senso della way (B → 6)
+            OsmWay(13, mapOf("highway" to "secondary", "maxweightrating:hgv:forward" to "7.5", "maxweightrating:hgv:forward:conditional" to "none @ destination"), longArrayOf(2, 6)),
+            // via di consegna: prima chiusa al camion
+            OsmWay(14, mapOf("highway" to "residential", "hgv" to "delivery"), longArrayOf(6, 7)),
+            // access=destination e hgv=destination: ×10, non ×100
+            OsmWay(15, mapOf("highway" to "secondary", "access" to "destination", "hgv" to "destination"), longArrayOf(7, 8)),
+            // maxweight con deroga per destinazione; e con un limite d'altezza
+            OsmWay(16, mapOf("highway" to "secondary", "maxweight" to "7.5", "maxweight:conditional" to "none @ destination"), longArrayOf(8, 9)),
+            OsmWay(17, mapOf("highway" to "secondary", "maxweight" to "7.5", "maxweight:conditional" to "none @ destination", "maxheight" to "3.5"), longArrayOf(9, 20)),
+            // FR: ponte da 19 t (maxweightrating senza deroga) e divieto sopra 26 t
+            OsmWay(18, mapOf("highway" to "secondary", "maxweightrating" to "19"), longArrayOf(20, 21)),
+            OsmWay(19, mapOf("highway" to "secondary", "hgv:conditional" to "no @ (weight>26)"), longArrayOf(21, 22)),
+        )
+        return MemoryOsm(nodes, ways)
+    }
+
+    @Test
+    fun `a transit ban weighs x10 for the truck only, in its direction - nothing changes with the ORS model`() {
+        fun check(profiles: List<VehicleProfile>, navmaster: Boolean) = imported(profiles, transitArea()) { g, enc, stats ->
+            assertEquals(navmaster, enc.shared.withTransit)
+            val iter = g.createEdgeIterator()
+            fun edgeOf(way: Long) = (0 until g.edgeCount).first { enc.shared.osmWayId.get(g.getFlags(it)).toLong() == way }
+            /** Il peso dell'arco di [way] (nel senso della way, o contro) diviso per lo stesso peso senza le penalità d'accesso. */
+            fun ratio(profile: String, way: Long, reverse: Boolean): Double {
+                val pe = enc.profile(profile)
+                val full = WeightingFactory.create(enc, pe, WeightingMethod.RECOMMENDED)
+                val base = if (profile == "car-ors") FastestWeighting(pe) else it.navmaster.engine.weighting.PriorityWeighting(pe, FastestWeighting(pe), enc.priorityModel)
+                val e = edgeOf(way); iter.setEdge(e, g.nodeA(e))
+                return full.edgeWeight(iter, reverse) / base.edgeWeight(iter, reverse)
+            }
+            val ban = if (navmaster) 10.0 else 1.0
+            for (way in listOf(10L, 11L)) for (rev in listOf(false, true)) {
+                assertEquals(ban, ratio("heavyvehicle", way, rev), 1e-9, "way $way")
+                assertEquals(1.0, ratio("car-ors", way, rev), 1e-9, "auto, way $way")
+            }
+            assertEquals(ban, ratio("heavyvehicle", 13, false), 1e-9, "B171 nel senso del divieto")
+            assertEquals(1.0, ratio("heavyvehicle", 13, true), 1e-9, "B171 nell'altro senso")
+            assertEquals(10.0, ratio("heavyvehicle", 15, false), 1e-9, "access=destination più il divieto: ×10")
+            assertEquals(10.0, ratio("car-ors", 15, false), 1e-9)
+            // la priorità resta quella della strada (nessun REACH_DEST in più)
+            val hgv = enc.profile("heavyvehicle")
+            assertEquals(hgv.priority.get(g.getFlags(edgeOf(12))), hgv.priority.get(g.getFlags(edgeOf(10))))
+
+            // il filtro del camion (40 t, 4 m)
+            val params = it.navmaster.engine.weighting.VehicleParameters(weight = 40.0, height = 4.0)
+            val filter = it.navmaster.engine.weighting.EdgeFilterFactory.create(enc, "heavyvehicle", params = params)
+            fun accepted(way: Long): Boolean { val e = edgeOf(way); iter.setEdge(e, g.nodeA(e)); return filter.accept(iter) }
+            assertEquals(navmaster, accepted(14), "hgv=delivery")
+            assertEquals(navmaster, accepted(16), "maxweight con deroga")
+            assertFalse(accepted(17), "la deroga sul peso non apre il limite d'altezza")
+            assertEquals(!navmaster, accepted(18), "ponte da 19 t (maxweightrating)")
+            assertEquals(!navmaster, accepted(19), "no @ (weight>26)")
+            assertTrue(accepted(10) && accepted(12))
+            // l'auto coi pesi non vede la deroga del camion
+            val van = it.navmaster.engine.weighting.EdgeFilterFactory.create(enc, "car-ors", params = it.navmaster.engine.weighting.VehicleParameters(weight = 12.0))
+            run { val e = edgeOf(16); iter.setEdge(e, g.nodeA(e)); assertFalse(van.accept(iter)) }
+
+            // i percorsi: A → B, e A → M (a metà del tratto vietato)
+            fun node(lat: Double, lon: Double) = (0 until g.nodeCount).first { abs(g.lat(it) - lat) < 1e-6 && abs(g.lon(it) - lon) < 1e-6 }
+            fun best(profile: String, from: Int, to: Int): Double {
+                val d = it.navmaster.engine.routing.BidirectionalDijkstra(g, WeightingFactory.create(enc, enc.profile(profile), WeightingMethod.RECOMMENDED), filter)
+                d.addSource(from, 0.0); d.addTarget(to, 0.0)
+                return if (d.run()) d.bestWeight else Double.POSITIVE_INFINITY
+            }
+            fun wayWeight(profile: String, vararg ways: Long): Double = ways.sumOf { way ->
+                val e = edgeOf(way); iter.setEdge(e, g.nodeA(e)); WeightingFactory.create(enc, enc.profile(profile), WeightingMethod.RECOMMENDED).edgeWeight(iter, false)
+            }
+            val a = node(47.0, 10.0); val m = node(47.0, 10.05); val b = node(47.0, 10.1)
+            val viaBan = wayWeight("heavyvehicle", 10, 11); val detour = wayWeight("heavyvehicle", 12)
+            val truck = best("heavyvehicle", a, b)
+            println("transito ${if (navmaster) "NAVMASTER" else "ORS"}: camion A→B ${"%.0f".format(truck)}, per il divieto ${"%.0f".format(viaBan)}, per la statale ${"%.0f".format(detour)}; archi vietati ${stats.hgvTransitEdges} ${stats.hgvTransitKmByClass}")
+            if (navmaster) {
+                assertEquals(detour, truck, 1e-6, "il camion gira dalla statale")
+                assertTrue(viaBan > detour)
+                assertEquals(wayWeight("heavyvehicle", 10), best("heavyvehicle", a, m), 1e-6, "a metà del tratto vietato ci arriva dal capo vicino")
+                assertEquals(7, stats.hgvTransitEdges) // 10, 11, 13, 14, 15, 16, 17
+                assertEquals(setOf("secondary", "residential"), stats.hgvTransitKmByClass.keys)
+            } else {
+                assertEquals(viaBan, truck, 1e-6, "ORS: il camion passa dal divieto come prima")
+                assertEquals(0, stats.hgvTransitEdges)
+            }
+            val carDijkstra = it.navmaster.engine.routing.BidirectionalDijkstra(g, WeightingFactory.create(enc, enc.profile("car-ors"), WeightingMethod.RECOMMENDED))
+            carDijkstra.addSource(a, 0.0); carDijkstra.addTarget(b, 0.0)
+            assertTrue(carDijkstra.run()); assertEquals(wayWeight("car-ors", 10, 11), carDijkstra.bestWeight, 1e-6, "l'auto passa dalla secondaria")
+        }
+        check(navProfiles("AT"), navmaster = true)
+        check(listOf(CarProfile(), HgvProfile()), navmaster = false)
     }
 
     /** Coordinate arrotondate al decimetro circa (il grafo le tronca a 1e-7 gradi). */

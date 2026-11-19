@@ -1,9 +1,11 @@
 package it.navmaster.engine.storage
 
+import it.navmaster.engine.profile.HgvTransit
 import it.navmaster.engine.profile.NodeDelays
 import it.navmaster.engine.profile.PriorityModel
 import it.navmaster.engine.profile.RoadAccess
 import it.navmaster.engine.profile.RoadClass
+import it.navmaster.engine.profile.SpeedModel
 import it.navmaster.engine.profile.Toll
 import it.navmaster.engine.profile.VehicleProfile
 import it.navmaster.engine.profile.WayAttributes
@@ -56,8 +58,10 @@ class ProfileEncoding(val profile: VehicleProfile, withDelay: Boolean = true) {
  *
  * @param withAdr i valori delle merci pericolose aggiunti a novembre 2026 ([adrTunnel], [hazmatGeneral],
  *   [hazmatWater]); `false` per aprire i grafi costruiti prima, che non li hanno (vedi [GraphEncoding.forExisting]).
+ * @param withTransit i divieti di transito dei mezzi pesanti ([hgvDestination], [hgvWeightExempt]), solo
+ *   nei grafi del modello NAVMASTER costruiti da novembre 2026.
  */
-class SharedEncoding(val withAdr: Boolean = true) {
+class SharedEncoding(val withAdr: Boolean = true, val withTransit: Boolean = false) {
     val roundabout = BooleanEncodedValue("roundabout")
     val roadClass = EnumEncodedValue("road_class", RoadClass.entries.toTypedArray())
     val roadClassLink = BooleanEncodedValue("road_class_link")
@@ -82,6 +86,14 @@ class SharedEncoding(val withAdr: Boolean = true) {
     val hazmatGeneral: BooleanEncodedValue? = if (withAdr) BooleanEncodedValue("hazmat_general") else null
     /** `hazmat:water=no`; null nei grafi vecchi. */
     val hazmatWater: BooleanEncodedValue? = if (withAdr) BooleanEncodedValue("hazmat_water") else null
+    /**
+     * Tratto vietato al transito dei mezzi pesanti, per senso ([HgvTransit]): il camion lo usa solo per
+     * arrivare o partire (peso ×10 nel profilo heavyvehicle, LimitedAccessWeighting). Null nei grafi ORS
+     * e in quelli di prima.
+     */
+    val hgvDestination: BooleanEncodedValue? = if (withTransit) BooleanEncodedValue("hgv_destination", twoDirections = true) else null
+    /** Il limite di peso ha la deroga per destinazione: il filtro del camion non blocca sul peso. Null come [hgvDestination]. */
+    val hgvWeightExempt: BooleanEncodedValue? = if (withTransit) BooleanEncodedValue("hgv_weight_exempt") else null
 
     internal fun register(b: EncodedValueRegistry.Builder) {
         b.add(roundabout).add(roadClass).add(roadClassLink).add(roadAccess).add(toll)
@@ -93,6 +105,16 @@ class SharedEncoding(val withAdr: Boolean = true) {
     internal fun registerAdr(b: EncodedValueRegistry.Builder) {
         if (!withAdr) return
         b.add(adrTunnel!!).add(hazmatGeneral!!).add(hazmatWater!!)
+    }
+
+    /**
+     * Registrati per ultimi, dopo i ritardi ai nodi: gli altri bit restano dove erano. Con due profili
+     * (car-ors e heavyvehicle, come grafo-nm) i 3 bit occupano gli ultimi liberi del sesto int: 192 bit
+     * su 192, nessun bit libero; un valore in più vorrebbe dire 7 int per arco.
+     */
+    internal fun registerTransit(b: EncodedValueRegistry.Builder) {
+        if (!withTransit) return
+        b.add(hgvDestination!!).add(hgvWeightExempt!!)
     }
 
     fun write(flags: IntArray, a: WayAttributes) {
@@ -112,6 +134,10 @@ class SharedEncoding(val withAdr: Boolean = true) {
         adrTunnel?.set(flags, a.adrTunnel)
         hazmatGeneral?.set(flags, a.hazmatGeneral)
         hazmatWater?.set(flags, a.hazmatWater)
+        hgvDestination?.let { ev ->
+            ev.set(flags, false, a.hgvTransit and HgvTransit.FWD != 0); ev.set(flags, true, a.hgvTransit and HgvTransit.BWD != 0)
+        }
+        hgvWeightExempt?.set(flags, a.hgvTransit and HgvTransit.EXEMPT != 0)
     }
 }
 
@@ -121,9 +147,16 @@ class SharedEncoding(val withAdr: Boolean = true) {
  *
  * @param withDelay i ritardi ai nodi (`<profilo>_delay`, novembre 2026); di default presenti solo con i valori
  *   ADR, che sono più vecchi: uno schema senza ADR è quello dei grafi di prima di entrambi.
+ * @param withTransit i divieti di transito dei mezzi pesanti (novembre 2026, [SharedEncoding.hgvDestination]):
+ *   di default solo per i profili del modello NAVMASTER in uno schema coi ritardi; mai nei grafi ORS, che
+ *   restano identici. Un motore di prima non apre i grafi che li hanno (valori codificati diversi, e la
+ *   variante di formato `navmaster-transito`, vedi RoutingGraph): prima l'app, poi i grafi.
  */
-class GraphEncoding(profiles: List<VehicleProfile>, withAdr: Boolean = true, val withDelay: Boolean = withAdr) {
-    val shared = SharedEncoding(withAdr)
+class GraphEncoding(
+    profiles: List<VehicleProfile>, withAdr: Boolean = true, val withDelay: Boolean = withAdr,
+    withTransit: Boolean = withDelay && profiles.any { it.options.speedModel == SpeedModel.NAVMASTER },
+) {
+    val shared = SharedEncoding(withAdr, withTransit)
     val profiles: List<ProfileEncoding> = profiles.map { ProfileEncoding(it, withDelay) }
     val registry: EncodedValueRegistry
 
@@ -142,22 +175,31 @@ class GraphEncoding(profiles: List<VehicleProfile>, withAdr: Boolean = true, val
         this.profiles.forEach { it.register(b) }
         shared.registerAdr(b)
         this.profiles.forEach { it.registerDelay(b) }
+        shared.registerTransit(b)
         registry = b.build()
     }
 
     companion object {
         /**
          * Lo schema di un grafo già costruito, dalla descrizione salvata nelle sue properties
-         * (`graph.encoded_values`): quello attuale (ADR e ritardi ai nodi) o, per i grafi di prima, quello
-         * senza i ritardi (ottobre–novembre 2026) o senza ADR né ritardi. Se nessuno coincide restituisce
-         * l'attuale (il caricamento poi segnala la differenza).
+         * (`graph.encoded_values`): quello dei profili dati (ADR e ritardi ai nodi; i profili letti dal disco
+         * sono del modello ORS, quindi senza i divieti di transito), quello coi divieti di transito (grafi
+         * NAVMASTER da novembre 2026) o, per i grafi di prima, quello senza i ritardi (ottobre–novembre
+         * 2026) o senza ADR né ritardi. Se nessuno coincide restituisce il primo (il caricamento poi
+         * segnala la differenza).
          */
         fun forExisting(profiles: List<VehicleProfile>, described: String?): GraphEncoding {
             val current = GraphEncoding(profiles)
             if (described == null || described == current.registry.describe()) return current
-            val noDelay = GraphEncoding(profiles, withAdr = true, withDelay = false)
+            if (!current.shared.withTransit) {
+                val transit = GraphEncoding(profiles, withTransit = true)
+                if (described == transit.registry.describe()) return transit
+            }
+            val noTransit = GraphEncoding(profiles, withTransit = false)
+            if (described == noTransit.registry.describe()) return noTransit
+            val noDelay = GraphEncoding(profiles, withAdr = true, withDelay = false, withTransit = false)
             if (described == noDelay.registry.describe()) return noDelay
-            val old = GraphEncoding(profiles, withAdr = false, withDelay = false)
+            val old = GraphEncoding(profiles, withAdr = false, withDelay = false, withTransit = false)
             return if (described == old.registry.describe()) old else current
         }
     }

@@ -51,8 +51,15 @@ object GuidanceParser {
     private val conditionalKeys = listOf("access:conditional", "vehicle:conditional", "motor_vehicle:conditional", "hgv:conditional", "goods:conditional",
         "bus:conditional", "maxweight:conditional", "maxweight:hgv:conditional", "maxheight:conditional", "maxwidth:conditional", "maxlength:conditional",
         "maxaxleload:conditional", "maxspeed:conditional", "maxspeed:hgv:conditional", "hazmat:conditional", "oneway:conditional")
+    /**
+     * Le deroghe dei limiti di classe (`maxweightrating`, [HgvTransit]): solo nei grafi coi divieti di
+     * transito (modello NAVMASTER), così il file `guidance` dei grafi ORS resta quello di prima.
+     */
+    private val transitConditionalKeys = listOf("maxweightrating:conditional", "maxweightrating:forward:conditional", "maxweightrating:backward:conditional",
+        "maxweightrating:hgv:conditional", "maxweightrating:hgv:forward:conditional", "maxweightrating:hgv:backward:conditional")
 
-    fun parse(way: OsmWay): GuidanceAttributes {
+    /** @param transitBans grafo coi divieti di transito (modello NAVMASTER): anche le deroghe di `maxweightrating`. */
+    fun parse(way: OsmWay, transitBans: Boolean = false): GuidanceAttributes {
         val oneway = oneway(way)
         // `turn:lanes` senza suffisso vale per il verso di marcia di un senso unico (come la guida di GraphHopper);
         // su una strada a doppio senso contano solo `turn:lanes:forward|backward`
@@ -79,7 +86,7 @@ object GuidanceParser {
             destinationRefFwd = way.tag("destination:ref:forward") ?: (if (oneway != -1) plainDestRef else ""),
             destinationRefBwd = way.tag("destination:ref:backward") ?: (if (oneway != 1) plainDestRef else ""),
             adrTunnel = adrTunnel(way),
-            conditional = conditional(way),
+            conditional = conditional(way, transitBans),
             laneSignsFwd = laneSigns(way, "forward", oneway != -1),
             laneSignsBwd = laneSigns(way, "backward", oneway == -1),
             widthSigned = way.hasTag("maxwidth") || way.hasTag("maxwidth:physical"),
@@ -111,9 +118,9 @@ object GuidanceParser {
     /** Categoria ADR della galleria (B = 2 … E = 5, 0 se nessuna): la stessa regola del routing, [WayAttributeParser.adrTunnel]. */
     fun adrTunnel(way: OsmWay): Int = WayAttributeParser.adrTunnel(way)
 
-    fun conditional(way: OsmWay): String {
+    fun conditional(way: OsmWay, transitBans: Boolean = false): String {
         val sb = StringBuilder()
-        for (k in conditionalKeys) {
+        for (k in if (transitBans) conditionalKeys + transitConditionalKeys else conditionalKeys) {
             val v = way.tag(k) ?: continue
             if (sb.isNotEmpty()) sb.append(GuidanceAttributes.SEP_ITEM)
             sb.append(k).append('=').append(v.replace(GuidanceAttributes.SEP_ITEM, ' ').replace(GuidanceAttributes.SEP_FIELD, ' '))

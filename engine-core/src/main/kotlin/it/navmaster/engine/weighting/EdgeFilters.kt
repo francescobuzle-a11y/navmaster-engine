@@ -89,7 +89,9 @@ class HeavyVehicleEdgeFilter(
         if (edge.get(shared.hgvBlocked) and vehicleType != 0) return false
         if (params == null || !params.hasAttributes) return true
         if (params.dangerousGoods && hazmatBlocked(edge, shared, params, guidance)) return false
-        return !params.blockedBy(edge.get(shared.maxHeight), edge.get(shared.maxWidth), edge.get(shared.maxLength), edge.get(shared.maxWeight), edge.get(shared.maxAxleLoad))
+        // limite di peso con la deroga per destinazione (grafi NAVMASTER): non blocca, il tratto pesa ×10 (HgvTransit)
+        val maxWeight = if (shared.hgvWeightExempt?.let { edge.get(it) } == true) Double.POSITIVE_INFINITY else edge.get(shared.maxWeight)
+        return !params.blockedBy(edge.get(shared.maxHeight), edge.get(shared.maxWidth), edge.get(shared.maxLength), maxWeight, edge.get(shared.maxAxleLoad))
     }
 }
 

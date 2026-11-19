@@ -4,6 +4,7 @@ import it.navmaster.engine.profile.PriorityModel
 import it.navmaster.engine.profile.RoadAccess
 import it.navmaster.engine.profile.RoadClass
 import it.navmaster.engine.storage.BaseGraph
+import it.navmaster.engine.storage.BooleanEncodedValue
 import it.navmaster.engine.storage.GraphEncoding
 import it.navmaster.engine.storage.ProfileEncoding
 import kotlin.math.pow
@@ -92,6 +93,14 @@ class PriorityWeighting(private val p: ProfileEncoding, private val base: Weight
 /**
  * Penalità per strade ad accesso limitato (ORS `LimitedAccessWeighting`): per i veicoli a motore
  * ×10 su `destination` e `private`, ×1.5 su `customers`, ×1.2 su `highway=service`.
+ *
+ * Estensione NavMaster (grafi NAVMASTER, solo profilo heavyvehicle): con [hgvDestination] i tratti vietati
+ * al transito dei mezzi pesanti nel senso di marcia ([it.navmaster.engine.profile.HgvTransit]) pesano
+ * [transitFactor] volte: il fattore è il massimo fra quello di `road_access` e questo, non il prodotto
+ * (`access=destination` più un divieto per i camion resta ×10, non ×100), e la priorità dell'arco non
+ * cambia. Contro una statale normale (PREFER, ×0,79) un tratto vietato costa quindi ×10 a parità di
+ * tempo; contro un'autostrada (VERY_NICE, ×0,75 nel modello NAVMASTER) ×10,5. Peso fisso: CH, core e
+ * landmark sono preparati con questo. Senza [hgvDestination] (grafi ORS, auto) il calcolo è quello di sempre.
  */
 class LimitedAccessWeighting(
     private val shared: GraphEncoding,
@@ -100,11 +109,13 @@ class LimitedAccessWeighting(
     private val privateFactor: Double = 10.0,
     private val customersFactor: Double = 1.5,
     private val serviceFactor: Double = 1.2,
+    private val hgvDestination: BooleanEncodedValue? = null,
+    private val transitFactor: Double = 10.0,
 ) : Weighting {
     override val name get() = base.name
 
     init {
-        for (f in listOf(destinationFactor, privateFactor, customersFactor, serviceFactor)) require(f in 1.0..10.0) { "fattore fuori da [1,10]: $f" }
+        for (f in listOf(destinationFactor, privateFactor, customersFactor, serviceFactor, transitFactor)) require(f in 1.0..10.0) { "fattore fuori da [1,10]: $f" }
     }
 
     override fun minWeight(distanceMeters: Double) = base.minWeight(distanceMeters)
@@ -112,11 +123,24 @@ class LimitedAccessWeighting(
     override fun edgeWeight(edge: BaseGraph.EdgeIterator, reverse: Boolean): Double {
         var w = base.edgeWeight(edge, reverse)
         if (w.isInfinite()) return w
-        when (edge.get(shared.shared.roadAccess)) {
-            RoadAccess.DESTINATION -> w *= destinationFactor
-            RoadAccess.PRIVATE -> w *= privateFactor
-            RoadAccess.CUSTOMERS -> w *= customersFactor
-            else -> {}
+        val transit = hgvDestination
+        if (transit == null) {
+            // il calcolo di ORS, con le stesse moltiplicazioni nello stesso ordine
+            when (edge.get(shared.shared.roadAccess)) {
+                RoadAccess.DESTINATION -> w *= destinationFactor
+                RoadAccess.PRIVATE -> w *= privateFactor
+                RoadAccess.CUSTOMERS -> w *= customersFactor
+                else -> {}
+            }
+        } else {
+            var f = when (edge.get(shared.shared.roadAccess)) {
+                RoadAccess.DESTINATION -> destinationFactor
+                RoadAccess.PRIVATE -> privateFactor
+                RoadAccess.CUSTOMERS -> customersFactor
+                else -> 1.0
+            }
+            if (if (reverse) edge.getReverse(transit) else edge.get(transit)) f = maxOf(f, transitFactor)
+            if (f != 1.0) w *= f
         }
         if (edge.get(shared.shared.roadClass) == RoadClass.SERVICE) w *= serviceFactor
         return w
@@ -143,7 +167,9 @@ object WeightingFactory {
             WeightingMethod.SHORTEST -> ShortestWeighting(profile)
             WeightingMethod.RECOMMENDED -> PriorityWeighting(profile, FastestWeighting(profile, maximumSpeed), encoding.priorityModel)
         }
-        return LimitedAccessWeighting(encoding, base)
+        // i divieti di transito solo per il camion (grafi NAVMASTER): l'auto, anche nei grafi misti, pesa come prima
+        val transit = if (profile.profile.name == "heavyvehicle") encoding.shared.hgvDestination else null
+        return LimitedAccessWeighting(encoding, base, hgvDestination = transit)
     }
 }
 

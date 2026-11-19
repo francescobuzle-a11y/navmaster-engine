@@ -426,15 +426,27 @@ class RoutingGraph private constructor(
         /** La variante del formato dei grafi preparati col peso consigliato NAVMASTER ([BaseGraph.formatVariant]). */
         const val PRIORITY_VARIANT = "navmaster"
 
+        /**
+         * La variante dei grafi NAVMASTER coi divieti di transito dei mezzi pesanti (novembre 2026,
+         * [it.navmaster.engine.profile.HgvTransit]): peso consigliato NAVMASTER più i valori
+         * `hgv_destination` e `hgv_weight_exempt` e il ×10 del camion nei pesi preparati. I motori di
+         * prima non aprono questi grafi (valori codificati diversi, e quelli col peso NAVMASTER vogliono
+         * la variante `navmaster` esatta): prima va installata l'app col motore nuovo, poi i grafi.
+         */
+        const val TRANSIT_VARIANT = "navmaster-transito"
+
         fun profileByName(name: String): VehicleProfile = when (name) {
             "car", "driving-car", "car-ors" -> CarProfile()
             "hgv", "driving-hgv", "truck", "heavyvehicle" -> HgvProfile()
             else -> throw IllegalArgumentException("profilo sconosciuto: $name")
         }
 
-        /** Importa un PBF in [dir] con i profili dati e lascia il grafo pronto. */
-        fun build(pbf: File, dir: File, profiles: List<VehicleProfile>, mmap: Boolean = false, importOptions: ImportOptions = ImportOptions()): Pair<RoutingGraph, ImportStats> {
-            val encoding = GraphEncoding(profiles)
+        /**
+         * Importa un PBF in [dir] con i profili dati e lascia il grafo pronto. [encoding] solo per le prove
+         * che rifanno un grafo di prima (per esempio NAVMASTER senza i divieti di transito).
+         */
+        fun build(pbf: File, dir: File, profiles: List<VehicleProfile>, mmap: Boolean = false, importOptions: ImportOptions = ImportOptions(),
+                  encoding: GraphEncoding = GraphEncoding(profiles)): Pair<RoutingGraph, ImportStats> {
             val gdir = GraphDirectory(dir, mmap)
             val graph = BaseGraph(gdir, encoding.registry)
             val tc = TurnCostStorage(gdir, TurnCostEncoding(profiles.map { it.name }))
@@ -444,8 +456,13 @@ class RoutingGraph private constructor(
             val stats = OsmGraphImporter(graph, encoding, tc, importOptions, guidance, points).import(pbf)
             rg.speedModel = (profiles.firstOrNull { it.options.speedModel == SpeedModel.NAVMASTER } ?: profiles.first()).options.speedModel.id
             rg.country = profiles.firstNotNullOfOrNull { it.options.country }
-            // i motori di prima non sanno del peso NAVMASTER: per loro il grafo ha un formato sconosciuto
-            graph.formatVariant = if (encoding.priorityModel == PriorityModel.NAVMASTER) PRIORITY_VARIANT else ""
+            // i motori di prima non sanno del peso NAVMASTER né dei divieti di transito: per loro il grafo ha un formato sconosciuto
+            check(!encoding.shared.withTransit || encoding.priorityModel == PriorityModel.NAVMASTER) { "divieti di transito senza il peso NAVMASTER" }
+            graph.formatVariant = when {
+                encoding.shared.withTransit -> TRANSIT_VARIANT
+                encoding.priorityModel == PriorityModel.NAVMASTER -> PRIORITY_VARIANT
+                else -> ""
+            }
             rg.flush()
             GraphProperties(File(dir, "profiles")).apply { load(); set("speed_model", rg.speedModel); set("country", rg.country ?: ""); set("priority_model", encoding.priorityModel.id); save() }
             rg.index = LocationIndex.build(graph)
@@ -472,8 +489,11 @@ class RoutingGraph private constructor(
             rg.country = props.get("country")?.takeIf { it.isNotBlank() }
             // il peso con cui sono stati preparati CH, core e landmark: ORS per i grafi di prima (anche NAVMASTER)
             encoding.priorityModel = PriorityModel.parse(props.get("priority_model"))
-            check((graph.formatVariant == PRIORITY_VARIANT) == (encoding.priorityModel == PriorityModel.NAVMASTER)) {
+            check((graph.formatVariant == PRIORITY_VARIANT || graph.formatVariant == TRANSIT_VARIANT) == (encoding.priorityModel == PriorityModel.NAVMASTER)) {
                 "grafo incoerente in $dir: formato «${graph.formatVariant}», priorità ${encoding.priorityModel.id}"
+            }
+            check((graph.formatVariant == TRANSIT_VARIANT) == encoding.shared.withTransit) {
+                "grafo incoerente in $dir: formato «${graph.formatVariant}», divieti di transito ${if (encoding.shared.withTransit) "presenti" else "assenti"}"
             }
             rg.landmarkSetNames = (props.get("landmark_sets") ?: "").split(',').filter { it.isNotBlank() }
             for (key in (props.get("ch") ?: "").split(',').filter { it.isNotBlank() }) {

@@ -43,6 +43,10 @@ data class ImportStats(
     val hgvSpeedByClass: Map<String, Double> = emptyMap(),
     /** Quota dei km di primary e secondary con cartello > 50 dove il camion va sotto 30 km/h (NaN se nessuno). */
     val hgvSlowSignedShare: Double = Double.NaN,
+    /** Archi vietati al transito dei mezzi pesanti in almeno un senso ([it.navmaster.engine.profile.HgvTransit]); 0 col modello ORS. */
+    val hgvTransitEdges: Int = 0,
+    /** Km di quegli archi per classe di strada (per vedere nel log della CI se finisce su autostrade o superstrade). */
+    val hgvTransitKmByClass: Map<String, Double> = emptyMap(),
 )
 
 /** Le strade su cui un casello o un portale fa pedaggio (non i parcheggi né le strade di servizio). */
@@ -111,6 +115,10 @@ class OsmGraphImporter(
     private val nodeDelays = profiles.any { it.profile.options.speedModel == SpeedModel.NAVMASTER }
     /** Modello NAVMASTER: le corsie `private` delle strade principali non bloccano i mezzi pesanti ([WayAttributeParser.parse]). */
     private val privateMainRoads = nodeDelays
+    /** Modello NAVMASTER: i divieti di transito dei mezzi pesanti, se lo schema li ha ([WayAttributeParser.parse], [it.navmaster.engine.profile.HgvTransit]). */
+    private val transitBans = nodeDelays && encoding.shared.hgvDestination != null
+    private var transitEdges = 0
+    private val transitKm = DoubleArray(it.navmaster.engine.profile.RoadClass.entries.size)
     private val controlNodes = LongIntHashMap()  // id OSM → codice di NodeDelays.classify
     /** Sensi d'arco (arco·2 + 0 avanti, + 1 indietro) con uno stop, una precedenza o un semaforo entro 30 m dal capo d'arrivo. */
     private val nearEnd = java.util.BitSet()
@@ -162,7 +170,9 @@ class OsmGraphImporter(
             speedModel = if (nodeDelays) SpeedModel.NAVMASTER else SpeedModel.ORS,
             delayEvents = if (nodeDelays) NodeDelays.Control.entries.filter { it != NodeDelays.Control.NONE }.associate { it.name to delayEvents[it.ordinal] } else emptyMap(),
             delayedEdges = delayedEdges, hgvSpeedByClass = byClass,
-            hgvSlowSignedShare = if (signedKm > 0) slowSignedKm / signedKm else Double.NaN)
+            hgvSlowSignedShare = if (signedKm > 0) slowSignedKm / signedKm else Double.NaN,
+            hgvTransitEdges = transitEdges,
+            hgvTransitKmByClass = it.navmaster.engine.profile.RoadClass.entries.filter { transitKm[it.ordinal] > 0 }.associate { it.osm to Math.round(transitKm[it.ordinal] * 10) / 10.0 })
     }
 
     /** Vero se almeno un profilo può percorrere la way; riempie [wayAccess]. */
@@ -342,7 +352,7 @@ class OsmGraphImporter(
             val copy = graph.addNode(graph.lat(tower), graph.lon(tower))
             val e = graph.addEdge(tower, copy, 0.0)
             val flags = graph.encodedValues.newFlags()
-            val attrs = WayAttributeParser.parse(way, isFerry = false, widthFromCarriageway = options.widthFromCarriageway, privateMainRoads = privateMainRoads)
+            val attrs = WayAttributeParser.parse(way, isFerry = false, widthFromCarriageway = options.widthFromCarriageway, privateMainRoads = privateMainRoads, transitBans = transitBans)
             encoding.shared.write(flags, attrs)
             for (i in profiles.indices) {
                 val pe = profiles[i]
@@ -451,7 +461,9 @@ class OsmGraphImporter(
             }
             val isFerry = way.tag("highway") == null && way.hasTag("route", "ferry", "shuttle_train")
             val flags = graph.encodedValues.newFlags()
-            encoding.shared.write(flags, tollFromNodes(way, WayAttributeParser.parse(way, isFerry, widthFromCarriageway = options.widthFromCarriageway, privateMainRoads = privateMainRoads), n))
+            val attrs = WayAttributeParser.parse(way, isFerry, widthFromCarriageway = options.widthFromCarriageway, privateMainRoads = privateMainRoads, transitBans = transitBans)
+            encoding.shared.write(flags, tollFromNodes(way, attrs, n))
+            if (attrs.hgvTransit and it.navmaster.engine.profile.HgvTransit.BOTH != 0) { transitEdges++; transitKm[attrs.roadClass.ordinal] += dist / 1000 }
             val ferryDuration = if (isFerry) OsmValues.parseDurationSeconds(way.tag("duration")) else -1L
             for (i in profiles.indices) {
                 // i traghetti: la velocità dalla durata e dalla lunghezza del tratto; le strade: la linea d'aria della way (ORS)
@@ -479,7 +491,7 @@ class OsmGraphImporter(
                 val rs = relationSigns[way.id]
                 val sA = if (rs != null && segIds.size() == n) rs.firstOrNull { it.first == segIds.get(0) }?.second else null
                 val sB = if (rs != null && segIds.size() == n) rs.firstOrNull { it.first == segIds.get(n - 1) }?.second else null
-                g.set(edge, GuidanceParser.parse(way), jA, jB, special?.toString(), sA, sB)
+                g.set(edge, GuidanceParser.parse(way, transitBans), jA, jB, special?.toString(), sA, sB)
             }
         }
     }

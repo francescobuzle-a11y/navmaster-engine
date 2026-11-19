@@ -26,6 +26,8 @@ import it.navmaster.engine.util.DistanceCalc
  * relazione `destination_sign` all'imbocco: destination, ref, colour), `lane_signs` (cartelli sulle
  * corsie: destination, ref, colour, campi `:lanes`), `limits` (i limiti dei cartelli: altezza, larghezza solo da `maxwidth`, lunghezza, peso,
  * carico per asse in m/t, solo quelli presenti), `hazmat` (vietato alle merci pericolose), `hazmat_water` (vietato alle merci inquinanti per le acque),
+ * `hgv_destination` (vietato al transito dei mezzi pesanti nel verso percorso: solo destinazione, grafi NAVMASTER),
+ * `weight_exempt` (il limite di peso ha la deroga per destinazione, grafi NAVMASTER),
  * `adr_tunnel` (categoria B…E), `conditional` (restrizioni a orario "chiave=valore"), `nodes`
  * (caselli, portali, dogane: tipo e indice del punto) e `branches` (le altre strade che lasciano il
  * nodo finale dell'arco: direzione iniziale, classe, link, corsie, accesso, destinazioni, svincolo).
@@ -161,6 +163,9 @@ class RoadFactsBuilder(private val graph: BaseGraph, private val encoding: Graph
         if (it.get(sh.hazmatForbidden)) m["hazmat"] = true
         // divieto per le merci inquinanti per le acque (grafi con i valori ADR)
         if (sh.hazmatWater?.let { ev -> it.get(ev) } == true) m["hazmat_water"] = true
+        // divieto di transito dei mezzi pesanti nel verso percorso, e limite di peso con deroga (grafi NAVMASTER)
+        if (sh.hgvDestination?.let { ev -> it.get(ev) } == true) m["hgv_destination"] = true
+        if (sh.hgvWeightExempt?.let { ev -> it.get(ev) } == true) m["weight_exempt"] = true
         return m
     }
 

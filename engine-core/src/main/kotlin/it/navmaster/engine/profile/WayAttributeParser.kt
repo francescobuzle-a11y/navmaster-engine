@@ -29,16 +29,20 @@ object WayAttributeParser {
      *   come limite di larghezza; con `false` contano solo `maxwidth` e `maxwidth:physical`.
      * @param privateMainRoads modello NAVMASTER: su autostrade, superstrade e statali `private` non blocca i
      *   mezzi pesanti (corsie di dogana e di cantiere, vedi `HgvProfile.privateMainRoad`); `no` sì.
+     * @param transitBans modello NAVMASTER: i divieti di transito dei mezzi pesanti ([HgvTransit]): il bit
+     *   «solo destinazione» per senso ([WayAttributes.hgvTransit]), i limiti di classe senza deroga nel
+     *   limite di peso, `no @ (weight>N)` come `hgv=no`, e `hgv=delivery` / `hgv=no` con la deroga per
+     *   destinazione non più bloccati. Con `false` (modello ORS) il risultato è quello di sempre.
      */
     fun parse(way: OsmWay, isFerry: Boolean, roadAccessRestrictions: List<String> = carRestrictions, widthFromCarriageway: Boolean = true,
-              privateMainRoads: Boolean = false): WayAttributes = WayAttributes(
+              privateMainRoads: Boolean = false, transitBans: Boolean = false): WayAttributes = WayAttributes(
         osmWayId = way.id,
-        blockedHeavyVehicleTypes = blockedHeavyVehicleTypes(way, privateMainRoads),
+        blockedHeavyVehicleTypes = blockedHeavyVehicleTypes(way, privateMainRoads, transitBans),
         hazmatForbidden = hazmatForbidden(way),
         maxHeight = meter(way, heightTags),
         maxWidth = meter(way, if (widthFromCarriageway) widthTags else widthTagsStrict),
         maxLength = meter(way, listOf("maxlength")),
-        maxWeight = tons(way, weightTags),
+        maxWeight = if (transitBans) minOf(tons(way, weightTags), HgvTransit.ratingLimit(way)) else tons(way, weightTags),
         maxAxleLoad = tons(way, listOf("maxaxleload")),
         toll = toll(way),
         roadAccess = roadAccess(way, roadAccessRestrictions),
@@ -52,6 +56,7 @@ object WayAttributeParser {
         adrTunnel = adrTunnel(way),
         hazmatGeneral = way.tag("hazmat") == "no",
         hazmatWater = way.tag("hazmat:water") == "no",
+        hgvTransit = if (transitBans && way.hasTag("highway")) HgvTransit.flags(way) else 0,
     )
 
     private val adrLetters = listOf("B", "C", "D", "E")
@@ -71,8 +76,13 @@ object WayAttributeParser {
      * Tipi di veicolo pesante bloccati (ORS `VehicleAccessParser`).
      * Prima le restrizioni generiche (`access=no` blocca tutti, salvo i tipi citati esplicitamente),
      * poi i tag specifici: `hgv=no`, `hgv=delivery` (consente delivery e blocca gli altri hgv), ecc.
+     *
+     * Con [transitBans] (modello NAVMASTER, vedi [HgvTransit]): `hgv|goods=delivery` non blocca più gli
+     * altri mezzi pesanti, e `hgv=no` con `hgv:conditional=yes @ destination` (o delivery) non blocca il
+     * camion: diventano tratti solo destinazione. `no @ (weight>N)` con N < 40 senza orari blocca il
+     * camion come `hgv=no`.
      */
-    fun blockedHeavyVehicleTypes(way: OsmWay, privateMainRoads: Boolean = false): Int {
+    fun blockedHeavyVehicleTypes(way: OsmWay, privateMainRoads: Boolean = false, transitBans: Boolean = false): Int {
         if (!way.hasTag("highway")) return 0
         val open = privateMainRoads && way.tag("highway") in HgvProfile.MAIN_ROADS
         val restrictedHere = if (open) motorVehicleRestrictedValues - "private" else motorVehicleRestrictedValues
@@ -95,8 +105,12 @@ object WayAttributeParser {
                 else -> null
             }
             blocked = setAccess(blocked, vehicleType, access)
-            // es. hgv=delivery: i mezzi pesanti diversi dalle consegne sono bloccati
-            if (vehicleType == value) blocked = setAccess(blocked, key, "no")
+            // es. hgv=delivery: i mezzi pesanti diversi dalle consegne sono bloccati (NAVMASTER: solo destinazione)
+            if (vehicleType == value && !(transitBans && value == "delivery" && (key == "hgv" || key == "goods"))) blocked = setAccess(blocked, key, "no")
+        }
+        if (transitBans) {
+            if (HgvTransit.hgvNoWithDestinationExemption(way)) blocked = blocked and HeavyVehicleAttributes.HGV.inv()
+            if (HgvTransit.weightRule(way) == HgvTransit.Rule.NO) blocked = blocked or HeavyVehicleAttributes.HGV
         }
         return blocked
     }

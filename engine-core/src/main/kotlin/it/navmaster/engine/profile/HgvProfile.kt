@@ -101,10 +101,13 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
         if (!highwaySpeeds.containsKey(highwayValue(way))) return Access.CAN_SKIP
         if (way.hasTag("impassable", "yes") || way.hasTag("status", "impassable") || way.hasTag("smoothness", "impassable")) return Access.CAN_SKIP
 
+        // L'accesso lo decidono le chiavi semplici. Le condizionali (`*:conditional`) non aprono né chiudono
+        // la way: col modello NAVMASTER quelle di solo peso danno il divieto di transito ([HgvTransit], bit
+        // nel grafo, non l'accesso) e `hgv=no` con la deroga per destinazione resta percorribile
+        // ([transitExemption]); quelle a orario si ignorano sempre, né divieto né deroga.
         for (v in restrictionValues) {
             if (v.isEmpty()) continue
-            // TODO restrizioni condizionali (access:conditional): per ora trattate come assolute
-            if (v in restrictedValues) return if (privateMainRoad(way)) Access.WAY else Access.CAN_SKIP
+            if (v in restrictedValues) return if (privateMainRoad(way) || transitExemption(way)) Access.WAY else Access.CAN_SKIP
             if (v in intendedValues) return Access.WAY
         }
         val carsAllowed = way.hasTag(restrictions, intendedValues)
@@ -132,6 +135,14 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
         }
         return false
     }
+
+    /**
+     * Modello NAVMASTER: `hgv=no` con `hgv:conditional=yes|destination|delivery @ (destination|delivery)` è
+     * un divieto di transito, non un divieto: la way resta del camion, col peso ×10 dei tratti solo
+     * destinazione ([HgvTransit]); la priorità non cambia (una sola penalità, non due). ORS non cambia.
+     */
+    fun transitExemption(way: OsmWay): Boolean =
+        options.speedModel == SpeedModel.NAVMASTER && HgvTransit.hgvNoWithDestinationExemption(way)
 
     override fun priority(way: OsmWay): PriorityCode {
         if (privateMainRoad(way)) return PriorityCode.REACH_DEST
@@ -170,6 +181,12 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
     companion object {
         /** Le strade principali su cui un `private` per il camion si legge come corsia riservata ([privateMainRoad]). */
         val MAIN_ROADS = setOf("motorway", "motorway_link", "motorroad", "trunk", "trunk_link", "primary", "primary_link")
+        /**
+         * La massa del camion di riferimento (autoarticolato da 40 t) per le regole che dipendono dal peso
+         * senza conoscere il veicolo: limiti di velocità condizionali e divieti di transito ([HgvTransit]).
+         * Un limite N vale se N < 40.
+         */
+        const val REF_TRUCK_T = 40.0
         private val CONDITION = Regex("""^\s*([^@]+?)\s*@\s*\(?\s*(.+?)\s*\)?\s*$""")
         private val WEIGHT = Regex("""^(weight|weightrating|maxweight)\s*>=?\s*([0-9]+(?:\.[0-9]+)?)\s*t?$""")
 
@@ -185,7 +202,7 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
                 val applies = conditions.all { c ->
                     when {
                         c == "trailer" || c == "articulated" -> true
-                        else -> WEIGHT.find(c)?.groupValues?.get(2)?.toDoubleOrNull()?.let { it < 40.0 } ?: false
+                        else -> WEIGHT.find(c)?.groupValues?.get(2)?.toDoubleOrNull()?.let { it < REF_TRUCK_T } ?: false
                     }
                 }
                 if (applies && (best.isNaN() || v < best)) best = v

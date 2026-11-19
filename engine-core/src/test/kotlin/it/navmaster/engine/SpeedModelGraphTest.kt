@@ -40,6 +40,10 @@ class SpeedModelGraphTest {
                 assertEquals("navmaster", rg.speedModel); assertEquals("DE", rg.country)
                 // CH, core e landmark preparati col peso consigliato di NAVMASTER, e il grafo lo ricorda
                 assertEquals(PriorityModel.NAVMASTER, rg.encoding.priorityModel); assertEquals(PriorityModel.ORS, ors.encoding.priorityModel)
+                // i divieti di transito dei mezzi pesanti: solo nel grafo NAVMASTER, che i motori di prima rifiutano
+                assertTrue(rg.encoding.shared.withTransit); assertTrue(!ors.encoding.shared.withTransit)
+                assertEquals("$GRAPH_FORMAT_VERSION.${RoutingGraph.TRANSIT_VARIANT}", GraphProperties(File(dir, "properties")).apply { load() }.get("graph.format_version"))
+                assertEquals(GRAPH_FORMAT_VERSION.toString(), GraphProperties(File(orsDir, "properties")).apply { load() }.get("graph.format_version"))
                 for ((a, b) in pairs) {
                     val params = VehicleParameters(height = 4.0, weight = 12.0)
                     val core = rg.router(RouteOptions(profile = "driving-hgv", vehicleParameters = params))
@@ -68,7 +72,9 @@ class SpeedModelGraphTest {
     fun `a navmaster graph prepared before the priority model opens with the ORS priority`() {
         val dir = Files.createTempDirectory("nme-smg-old").toFile().also { it.deleteOnExit() }
         val profiles = listOf(HgvProfile(VehicleProfileOptions(maximumGradeLevel = 1, useAcceleration = false, blockFords = false, speedModel = SpeedModel.NAVMASTER, country = "DE")))
-        RoutingGraph.build(File("../data/heidelberg.test.pbf"), dir, profiles).first.use { it.prepareCH(withCore = false, landmarkSets = emptyList()) }
+        // un grafo NAVMASTER di prima dei divieti di transito
+        val encoding = it.navmaster.engine.storage.GraphEncoding(profiles, withTransit = false)
+        RoutingGraph.build(File("../data/heidelberg.test.pbf"), dir, profiles, encoding = encoding).first.use { it.prepareCH(withCore = false, landmarkSets = emptyList()) }
         assertEquals("navmaster", GraphProperties(File(dir, "profiles")).apply { load() }.get("priority_model"))
         // il peso consigliato di tutti gli archi: cambia col modello letto (autostrade e strade migliori)
         fun dijkstraWeight(rg: RoutingGraph): Double {
@@ -88,5 +94,19 @@ class SpeedModelGraphTest {
         val old = RoutingGraph.load(dir).use { assertEquals(PriorityModel.ORS, it.encoding.priorityModel); dijkstraWeight(it) }
         // premi di ORS più forti sulle strade sopra le statali: la rete pesa meno, e il modello letto arriva davvero al peso
         assertTrue(old < nav - 100.0, "peso ORS $old, NAVMASTER $nav")
+    }
+
+    @Test
+    fun `a graph with transit bans says so in its format, and an inconsistent one is refused`() {
+        val dir = Files.createTempDirectory("nme-smg-tr").toFile().also { it.deleteOnExit() }
+        val profiles = listOf(HgvProfile(VehicleProfileOptions(maximumGradeLevel = 1, useAcceleration = false, blockFords = false, speedModel = SpeedModel.NAVMASTER, country = "DE")))
+        RoutingGraph.build(File("../data/heidelberg.test.pbf"), dir, profiles).first.close()
+        val props = File(dir, "properties")
+        assertEquals("$GRAPH_FORMAT_VERSION.${RoutingGraph.TRANSIT_VARIANT}", GraphProperties(props).apply { load() }.get("graph.format_version"))
+        RoutingGraph.load(dir).use { assertTrue(it.encoding.shared.withTransit); assertEquals(PriorityModel.NAVMASTER, it.encoding.priorityModel) }
+        // un motore di prima (variante `navmaster` esatta e schema senza transito) non lo apre; qui: variante tolta → rifiutato
+        GraphProperties(props).apply { load(); set("graph.format_version", "$GRAPH_FORMAT_VERSION.${RoutingGraph.PRIORITY_VARIANT}"); save() }
+        val e = kotlin.test.assertFailsWith<IllegalStateException> { RoutingGraph.load(dir).close() }
+        assertTrue(e.message!!.contains("divieti di transito"), e.message)
     }
 }

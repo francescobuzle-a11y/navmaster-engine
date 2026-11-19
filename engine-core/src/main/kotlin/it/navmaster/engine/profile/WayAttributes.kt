@@ -90,4 +90,10 @@ data class WayAttributes(
     val hazmatGeneral: Boolean = false,
     /** `hazmat:water=no`: vietata alle merci inquinanti per le acque (zone di protezione delle falde). */
     val hazmatWater: Boolean = false,
+    /**
+     * Divieto di transito dei mezzi pesanti (modello NAVMASTER, [HgvTransit]): bit [HgvTransit.FWD] e
+     * [HgvTransit.BWD] per i sensi «solo destinazione», [HgvTransit.EXEMPT] se il limite di peso ha la
+     * deroga per destinazione. 0 col modello ORS.
+     */
+    val hgvTransit: Int = 0,
 )
