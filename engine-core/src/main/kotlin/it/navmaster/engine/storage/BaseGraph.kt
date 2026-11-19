@@ -235,15 +235,15 @@ class BaseGraph(
         }
         val pa = a.toLong() * nodeEntryBytes
         val aLat = nodes.getInt(pa + 4); val aLon = nodes.getInt(pa + 8); val aEle = if (is3D) nodes.getInt(pa + 12) else 0
-        val avail = (nextGeoRef - ref).toInt()
+        val avail = minOf(nextGeoRef - ref, Int.MAX_VALUE.toLong()).toInt()
         val tl = geoBuf.get()
-        // prima un pezzo piccolo (il numero dei punti), poi, se serve, tutto il record
+        // prima un pezzo piccolo (di solito tutto il record), poi, solo se il record continua, fino al massimo possibile
         var buf = tl
         var have = minOf(avail, GEO_FIRST_READ)
         geometry.getBytes(ref, buf, have)
         val count = GeoCodec.count(buf)
-        val need = minOf(avail, GeoCodec.maxBytes(count, is3D))
-        if (need > have) {
+        if (GeoCodec.length(buf, have, is3D) < 0) {
+            val need = minOf(avail, GeoCodec.maxBytes(count, is3D))
             if (buf.size < need) { buf = ByteArray(maxOf(need, buf.size * 2)); if (buf.size <= GEO_BUF_KEEP) geoBuf.set(buf) }
             geometry.getBytes(ref, buf, need)
             have = need
@@ -464,8 +464,24 @@ internal object GeoCodec {
         return r.toInt()
     }
 
-    /** I byte massimi di un record di [count] punti. */
-    fun maxBytes(count: Int, is3D: Boolean): Int = 5 + count * (if (is3D) 3 else 2) * 10
+    /**
+     * I byte massimi di un record di [count] punti: lo scarto di due int sta in 33 bit, zigzag in 34,
+     * quindi in al più 5 byte di varint; il numero dei punti in al più 5.
+     */
+    fun maxBytes(count: Int, is3D: Boolean): Int = 5 + count * (if (is3D) 3 else 2) * 5
+
+    /** La lunghezza del record che inizia in [buf] se tutti i suoi varint finiscono nei primi [have] byte, altrimenti -1. */
+    fun length(buf: ByteArray, have: Int, is3D: Boolean): Int {
+        var i = 0
+        // il numero dei punti
+        while (true) { if (i >= have) return -1; if (buf[i++].toInt() and 0x80 == 0) break }
+        var values = count(buf).toLong() * (if (is3D) 3 else 2)
+        while (values > 0) {
+            if (i >= have) return -1
+            if (buf[i++].toInt() and 0x80 == 0) values--
+        }
+        return i
+    }
 
     /** Aggiunge a [pl] i punti del record in [buf] (i primi [len] byte), dal nodo A di coordinate intere date. */
     fun decodeInto(buf: ByteArray, len: Int, aLat: Int, aLon: Int, aEle: Int, is3D: Boolean, pl: PointList) {

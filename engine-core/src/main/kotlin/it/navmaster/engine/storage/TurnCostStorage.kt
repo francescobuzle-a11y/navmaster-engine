@@ -13,14 +13,16 @@ import java.io.Closeable
  * Le teste delle liste (la prima voce di ogni nodo con divieti):
  * - formato 5, file `turn_index`: una bitmap dei nodi con voci e le teste dei soli nodi con voci, in
  *   ordine di nodo, caricate nell'heap all'apertura. Intestazione [1] = nodi coperti dalla bitmap
- *   ([nodeLimit]), [2] = teste; dati: le parole della bitmap (64 bit, ognuna come due int, prima il
- *   basso), poi le teste. In Germania 116 mila nodi su 13,5 milioni hanno voci: 2,3 MB invece di 74,5,
+ *   ([nodeLimit]), [2] = teste, [3] = voci di `turn_costs` dello stesso giro (un `turn_index` rimasto
+ *   da un altro grafo nella stessa cartella non viene usato); dati: le parole della bitmap (64 bit,
+ *   ognuna come due int, prima il basso), poi le teste. In Germania 116 mila nodi su 13,5 milioni hanno voci: 2,3 MB invece di 74,5,
  *   e [hasEntries], letto per ogni nodo via delle ricerche edge-based, diventa un bit nell'heap invece
  *   di una lettura del file mappato (una chiamata nativa sul tablet);
  * - formato 4, file `turn_heads` (ancora letto): un int per nodo con l'indice della prima voce (-1 = nessuna).
  *
  * Durante l'import le teste si scrivono come nel formato 4 (file `turn_heads` di lavoro); [flush] le
- * compatta in `turn_index`, cancella il file di lavoro e da lì risponde dall'heap.
+ * compatta in `turn_index`, poi cancella il file di lavoro, e da lì risponde dall'heap. Un deposito
+ * aperto da [loadExisting] non viene mai convertito né cancellato da [flush].
  */
 class TurnCostStorage(private val dir: GraphDirectory, val encoding: TurnCostEncoding) : Closeable {
     private var costs: DataAccess = dir.create("turn_costs", 1 shl 16)
@@ -29,21 +31,18 @@ class TurnCostStorage(private val dir: GraphDirectory, val encoding: TurnCostEnc
     var count = 0; private set
     private var nodeCapacity = 0
 
-    // le teste compatte (formato 5): bitmap dei nodi con voci, ranghi per parola, teste in ordine di nodo
+    // le teste compatte (formato 5): bitmap dei nodi con voci e teste in ordine di nodo
     private var compact = false
     private var nodeLimit = 0
-    private var words = LongArray(0)
-    private var ranks = IntArray(0)
+    private var bits = RankedBits(LongArray(0))
     private var headOf = IntArray(0)
+    /** Aperto da [loadExisting]: [flush] non converte né cancella nulla. */
+    private var loaded = false
 
     private fun head(node: Int): Int {
         if (compact) {
-            if (node < 0 || node >= nodeLimit) return NO_ENTRY
-            val w = node ushr 6
-            val bit = 1L shl (node and 63)
-            val word = words[w]
-            if (word and bit == 0L) return NO_ENTRY
-            return headOf[ranks[w] + java.lang.Long.bitCount(word and (bit - 1))]
+            if (node < 0 || node >= nodeLimit || !bits[node]) return NO_ENTRY
+            return headOf[bits.rank(node)]
         }
         if (node >= nodeCapacity) return NO_ENTRY
         return heads!!.getInt(node.toLong() * 4)
@@ -94,62 +93,64 @@ class TurnCostStorage(private val dir: GraphDirectory, val encoding: TurnCostEnc
 
     fun hasEntries(viaNode: Int) = head(viaNode) != NO_ENTRY
 
-    /** Scrive le voci e le teste compatte (`turn_index`); il file di lavoro `turn_heads` viene cancellato. */
+    /**
+     * Scrive le voci e le teste compatte (`turn_index`), poi cancella il file di lavoro `turn_heads`.
+     * Su un deposito aperto da [loadExisting] scrive solo le voci (in sola lettura: nulla).
+     */
     fun flush() {
+        if (loaded) { costs.flush(); return }
         costs.setHeader(0, GRAPH_FORMAT_VERSION); costs.setHeader(1, count)
         costs.flush()
         if (!compact) compactHeads()
         val da = dir.create(INDEX, 1 shl 16)
         try {
-            da.setHeader(0, GRAPH_FORMAT_VERSION); da.setHeader(1, nodeLimit); da.setHeader(2, headOf.size)
-            da.ensureCapacity(maxOf(4L, words.size.toLong() * 8 + headOf.size.toLong() * 4))
-            var p = 0L
-            for (w in words) { da.setInt(p, w.toInt()); da.setInt(p + 4, (w ushr 32).toInt()); p += 8 }
+            da.setHeader(0, GRAPH_FORMAT_VERSION); da.setHeader(1, nodeLimit); da.setHeader(2, headOf.size); da.setHeader(3, count)
+            da.ensureCapacity(maxOf(4L, bits.words.size.toLong() * 8 + headOf.size.toLong() * 4))
+            var p = RankedBits.writeWords(da, 0L, bits.words)
             for (h in headOf) { da.setInt(p, h); p += 4 }
             da.flush()
         } finally { da.close() }
+        // il file di lavoro solo dopo che turn_index è scritto
+        heads?.close()
+        heads = null
+        java.io.File(dir.dir, LEGACY_HEADS).delete()
     }
 
-    /** Le teste per nodo diventano bitmap + teste dei soli nodi con voci; il file di lavoro sparisce. */
+    /** Le teste per nodo diventano bitmap + teste dei soli nodi con voci (il file di lavoro resta fino a [flush]). */
     private fun compactHeads() {
-        val h = heads
+        val h = heads ?: error("teste dei costi di svolta già chiuse")
         var limit = 0
         var n = 0
-        for (node in 0 until nodeCapacity) if (h!!.getInt(node.toLong() * 4) != NO_ENTRY) { limit = node + 1; n++ }
+        for (node in 0 until nodeCapacity) if (h.getInt(node.toLong() * 4) != NO_ENTRY) { limit = node + 1; n++ }
         val w = LongArray((limit + 63) ushr 6)
         val hs = IntArray(n)
         var k = 0
         for (node in 0 until limit) {
-            val e = h!!.getInt(node.toLong() * 4)
+            val e = h.getInt(node.toLong() * 4)
             if (e == NO_ENTRY) continue
             w[node ushr 6] = w[node ushr 6] or (1L shl (node and 63))
             hs[k++] = e
         }
         setCompact(limit, w, hs)
-        h?.close()
-        heads = null
-        java.io.File(dir.dir, LEGACY_HEADS).delete()
     }
 
     private fun setCompact(limit: Int, w: LongArray, hs: IntArray) {
-        nodeLimit = limit; words = w; headOf = hs
-        ranks = IntArray(w.size)
-        var r = 0
-        for (i in w.indices) { ranks[i] = r; r += java.lang.Long.bitCount(w[i]) }
-        check(r == hs.size) { "teste dei costi di svolta incoerenti: $r bit, ${hs.size} teste" }
+        val b = RankedBits(w)
+        check(b.total == hs.size) { "teste dei costi di svolta incoerenti: ${b.total} bit, ${hs.size} teste" }
+        nodeLimit = limit; bits = b; headOf = hs
         compact = true
     }
 
     fun loadExisting(): Boolean {
         val c = dir.open("turn_costs", 1 shl 16) ?: return false
+        loaded = true
         val idx = dir.open(INDEX, 1 shl 16)
-        if (idx != null) {
+        // turn_index solo se è dello stesso giro di turn_costs (formato 5 e stesso numero di voci)
+        if (idx != null && c.getHeader(0) >= 5 && idx.getHeader(3) == c.getHeader(1)) {
             try {
                 val limit = idx.getHeader(1); val n = idx.getHeader(2)
                 val nw = (limit + 63) ushr 6
-                val raw = IntArray(nw * 2)
-                if (raw.isNotEmpty()) idx.getInts(0, raw, 0, raw.size)
-                val w = LongArray(nw) { (raw[2 * it].toLong() and 0xFFFFFFFFL) or (raw[2 * it + 1].toLong() shl 32) }
+                val w = RankedBits.readWords(idx, 0L, nw)
                 val hs = IntArray(n)
                 if (n > 0) idx.getInts(nw * 8L, hs, 0, n)
                 setCompact(limit, w, hs)
@@ -159,6 +160,7 @@ class TurnCostStorage(private val dir: GraphDirectory, val encoding: TurnCostEnc
             count = c.getHeader(1)
             return true
         }
+        idx?.close()
         val h = dir.open(LEGACY_HEADS, 1 shl 16) ?: run { c.close(); return false }
         costs.close(); heads?.close()
         costs = c; heads = h

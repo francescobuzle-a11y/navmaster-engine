@@ -27,7 +27,7 @@ import java.io.Closeable
  *   dati e quella degli archi con stringhe (parole da 64 bit, ognuna come due int, prima il basso),
  *   poi i record corti da [SHORT_BYTES] byte degli archi senza stringhe (i byte 0-7, 68 e 69 del record
  *   intero), poi i record interi da [ENTRY_BYTES] byte degli archi con stringhe. Le bitmap e i loro
- *   ranghi stanno nell'heap; un valore costa al più una lettura del file. In Germania il 60 % delle
+ *   ranghi ([RankedBits]) stanno nell'heap (Germania circa 4 MB); un valore costa al più una lettura del file. In Germania il 60 % delle
  *   righe è vuoto e il 26 % ha solo i campi da un byte: circa 206 MB invece di 1 126;
  * - formato 4, denso (ancora letto): un record da [ENTRY_BYTES] byte per arco.
  *
@@ -37,12 +37,10 @@ import java.io.Closeable
 class GuidanceStore private constructor(private var da: DataAccess, private val names: StringStore, private val importDir: GraphDirectory? = null) : Closeable {
     private var count = 0
 
-    // formato rado: bitmap degli archi con dati e con stringhe, ranghi per parola, inizio delle due aree
+    // formato rado: bitmap degli archi con dati e con stringhe, inizio delle due aree
     private var sparse = false
-    private var dataWords = LongArray(0)
-    private var strWords = LongArray(0)
-    private var shortRanks = IntArray(0)
-    private var strRanks = IntArray(0)
+    private var dataBits = RankedBits(LongArray(0))
+    private var strBits = RankedBits(LongArray(0))
     private var shortBase = 0L
     private var longBase = 0L
 
@@ -80,29 +78,23 @@ class GuidanceStore private constructor(private var da: DataAccess, private val 
         }
     }
 
-    private fun bit(words: LongArray, edge: Int): Boolean = words[edge ushr 6] and (1L shl (edge and 63)) != 0L
-    private fun rank(words: LongArray, ranks: IntArray, edge: Int): Int {
-        val w = edge ushr 6
-        return ranks[w] + java.lang.Long.bitCount(words[w] and ((1L shl (edge and 63)) - 1))
-    }
-
     /** Il byte del record intero all'offset [off]: dal record corto o da quello intero (formato rado). */
     private fun sparseU8(edge: Int, off: Int): Int {
-        if (bit(strWords, edge)) return da.getByte(longBase + rank(strWords, strRanks, edge).toLong() * ENTRY_BYTES + off).toInt() and 0xFF
+        if (strBits[edge]) return da.getByte(longBase + strBits.rank(edge).toLong() * ENTRY_BYTES + off).toInt() and 0xFF
         val k = when (off) { in 0..7 -> off; 68 -> 8; 69 -> 9; else -> return 0 }
-        val r = rank(dataWords, shortRanks, edge) - rank(strWords, strRanks, edge)
+        val r = dataBits.rank(edge) - strBits.rank(edge)
         return da.getByte(shortBase + r.toLong() * SHORT_BYTES + k).toInt() and 0xFF
     }
 
     /** Il puntatore della stringa all'offset [off] del record intero; 0 per gli archi senza stringhe (formato rado). */
     private fun sparsePtr(edge: Int, off: Int): Int =
-        if (!bit(strWords, edge)) 0 else da.getInt(longBase + rank(strWords, strRanks, edge).toLong() * ENTRY_BYTES + off)
+        if (!strBits[edge]) 0 else da.getInt(longBase + strBits.rank(edge).toLong() * ENTRY_BYTES + off)
 
     private fun u8(edge: Int, off: Int): Int =
         if (sparse) sparseU8(edge, off) else da.getByte(edge.toLong() * ENTRY_BYTES + off).toInt() and 0xFF
     private fun ptr(edge: Int, off: Int): Int = if (sparse) sparsePtr(edge, off) else da.getInt(edge.toLong() * ENTRY_BYTES + off)
     private fun str(edge: Int, off: Int): String = names.get(ptr(edge, off))
-    private fun has(edge: Int) = edge in 0 until count && (!sparse || bit(dataWords, edge))
+    private fun has(edge: Int) = edge in 0 until count && (!sparse || dataBits[edge])
 
     /** Limite di velocità percorrendo l'arco ([reverse]: da B ad A); 0 = sconosciuto, 255 = nessun limite. */
     fun maxSpeed(edge: Int, reverse: Boolean): Int = if (!has(edge)) 0 else u8(edge, if (reverse) 1 else 0)
@@ -193,9 +185,7 @@ class GuidanceStore private constructor(private var da: DataAccess, private val 
         val sBase = 2 * wordsBytes
         val lBase = (sBase + shorts.toLong() * SHORT_BYTES + 3) and 3L.inv()
         out.ensureCapacity(maxOf(4L, lBase + longs.toLong() * ENTRY_BYTES))
-        var p = 0L
-        for (w in dw) { out.setInt(p, w.toInt()); out.setInt(p + 4, (w ushr 32).toInt()); p += 8 }
-        for (w in sw) { out.setInt(p, w.toInt()); out.setInt(p + 4, (w ushr 32).toInt()); p += 8 }
+        RankedBits.writeWords(out, RankedBits.writeWords(out, 0L, dw), sw)
         // secondo passo: i record corti e quelli interi, in ordine di arco
         var sp = sBase; var lp = lBase
         val short = ByteArray(SHORT_BYTES)
@@ -227,14 +217,8 @@ class GuidanceStore private constructor(private var da: DataAccess, private val 
     }
 
     private fun setSparse(n: Int, dw: LongArray, sw: LongArray, sBase: Long, lBase: Long) {
-        count = n; dataWords = dw; strWords = sw; shortBase = sBase; longBase = lBase
-        shortRanks = IntArray(dw.size); strRanks = IntArray(sw.size)
-        var rd = 0; var rs = 0
-        for (i in dw.indices) {
-            check(sw[i] and dw[i].inv() == 0L) { "dati di guida incoerenti: stringhe su un arco senza dati" }
-            shortRanks[i] = rd; strRanks[i] = rs
-            rd += java.lang.Long.bitCount(dw[i]); rs += java.lang.Long.bitCount(sw[i])
-        }
+        check(dw.size == sw.size && dw.indices.all { sw[it] and dw[it].inv() == 0L }) { "dati di guida incoerenti: stringhe su un arco senza dati" }
+        count = n; dataBits = RankedBits(dw); strBits = RankedBits(sw); shortBase = sBase; longBase = lBase
         sparse = true
     }
 
@@ -266,10 +250,8 @@ class GuidanceStore private constructor(private var da: DataAccess, private val 
                 SPARSE -> {
                     val n = da.getHeader(2); val shorts = da.getHeader(3)
                     val nw = (n + 63) ushr 6
-                    val raw = IntArray(nw * 4)
-                    if (raw.isNotEmpty()) da.getInts(0, raw, 0, raw.size)
-                    val dw = LongArray(nw) { (raw[2 * it].toLong() and 0xFFFFFFFFL) or (raw[2 * it + 1].toLong() shl 32) }
-                    val sw = LongArray(nw) { (raw[2 * (nw + it)].toLong() and 0xFFFFFFFFL) or (raw[2 * (nw + it) + 1].toLong() shl 32) }
+                    val dw = RankedBits.readWords(da, 0L, nw)
+                    val sw = RankedBits.readWords(da, nw * 8L, nw)
                     val sBase = nw.toLong() * 16
                     val lBase = (sBase + shorts.toLong() * SHORT_BYTES + 3) and 3L.inv()
                     GuidanceStore(da, names).also { it.setSparse(n, dw, sw, sBase, lBase) }
