@@ -46,7 +46,7 @@ class ProfileEncoding(val profile: VehicleProfile, withDelay: Boolean = true) {
             return
         }
         access.set(flags, false, r.forward); access.set(flags, true, r.backward)
-        speed.set(flags, false, r.speedKmh); speed.set(flags, true, r.speedKmh)
+        speed.set(flags, false, r.speedKmh); speed.set(flags, true, r.speedBackwardKmh)
         priority.set(flags, r.priority)
     }
 }

@@ -7,6 +7,10 @@ import it.navmaster.engine.profile.GuidanceParser
 import it.navmaster.engine.storage.GuidanceStore
 import it.navmaster.engine.storage.PointStore
 import it.navmaster.engine.profile.Access
+import it.navmaster.engine.profile.ClimbModel
+import it.navmaster.engine.terrain.ElevationSource
+import it.navmaster.engine.terrain.TerrainSpeeds
+import it.navmaster.engine.terrain.WayTerrain
 import it.navmaster.engine.profile.NodeDelays
 import it.navmaster.engine.profile.SpeedModel
 import it.navmaster.engine.profile.WaySpeedAccess
@@ -41,8 +45,34 @@ data class ImportStats(
     val delayedEdges: Int = 0,
     /** Velocità media del camion (km/h, pesata per lunghezza) per classe di strada. */
     val hgvSpeedByClass: Map<String, Double> = emptyMap(),
-    /** Quota dei km di primary e secondary con cartello > 50 dove il camion va sotto 30 km/h (NaN se nessuno). */
+    /** Quota dei km di primary e secondary con cartello > 50 dove il camion va sotto 30 km/h (NaN se nessuno), senza il terreno. */
     val hgvSlowSignedShare: Double = Double.NaN,
+    /** Salite, discese e curve del camion (modello NAVMASTER); null se il terreno non si è applicato. */
+    val terrain: TerrainStats? = null,
+)
+
+/**
+ * Il terreno del camion all'import (modello NAVMASTER, [it.navmaster.engine.terrain.WayTerrain]),
+ * contato per arco e per senso percorribile: i km coperti dal DEM, i km frenati dalla pendenza e i
+ * minuti persi per la pendenza sola, per le curve sole e per le due insieme (non sono additivi).
+ */
+data class TerrainStats(
+    /** Vero se è stato usato un DEM (altrimenti solo curve). */
+    val dem: Boolean,
+    /** km di archi del camion (per senso percorribile). */
+    val km: Double,
+    /** Quota di quei km con una quota dal DEM (NaN senza DEM). */
+    val demCoverage: Double,
+    /** km in cui la pendenza frena il camion (salita o discesa, per senso). */
+    val slopeKm: Double,
+    val slopeLossMin: Double,
+    /** Curve contate sulle way del camion. */
+    val curves: Int,
+    val curveLossMin: Double,
+    /** Minuti persi per pendenza e curve insieme. */
+    val lossMin: Double,
+    /** Sensi d'arco con la velocità cambiata dal terreno. */
+    val changedEdgeDirections: Int,
 )
 
 /** Le strade su cui un casello o un portale fa pedaggio (non i parcheggi né le strade di servizio). */
@@ -72,6 +102,16 @@ data class ImportOptions(
      * pedaggio per i mezzi pesanti se la way non dice già di più.
      */
     val tollNodes: Boolean = true,
+    /**
+     * Estensione NavMaster, solo modello NAVMASTER e mezzi pesanti ([it.navmaster.engine.profile.VehicleProfile.climb]):
+     * il modello del terreno (DEM) per le pendenze ([it.navmaster.engine.terrain.HgtDem]); null = senza
+     * pendenze. Mai coi profili ORS (la CLI rifiuta `--dem` con `--speed-model=ors`).
+     */
+    val dem: ElevationSource? = null,
+    /** Da dove viene il DEM (`copernicus-glo90`, `skadi`), scritto nel file `profiles` del grafo. */
+    val demSource: String? = null,
+    /** Le curve dalla geometria (modello NAVMASTER, mezzi pesanti, anche senza DEM); false solo per le prove. */
+    val curves: Boolean = true,
 )
 
 class OsmGraphImporter(
@@ -121,6 +161,19 @@ class OsmGraphImporter(
     private var signedKm = 0.0
     private var slowSignedKm = 0.0
 
+    /**
+     * I profili a cui si applica il terreno ([it.navmaster.engine.terrain.WayTerrain]): modello NAVMASTER
+     * e un [it.navmaster.engine.profile.ClimbModel] (oggi solo il camion). Nessuno nei grafi ORS.
+     */
+    private val terrainProfile = BooleanArray(profiles.size) { i ->
+        val p = profiles[i].profile
+        p.options.speedModel == SpeedModel.NAVMASTER && p.climb != null && (options.curves || options.dem != null)
+    }
+    private val terrainOn = terrainProfile.any { it }
+    private var tKm = 0.0; private var tDemKm = 0.0; private var tSlopeKm = 0.0
+    private var tSlopeLoss = 0.0; private var tCurveLoss = 0.0; private var tLoss = 0.0
+    private var tCurves = 0; private var tChanged = 0
+
     fun import(pbf: File): ImportStats = import(OsmPbfReader(pbf))
 
     fun import(reader: OsmSource): ImportStats {
@@ -162,7 +215,11 @@ class OsmGraphImporter(
             speedModel = if (nodeDelays) SpeedModel.NAVMASTER else SpeedModel.ORS,
             delayEvents = if (nodeDelays) NodeDelays.Control.entries.filter { it != NodeDelays.Control.NONE }.associate { it.name to delayEvents[it.ordinal] } else emptyMap(),
             delayedEdges = delayedEdges, hgvSpeedByClass = byClass,
-            hgvSlowSignedShare = if (signedKm > 0) slowSignedKm / signedKm else Double.NaN)
+            hgvSlowSignedShare = if (signedKm > 0) slowSignedKm / signedKm else Double.NaN,
+            terrain = if (!terrainOn || hgvIndex < 0 || !terrainProfile[hgvIndex]) null else TerrainStats(
+                dem = options.dem != null, km = tKm / 1000, demCoverage = if (options.dem != null && tKm > 0) tDemKm / tKm else Double.NaN,
+                slopeKm = tSlopeKm, slopeLossMin = tSlopeLoss / 60, curves = tCurves, curveLossMin = tCurveLoss / 60,
+                lossMin = tLoss / 60, changedEdgeDirections = tChanged))
     }
 
     /** Vero se almeno un profilo può percorrere la way; riempie [wayAccess]. */
@@ -268,6 +325,7 @@ class OsmGraphImporter(
         private val lats = DoubleArrayList(); private val lons = DoubleArrayList()
         private val segIds = LongArrayList() // id OSM dei punti del segmento corrente, in parallelo a lats/lons
         private var segmentStart = -1 // nodo del grafo in cui inizia il segmento corrente
+        private var segmentStartIdx = -1 // indice nella way del primo punto del segmento corrente (vedi WayTerrain.nodeCum)
         /**
          * ORS `estimated_way_distance`: la distanza in linea d'aria fra il primo e l'ultimo nodo della
          * way intera (non la lunghezza dell'arco), usata dal modello di accelerazione e dalla penalità
@@ -285,8 +343,9 @@ class OsmGraphImporter(
                 val la1 = nodeLat(ids[0]); val lo1 = nodeLon(ids[0]); val la2 = nodeLat(ids[ids.size - 1]); val lo2 = nodeLon(ids[ids.size - 1])
                 if (la1.isNaN() || lo1.isNaN() || la2.isNaN() || lo2.isNaN()) Double.NaN else DistanceCalc.haversine(la1, lo1, la2, lo2)
             }
-            segmentStart = -1
+            segmentStart = -1; segmentStartIdx = -1
             lats.clear(); lons.clear(); segIds.clear()
+            beginTerrain(way)
             for (i in ids.indices) {
                 val id = ids[i]
                 var tower = towers.getOrDefault(id, -1)
@@ -310,12 +369,12 @@ class OsmGraphImporter(
                 val next: Int
                 if (segmentStart >= 0) {
                     lats.add(graph.lat(tower)); lons.add(graph.lon(tower)); segIds.add(id)
-                    addEdge(way, segmentStart, if (bt != null) splitBarrier(way, tower, bt) else tower)
+                    addEdge(way, segmentStart, if (bt != null) splitBarrier(way, tower, bt) else tower, segmentStartIdx)
                     next = tower
                 } else {
                     next = if (bt != null) splitBarrier(way, tower, bt) else tower
                 }
-                segmentStart = next
+                segmentStart = next; segmentStartIdx = i
                 lats.clear(); lons.clear(); segIds.clear()
                 lats.add(graph.lat(next)); lons.add(graph.lon(next)); segIds.add(id)
             }
@@ -325,9 +384,9 @@ class OsmGraphImporter(
         private fun closeSegment(way: OsmWay, promoteLast: Boolean) {
             if (segmentStart >= 0 && lats.size > 1 && promoteLast) {
                 val end = graph.addNode(lats[lats.size - 1], lons[lons.size - 1])
-                addEdge(way, segmentStart, end)
+                addEdge(way, segmentStart, end, segmentStartIdx)
             }
-            segmentStart = -1
+            segmentStart = -1; segmentStartIdx = -1
             lats.clear(); lons.clear(); segIds.clear()
         }
 
@@ -365,6 +424,92 @@ class OsmGraphImporter(
                 booth -> { tollNodeEdges++; a.copy(toll = Toll.ALL) }
                 gantry && (a.toll == Toll.MISSING || a.toll == Toll.NO) -> { tollNodeEdges++; a.copy(toll = Toll.HGV) }
                 else -> a
+            }
+        }
+
+        // --- terreno (modello NAVMASTER, camion): pendenze e curve per way intera, lette a pezzi dagli archi
+        private var terrainWay: OsmWay? = null
+        private var terrain: WayTerrain? = null
+        private val terrainSpeeds = arrayOfNulls<TerrainSpeeds>(profiles.size)
+        private var wayLat = DoubleArray(64); private var wayLon = DoubleArray(64)
+
+        /** Nuova way: il terreno si calcola al primo arco che lo chiede (le coordinate però si leggono ora, prima delle promozioni). */
+        private fun beginTerrain(way: OsmWay) {
+            terrainWay = null; terrain = null; terrainSpeeds.fill(null)
+            if (!terrainOn) return
+            var needed = false
+            for (i in profiles.indices) if (terrainProfile[i] && !wayAccess[i].canSkip && !wayAccess[i].isFerry) needed = true
+            if (!needed) return
+            val ids = way.nodeIds
+            if (wayLat.size < ids.size) { wayLat = DoubleArray(ids.size * 2); wayLon = DoubleArray(ids.size * 2) }
+            for (k in ids.indices) {
+                val id = ids[k]
+                val t = towers.getOrDefault(id, -1)
+                if (t >= 0) { wayLat[k] = graph.lat(t); wayLon[k] = graph.lon(t); continue }
+                val p = pillars.getOrDefault(id, -1)
+                if (p >= 0) { wayLat[k] = pillarLat[p]; wayLon[k] = pillarLon[p] } else { wayLat[k] = Double.NaN; wayLon[k] = Double.NaN }
+            }
+            terrainWay = way
+        }
+
+        /**
+         * La velocità dell'arco (punti [startIdx]..[startIdx] + n - 1 della way) per senso, dal profilo di
+         * velocità della way ([TerrainSpeeds]); mai sopra la base, mai sotto il minimo del profilo. Senza
+         * pendenza né curve, o se il terreno non cambia il passo memorizzato, [r] resta com'è (stessi flag).
+         *
+         * Il terreno si applica come rapporto di tempi alla base già arrotondata al passo dei flag (5 km/h):
+         * una base di 63 si salva 65, e una perdita dell'1 % (una curva lontana) darebbe 62,4 → 60, un salto
+         * dell'8 % rispetto all'arco accanto; così invece 65 × 0,99 → 65, e al 6 % 65 × 38/63 → 40.
+         */
+        private fun withTerrain(i: Int, way: OsmWay, r: WaySpeedAccess, startIdx: Int, n: Int): WaySpeedAccess {
+            if (terrainWay !== way || startIdx < 0) return r
+            val t = terrain ?: WayTerrain.analyse(way, wayLat, wayLon, way.nodeIds.size, options.dem, options.curves).also {
+                terrain = it
+                if (hgvIndex >= 0 && !wayAccess[hgvIndex].canSkip) tCurves += it.curves
+            }
+            val endIdx = startIdx + n - 1
+            if (endIdx >= t.nodeCum.size) return r
+            val a = t.nodeCum[startIdx]; val b = t.nodeCum[endIdx]
+            val stats = i == hgvIndex
+            if (stats) {
+                val dirs = (if (r.forward) 1 else 0) + (if (r.backward) 1 else 0)
+                tKm += (b - a) * dirs
+                if (!t.demCoverage.isNaN()) tDemKm += (b - a) * dirs * t.demCoverage
+            }
+            if (t.neutral || b - a < 1.0) return r
+            val profile = profiles[i].profile
+            val climb = profile.climb ?: return r
+            val sp = terrainSpeeds[i]?.takeIf { it.baseKmh == r.speedKmh }
+                ?: TerrainSpeeds(t, climb, r.speedKmh).also { terrainSpeeds[i] = it }
+            val step = profile.options.speedFactor
+            fun steps(v: Double) = Math.round(v / step)
+            val baseQ = maxOf(step, steps(r.speedKmh) * step)
+            fun scaled(v: Double) = maxOf(profile.minSpeed, baseQ * minOf(1.0, v / r.speedKmh))
+            val fwd = scaled(sp.speedKmh(a, b, true)); val bwd = scaled(sp.speedKmh(a, b, false))
+            if (stats) terrainStats(t, climb, r, sp, a, b)
+            val fwdChanged = steps(fwd) != steps(r.speedKmh); val bwdChanged = steps(bwd) != steps(r.speedKmh)
+            if (!fwdChanged && !bwdChanged) return r
+            if (stats) { if (r.forward && fwdChanged) tChanged++; if (r.backward && bwdChanged) tChanged++ }
+            return r.copy(speedKmh = if (fwdChanged) fwd else r.speedKmh, speedBackwardKmh = if (bwdChanged) bwd else r.speedKmh)
+        }
+
+        /** Le perdite di tempo del camion su un arco, per senso percorribile: pendenza sola, curve sole, insieme. */
+        private fun terrainStats(t: WayTerrain, climb: ClimbModel, r: WaySpeedAccess,
+                                 sp: TerrainSpeeds, a: Double, b: Double) {
+            val base = (b - a) / (r.speedKmh / 3.6)
+            val both = t.grade != null && t.curves > 0
+            val slopeOnly = if (both) TerrainSpeeds(t, climb, r.speedKmh, slope = true, curves = false) else null
+            val curvesOnly = if (both) TerrainSpeeds(t, climb, r.speedKmh, slope = false, curves = true) else null
+            for (fwd in booleanArrayOf(true, false)) {
+                if (fwd && !r.forward || !fwd && !r.backward) continue
+                val all = sp.seconds(a, b, fwd) - base
+                tLoss += all
+                tSlopeKm += sp.slowedBySlope(a, b, fwd) / 1000
+                when {
+                    both -> { tSlopeLoss += slopeOnly!!.seconds(a, b, fwd) - base; tCurveLoss += curvesOnly!!.seconds(a, b, fwd) - base }
+                    t.grade != null -> tSlopeLoss += all
+                    else -> tCurveLoss += all
+                }
             }
         }
 
@@ -419,13 +564,14 @@ class OsmGraphImporter(
                     val r = wayResults[i] ?: continue
                     val p = profiles[i].profile
                     if (fwd && r.forward) delayFwd[i] += NodeDelays.seconds(c, r.speedKmh, p.acceleration, p.deceleration)
-                    if (bwd && r.backward) delayBwd[i] += NodeDelays.seconds(c, r.speedKmh, p.acceleration, p.deceleration)
+                    if (bwd && r.backward) delayBwd[i] += NodeDelays.seconds(c, r.speedBackwardKmh, p.acceleration, p.deceleration)
                 }
             }
             for (i in profiles.indices) if (wayResults[i] != null) profiles[i].writeDelay(flags, delayFwd[i], delayBwd[i])
         }
 
-        private fun addEdge(way: OsmWay, from: Int, to: Int) {
+        /** [startIdx]: l'indice nella way del primo punto dell'arco (l'arco va da lì a startIdx + n - 1). */
+        private fun addEdge(way: OsmWay, from: Int, to: Int, startIdx: Int) {
             val n = lats.size
             if (from == to) {
                 if (n <= 2) return // anello di due nodi: scartato
@@ -434,11 +580,11 @@ class OsmGraphImporter(
                 val savedLat = lats[n - 1]; val savedLon = lons[n - 1]
                 val midId = segIds.get(n - 2); val savedId = segIds.get(n - 1)
                 lats.size = n - 1; lons.size = n - 1; segIds.elementsCount = n - 1
-                addEdge(way, from, mid)
+                addEdge(way, from, mid, startIdx)
                 lats.clear(); lons.clear(); segIds.clear()
                 lats.add(graph.lat(mid)); lons.add(graph.lon(mid)); lats.add(savedLat); lons.add(savedLon)
                 segIds.add(midId); segIds.add(savedId)
-                addEdge(way, mid, to)
+                addEdge(way, mid, to, startIdx + n - 2)
                 return
             }
             var dist = DistanceCalc.length(lats.array, lons.array, n)
@@ -453,14 +599,18 @@ class OsmGraphImporter(
             val flags = graph.encodedValues.newFlags()
             encoding.shared.write(flags, tollFromNodes(way, WayAttributeParser.parse(way, isFerry, widthFromCarriageway = options.widthFromCarriageway, privateMainRoads = privateMainRoads), n))
             val ferryDuration = if (isFerry) OsmValues.parseDurationSeconds(way.tag("duration")) else -1L
+            var baseHgvSpeed = Double.NaN
             for (i in profiles.indices) {
                 // i traghetti: la velocità dalla durata e dalla lunghezza del tratto; le strade: la linea d'aria della way (ORS)
-                val r = profiles[i].profile.analyse(way, wayAccess[i], if (isFerry) dist else wayBeeline, ferryDuration)
+                var r = profiles[i].profile.analyse(way, wayAccess[i], if (isFerry) dist else wayBeeline, ferryDuration)
+                if (i == hgvIndex && r != null) baseHgvSpeed = r.speedKmh
+                // modello NAVMASTER, camion: salite, discese e curve (le velocità diventano diverse per senso)
+                if (r != null && terrainProfile[i] && !isFerry) r = withTerrain(i, way, r, startIdx, n)
                 wayResults[i] = r
                 profiles[i].write(flags, r)
             }
             if (nodeDelays) interiorDelays(edge, n, flags)
-            speedStats(way, dist)
+            speedStats(way, dist, baseHgvSpeed)
             graph.setFlags(edge, flags)
             val name = wayName(way)
             if (name.isNotEmpty()) graph.setName(edge, name)
@@ -484,13 +634,18 @@ class OsmGraphImporter(
         }
     }
 
-    /** Le statistiche delle velocità del camion (ImportStats). */
-    private fun speedStats(way: OsmWay, dist: Double) {
+    /**
+     * Le statistiche delle velocità del camion (ImportStats): la media per classe coi due sensi (in salita
+     * e in discesa differiscono); la quota lenta delle strade col cartello alto sulla velocità di base
+     * ([baseKmh], prima del terreno: misura gli artefatti del modello, non le montagne).
+     */
+    private fun speedStats(way: OsmWay, dist: Double, baseKmh: Double) {
         if (hgvIndex < 0) return
         val r = wayResults[hgvIndex] ?: return
         if (!r.forward && !r.backward) return
         val rc = WayAttributeParser.roadClass(way)
-        classLength[rc.ordinal] += dist; classSpeedLength[rc.ordinal] += dist * r.speedKmh
+        val mean = if (r.forward && r.backward) (r.speedKmh + r.speedBackwardKmh) / 2 else if (r.forward) r.speedKmh else r.speedBackwardKmh
+        classLength[rc.ordinal] += dist; classSpeedLength[rc.ordinal] += dist * mean
         val h = way.tag("highway")
         if (h == "primary" || h == "secondary") {
             var signed = Double.NaN
@@ -499,7 +654,7 @@ class OsmGraphImporter(
             }
             if (!signed.isNaN() && signed > 50) {
                 signedKm += dist / 1000
-                if (r.speedKmh < 30) slowSignedKm += dist / 1000
+                if ((if (baseKmh.isNaN()) r.speedKmh else baseKmh) < 30) slowSignedKm += dist / 1000
             }
         }
     }

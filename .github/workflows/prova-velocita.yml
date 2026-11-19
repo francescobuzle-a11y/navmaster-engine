@@ -3,6 +3,9 @@
 # rotatorie; ors: accelerazione per way, come prima), poi la sonda BrnoMikulovProbeTest sui grafi
 # navmaster e la prova SpeedModelRealTest (la statale 52 fra Mikulov e Pohořelice, Wien → Brno per
 # il valico di Mikulov, i tempi di una decina di viaggi coi due modelli). Niente viene pubblicato.
+# Coi grafi navmaster anche il modello del terreno (input dem): le celle .hgt del riquadro di ogni Paese
+# preparate da tools/dem/scarica-dem.sh (Copernicus GLO-90 con GDAL, skadi di riserva) e passate con
+# --dem alle sole importazioni navmaster; i grafi ors non lo vedono mai.
 name: Prova delle velocità
 
 on:
@@ -14,6 +17,9 @@ on:
       ors:
         description: "Costruisce anche i grafi col modello ors per il confronto (yes/no)"
         default: "yes"
+      dem:
+        description: "Pendenze del camion nei grafi navmaster: glo90 (Copernicus, GDAL), skadi (riserva) o none"
+        default: "glo90"
 
 env:
   GEOFABRIK: https://download.geofabrik.de/europe
@@ -40,9 +46,11 @@ jobs:
         working-directory: /mnt/w
         env:
           ORS: ${{ inputs.ors || 'yes' }}
+          DEM: ${{ inputs.dem || 'glo90' }}
         run: |
           set -euo pipefail
           sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool >/dev/null
+          if [ "$DEM" = "glo90" ]; then sudo apt-get install -y -qq gdal-bin >/dev/null || echo "GDAL non installato: si userà skadi"; fi
           CLI=$GITHUB_WORKSPACE/engine-cli/build/install/engine-cli/bin/engine-cli
           MEM=$(( $(free -g | awk '/Mem:/{print $2}') - 3 ))
           NAV=""; ORSG=""
@@ -52,8 +60,15 @@ jobs:
               || { echo "Geofabrik non risponde: copia di openstreetmap.fr"; curl -fsSL --retry 5 --retry-delay 30 --retry-all-errors -o region.osm.pbf "https://download.openstreetmap.fr/extracts/europe/$(echo $c | tr - _)-latest.osm.pbf"; }
             osmium tags-filter region.osm.pbf w/highway=$VEHICLE_ROADS w/route=ferry,shuttle_train r/type=restriction -o roads-$c.osm.pbf --overwrite
             rm region.osm.pbf
+            DEMOPT=""
+            if [ "$DEM" != "none" ]; then
+              echo "== $c DEM ($DEM)"
+              bash $GITHUB_WORKSPACE/tools/dem/scarica-dem.sh "$DEM" roads-$c.osm.pbf /mnt/w/dem-$c 2>&1 | tee dem-$c.log
+              DEMOPT="--dem=/mnt/w/dem-$c"
+            fi
             echo "== $c navmaster ($CC)"
-            JAVA_OPTS="-Xmx${MEM}g -XX:+UseParallelGC" $CLI import roads-$c.osm.pbf nav/$c --mmap --speed-model=navmaster --country=$CC 2>&1 | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' | tee import-nav-$c.log
+            JAVA_OPTS="-Xmx${MEM}g -XX:+UseParallelGC" $CLI import roads-$c.osm.pbf nav/$c --mmap --speed-model=navmaster --country=$CC $DEMOPT 2>&1 | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' | tee import-nav-$c.log
+            rm -rf /mnt/w/dem-$c
             NAV="$NAV${NAV:+,}$c=/mnt/w/nav/$c"
             if [ "$ORS" = "yes" ]; then
               echo "== $c ors"
@@ -66,7 +81,8 @@ jobs:
           echo "NM_SPEED_ORS=$ORSG" >> "$GITHUB_ENV"
           echo "NM_CB=$NAV" >> "$GITHUB_ENV"
           echo "== riassunto"
-          grep -HE "(grafo:|modello delle|ritardi|archi con ritardo|camion, velocità|camion sotto|Core .*nodi nel core)" import-*.log || true
+          grep -HE "(grafo:|modello delle|ritardi|archi con ritardo|camion, velocità|camion sotto|terreno|Core .*nodi nel core)" import-*.log || true
+          grep -HE "(DEM pronto|bordi comuni|riserva skadi)" dem-*.log || true
           du -sh nav/* ors/* 2>/dev/null || true; df -h /mnt
       - name: Sonda Brno/Mikulov sui grafi navmaster
         if: inputs.probe != 'no'
@@ -83,5 +99,6 @@ jobs:
           name: prova-velocita
           path: |
             /mnt/w/import-*.log
+            /mnt/w/dem-*.log
             sonda.log
             prova.log

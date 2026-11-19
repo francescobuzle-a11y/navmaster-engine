@@ -56,7 +56,17 @@ class Instruction(var sign: Int, var name: String) {
  * Porting di GraphHopper `InstructionsFromEdges` (fork ORS): produce la lista di istruzioni di un
  * percorso osservando, a ogni nodo, gli archi alternativi (nomi, classi stradali, velocità).
  */
-class InstructionsBuilder(private val graph: BaseGraph, private val encoding: GraphEncoding, private val profile: ProfileEncoding) {
+class InstructionsBuilder(
+    private val graph: BaseGraph, private val encoding: GraphEncoding, private val profile: ProfileEncoding,
+    /**
+     * Grafo del modello NAVMASTER: le velocità del camion cambiano da un arco all'altro della stessa strada
+     * per le salite, le discese e le curve ([it.navmaster.engine.terrain.WayTerrain]); il confronto delle
+     * velocità ([OutgoingEdges.outgoingEdgesAreSlowerByFactor]) usa allora la velocità più alta dei due
+     * sensi e una tolleranza di [NAVMASTER_SPEED_TOLERANCE] km/h, perché un'istruzione non compaia o
+     * sparisca per il rumore del terreno. I grafi ORS restano come in GraphHopper (uguaglianza esatta).
+     */
+    private val navmasterSpeeds: Boolean = false,
+) {
     private val sh = encoding.shared
     private val outIt = graph.createEdgeIterator()
     private val tmpIt = graph.createEdgeIterator()
@@ -231,6 +241,14 @@ class InstructionsBuilder(private val graph: BaseGraph, private val encoding: Gr
             val visibleTurns get() = 1 + visible.size
 
             fun outgoingEdgesAreSlowerByFactor(factor: Double): Boolean {
+                if (navmasterSpeeds) {
+                    val pathSpeed = roadSpeedOf(current.edge)
+                    val prevSpeed = if (prevEdge != null) roadSpeedOf(prevEdge.edge) else pathSpeed
+                    if (abs(pathSpeed - prevSpeed) > NAVMASTER_SPEED_TOLERANCE || pathSpeed < 1) return false
+                    var maxSurrounding = -1.0
+                    for (e in visible) maxSurrounding = max(maxSurrounding, roadSpeedOf(e))
+                    return maxSurrounding * factor < pathSpeed
+                }
                 val pathSpeed = speedOf(current.edge, current.baseNode)
                 val prevSpeed = if (prevEdge != null) speedOf(prevEdge.edge, prevEdge.baseNode) else pathSpeed
                 if (pathSpeed != prevSpeed || pathSpeed < 1) return false
@@ -268,6 +286,8 @@ class InstructionsBuilder(private val graph: BaseGraph, private val encoding: Gr
     private fun linkOf(edge: Int): Boolean { tmpIt.setEdge(edge, graph.nodeA(edge)); return tmpIt.get(sh.roadClassLink) }
     private fun sameRoadClassAndLink(e1: Int, e2: Int) = roadClassOf(e1) == roadClassOf(e2) && linkOf(e1) == linkOf(e2)
     private fun speedOf(edge: Int, base: Int): Double { tmpIt.setEdge(edge, base); return tmpIt.get(profile.speed) }
+    /** La velocità più alta dei due sensi (modello NAVMASTER: quella della strada, meno toccata dalla pendenza). */
+    private fun roadSpeedOf(edge: Int): Double { tmpIt.setEdge(edge, graph.nodeA(edge)); return max(tmpIt.get(profile.speed), tmpIt.getReverse(profile.speed)) }
     private fun isOneway(edge: PathEdge): Boolean { tmpIt.setEdge(edge.edge, edge.baseNode); return tmpIt.get(profile.access) != tmpIt.getReverse(profile.access) }
 
     /** Punto per il calcolo dell'orientamento: il primo pillar, altrimenti il nodo adiacente. */
@@ -282,6 +302,8 @@ class InstructionsBuilder(private val graph: BaseGraph, private val encoding: Gr
 
     companion object {
         const val MAX_U_TURN_DISTANCE = 35.0
+        /** Velocità uguali per le istruzioni sui grafi NAVMASTER (km/h, due passi di velocità). */
+        const val NAVMASTER_SPEED_TOLERANCE = 10.0
         private val MAJOR = setOf(RoadClass.MOTORWAY, RoadClass.TRUNK, RoadClass.PRIMARY, RoadClass.SECONDARY, RoadClass.TERTIARY)
 
         fun isNameSimilar(a: String?, b: String?): Boolean {
