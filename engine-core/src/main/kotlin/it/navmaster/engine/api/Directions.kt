@@ -827,7 +827,7 @@ class DirectionsService(private val graphs: RoutingGraph, private val limits: Di
         val started = System.nanoTime()
         var instructionsNanos = 0L
         val pe = graphs.encoding.profile(encoder)
-        val instructionsBuilder = InstructionsBuilder(graphs.graph, graphs.encoding, pe)
+        val instructionsBuilder = InstructionsBuilder(graphs.graph, graphs.encoding, pe, navmasterSpeeds = graphs.speedModel == it.navmaster.engine.profile.SpeedModel.NAVMASTER.id)
         val stepBuilder = OrsStepBuilder(StepOptions(request.language, request.units, request.maneuvers, request.htmlFormat))
         val geometry = PointList(256)
         val wayPoints = ArrayList<Int>().also { it.add(0) }

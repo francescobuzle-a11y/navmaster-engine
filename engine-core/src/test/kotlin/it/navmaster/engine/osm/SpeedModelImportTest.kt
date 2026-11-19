@@ -36,11 +36,11 @@ class SpeedModelImportTest {
         HgvProfile(VehicleProfileOptions(maximumGradeLevel = 1, useAcceleration = false, blockFords = false, speedModel = SpeedModel.NAVMASTER, country = country)),
     )
 
-    private fun <T> imported(profiles: List<VehicleProfile>, source: OsmSource? = null, block: (BaseGraph, GraphEncoding, ImportStats) -> T): T {
+    private fun <T> imported(profiles: List<VehicleProfile>, source: OsmSource? = null, options: ImportOptions = ImportOptions(), block: (BaseGraph, GraphEncoding, ImportStats) -> T): T {
         val encoding = GraphEncoding(profiles)
         val dir = Files.createTempDirectory("nme-sm").toFile().also { it.deleteOnExit() }
         return BaseGraph(GraphDirectory(dir), encoding.registry).use { graph ->
-            val importer = OsmGraphImporter(graph, encoding)
+            val importer = OsmGraphImporter(graph, encoding, null, options)
             val stats = if (source != null) importer.import(source) else importer.import(pbf)
             block(graph, encoding, stats)
         }
@@ -103,7 +103,8 @@ class SpeedModelImportTest {
             }
         }, relations = false)
 
-        imported(navProfiles("DE")) { graph, encoding, stats ->
+        // il modello di base, senza le curve del camion (provate a parte, sotto)
+        imported(navProfiles("DE"), options = ImportOptions(curves = false)) { graph, encoding, stats ->
             println("NAVMASTER Heidelberg: $stats")
             assertEquals(6, graph.intsForFlags)
             val hgv = encoding.profile("heavyvehicle")
@@ -145,6 +146,68 @@ class SpeedModelImportTest {
             assertTrue(stats.delayEvents.getValue("IMPLIED_GIVE_WAY") > 100, "precedenze implicite: ${stats.delayEvents}")
             assertTrue(stats.delayEvents.getValue("ROUNDABOUT_ENTRY") > 5, "rotatorie: ${stats.delayEvents}")
             assertTrue(stats.hgvSlowSignedShare < 0.01, "camion sotto 30 km/h con cartello > 50: ${stats.hgvSlowSignedShare}")
+        }
+    }
+
+    @Test
+    fun `the NAVMASTER curves on Heidelberg - the truck only slower, never absurd, the car unchanged`() {
+        // senza DEM: solo le curve del camion (il DEM ha le sue prove in TerrainImportTest)
+        val plain = imported(navProfiles("DE"), options = ImportOptions(curves = false)) { graph, _, _ -> (0 until graph.edgeCount).map { graph.getFlags(it) } }
+        imported(navProfiles("DE")) { graph, encoding, stats ->
+            val t = stats.terrain!!
+            println("NAVMASTER Heidelberg, curve del camion: $t")
+            val hgv = encoding.profile("heavyvehicle"); val car = encoding.profile("car-ors")
+            val main = setOf(it.navmaster.engine.profile.RoadClass.MOTORWAY, it.navmaster.engine.profile.RoadClass.TRUNK, it.navmaster.engine.profile.RoadClass.PRIMARY,
+                it.navmaster.engine.profile.RoadClass.SECONDARY, it.navmaster.engine.profile.RoadClass.TERTIARY)
+            var slower = 0
+            for (e in 0 until graph.edgeCount) {
+                val f = graph.getFlags(e); val p = plain[e]
+                for (rev in listOf(false, true)) {
+                    assertEquals(car.speed.get(p, rev), car.speed.get(f, rev), "auto, arco $e")
+                    val before = hgv.speed.get(p, rev); val now = hgv.speed.get(f, rev)
+                    assertTrue(now <= before, "arco $e: il camion più veloce con le curve ($before → $now)")
+                    if (now < before) slower++
+                    if (encoding.shared.roadClass.get(f) in main && hgv.access.get(f, rev)) assertTrue(now >= 10.0, "arco $e: camion a $now km/h")
+                }
+            }
+            println("sensi d'arco più lenti per le curve: $slower su ${2 * graph.edgeCount}")
+            assertEquals(t.changedEdgeDirections.toDouble(), slower.toDouble(), t.changedEdgeDirections * 0.2 + 5, "conteggio dei sensi cambiati")
+            assertTrue(t.curves > 100, "curve: ${t.curves}")
+            // in media pochi secondi al km: le curve contano nelle anse e negli incroci, non dappertutto
+            val secPerKm = t.curveLossMin * 60 / t.km
+            assertTrue(secPerKm in 0.5..6.0, "curve: $secPerKm s/km")
+            assertTrue(slower < graph.edgeCount / 5, "troppi archi rallentati: $slower")
+        }
+    }
+
+    @Test
+    fun `a flat DSM full of forest blocks and villages - almost no truck km slowed by slope on Heidelberg`() {
+        // pianura a 100 m con blocchi di bosco o di case alti 15 m (300 × 300 m, quattro su dieci) e 1 m di rumore
+        // ogni 30 m: come un DEM di superficie sulla Val Padana; le strade di Heidelberg ci passano sopra in ogni verso
+        fun hash(a: Long, b: Long): Long { var h = a * 0x9E3779B97F4A7C15uL.toLong() + b * 0xC2B2AE3D27D4EB4FuL.toLong(); h = h xor (h ushr 31); h *= 0x94D049BB133111EBuL.toLong(); return h xor (h ushr 29) }
+        val dsm = it.navmaster.engine.terrain.ElevationSource { lat, lon ->
+            val y = lat * 111_195.0; val x = lon * 111_195.0 * 0.65
+            val block = if (Math.floorMod(hash(Math.floorDiv(x.toLong(), 300L), Math.floorDiv(y.toLong(), 300L)), 10L) < 4) 15.0 else 0.0
+            val noise = Math.floorMod(hash(Math.floorDiv(x.toLong(), 30L) + 7, Math.floorDiv(y.toLong(), 30L)), 1000L) / 1000.0 * 2 - 1
+            100 + block + noise
+        }
+        // senza i tag incline (veri, sulle salite di Heidelberg: sulle way corte valgono al posto del DEM): conta solo il DEM
+        val reader = OsmPbfReader(pbf)
+        val noIncline = object : OsmSource {
+            override val nodeCount get() = reader.nodeCount
+            override val wayCount get() = reader.wayCount
+            override fun read(sink: OsmSink, nodes: Boolean, ways: Boolean, relations: Boolean) = reader.read(object : OsmSink {
+                override fun node(id: Long, lat: Double, lon: Double, tags: Map<String, String>?) = sink.node(id, lat, lon, tags)
+                override fun way(way: OsmWay) = sink.way(if (way.hasTag("incline")) OsmWay(way.id, way.tags - "incline", way.nodeIds) else way)
+                override fun relation(id: Long, tags: Map<String, String>, members: List<RelationMember>) = sink.relation(id, tags, members)
+            }, nodes, ways, relations)
+        }
+        imported(navProfiles("DE"), noIncline, options = ImportOptions(dem = dsm, curves = false)) { _, _, stats ->
+            val t = stats.terrain!!
+            println("NAVMASTER Heidelberg su una pianura con boschi: ${"%.1f".format(t.slopeKm)} km frenati su ${"%.0f".format(t.km)}; per classe ${t.slopeShareByClass.mapValues { "%.2f %%".format(100 * it.value) }}")
+            assertTrue(stats.demUsed)
+            assertTrue(t.slopeKm / t.km < 0.002, "km frenati dalla pendenza in pianura: ${t.slopeKm} su ${t.km}")
+            for ((c, share) in t.slopeShareByClass) assertTrue(share < 0.005, "$c: ${100 * share} % dei km frenati in pianura")
         }
     }
 

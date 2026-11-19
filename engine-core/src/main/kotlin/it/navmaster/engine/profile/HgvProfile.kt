@@ -34,6 +34,8 @@ class HgvProfile(options: VehicleProfileOptions = VehicleProfileOptions(maximumG
     override val roundaboutCapMultiLane = 30.0
     override val miniRoundaboutCap = 15.0
     override val residentialCap = 30.0
+    /** Salite, discese e curve: solo col modello NAVMASTER (ORS non ne sa nulla). */
+    override val climb: ClimbModel? = if (options.speedModel == SpeedModel.NAVMASTER) ClimbModel.HGV else null
 
     init {
         intendedValues += listOf("designated", "agricultural", "forestry", "delivery", "bus", "hgv", "goods")

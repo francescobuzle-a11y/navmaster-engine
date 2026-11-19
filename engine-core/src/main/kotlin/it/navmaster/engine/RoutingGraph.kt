@@ -142,6 +142,14 @@ class RoutingGraph private constructor(
     var speedModel: String = "ors"; private set
     var country: String? = null; private set
 
+    /**
+     * Le pendenze del camion (modello NAVMASTER): `dem` se il grafo è stato costruito con un modello del
+     * terreno ([ImportOptions.dem]), con la sua fonte ([demSource], es. `copernicus-glo90`); null senza
+     * (le curve ci sono comunque in ogni grafo NAVMASTER). Solo diagnostica: le velocità sono negli archi.
+     */
+    var terrain: String? = null; private set
+    var demSource: String? = null; private set
+
     val profileNames: List<String> get() = encoding.profiles.map { it.profile.name }
 
     /** Pesi su cui preparare la CH per ciascun profilo (ORS: auto `fastest`, camion `recommended`). */
@@ -476,7 +484,15 @@ class RoutingGraph private constructor(
                 else -> ""
             }
             rg.flush()
-            GraphProperties(File(dir, "profiles")).apply { load(); set("speed_model", rg.speedModel); set("country", rg.country ?: ""); set("priority_model", encoding.priorityModel.id); save() }
+            GraphProperties(File(dir, "profiles")).apply {
+                load(); set("speed_model", rg.speedModel); set("country", rg.country ?: ""); set("priority_model", encoding.priorityModel.id)
+                // solo se il DEM è servito davvero a un profilo col terreno: il file degli altri (ORS compresi) resta quello di prima
+                if (importOptions.dem != null && stats.demUsed) {
+                    rg.terrain = "dem"; rg.demSource = importOptions.demSource?.takeIf { it.isNotBlank() } ?: "hgt"
+                    set("terrain", rg.terrain!!); set("dem_source", rg.demSource!!)
+                }
+                save()
+            }
             rg.index = LocationIndex.build(graph)
             rg.index.save(gdir)
             return rg to stats
@@ -499,6 +515,8 @@ class RoutingGraph private constructor(
             rg.coreWide = props.get("core_kind") == "wide"
             rg.speedModel = props.get("speed_model")?.takeIf { it.isNotBlank() } ?: "ors"
             rg.country = props.get("country")?.takeIf { it.isNotBlank() }
+            rg.terrain = props.get("terrain")?.takeIf { it.isNotBlank() }
+            rg.demSource = props.get("dem_source")?.takeIf { it.isNotBlank() }
             // il peso con cui sono stati preparati CH, core e landmark: ORS per i grafi di prima (anche NAVMASTER)
             encoding.priorityModel = PriorityModel.parse(props.get("priority_model"))
             check((graph.formatVariant == PRIORITY_VARIANT || graph.formatVariant == TRANSIT_VARIANT) == (encoding.priorityModel == PriorityModel.NAVMASTER)) {

@@ -12,10 +12,15 @@ data class WaySpeedAccess(
     val access: Access,
     val forward: Boolean,
     val backward: Boolean,
-    /** km/h, già limitata a [minSpeed, maxSpeed] del profilo. */
+    /** km/h, già limitata a [minSpeed, maxSpeed] del profilo; nel senso della way. */
     val speedKmh: Double,
     /** Fattore di priorità [PriorityCode.factor], usato dal peso "recommended". */
     val priority: Double,
+    /**
+     * km/h nel senso contrario alla way: uguale a [speedKmh] tranne che per le salite, le discese e le
+     * curve del modello NAVMASTER ([it.navmaster.engine.terrain.WayTerrain]); ORS non la tocca mai.
+     */
+    val speedBackwardKmh: Double = speedKmh,
 )
 
 /** Opzioni di costruzione del profilo (`encoder_options` di ORS). */
@@ -64,6 +69,12 @@ abstract class VehicleProfile(
     /** Accelerazione e decelerazione tipiche (m/s²) per le perdite ai nodi del modello NAVMASTER ([NodeDelays]). */
     open val acceleration: Double = 1.5
     open val deceleration: Double = 2.0
+
+    /**
+     * Il mezzo di riferimento per salite, discese e curve del modello NAVMASTER ([ClimbModel],
+     * [it.navmaster.engine.terrain.WayTerrain]); null = velocità senza terreno (l'auto, e ogni profilo ORS).
+     */
+    open val climb: ClimbModel? = null
 
     /** Tetti di velocità per tipo del modello NAVMASTER (km/h). */
     protected open val roundaboutCap: Double = 30.0
