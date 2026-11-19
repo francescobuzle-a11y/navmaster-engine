@@ -205,6 +205,15 @@ class SpeedModelImportTest {
         assertEquals(65.0, truckSpeed("IT")) // 63
         assertEquals(55.0, truckSpeed("DE")) // 54
         assertEquals(70.0, truckSpeed(null)) // riserva 80 × 0,9
+        assertEquals(80.0, truckSpeed("SK")) // 90 × 0,9 = 81 (zákon 8/2009 §16)
+        assertEquals(70.0, truckSpeed("HR")) // 80 × 0,9 = 72 (ZSPC art. 55)
+        assertEquals(55.0, truckSpeed("AL")) // 60 × 0,9 = 54
+        // le trunk (EXPRESS, fattore pieno) di Spagna e Polonia sono quasi sempre a una carreggiata: limite delle strade normali
+        val trunk = mapOf("highway" to "trunk")
+        fun trunkSpeed(country: String?) = imported(navProfiles(country), straightRoad(1, trunk)) { g, enc, _ -> enc.profile("heavyvehicle").speed.get(g.getFlags(0), false) }
+        assertEquals(80.0, trunkSpeed("ES"))
+        assertEquals(70.0, trunkSpeed("PL"))
+        assertEquals(80.0, trunkSpeed("TR")) // 85 legale, ma senza cartello la trunk resta alla velocità di base del camion (80)
     }
 
     @Test

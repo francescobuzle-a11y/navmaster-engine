@@ -56,7 +56,20 @@ enum class RoadContext {
  * Limiti legali del camion (autoarticolato o autotreno oltre 12 t) per Paese e contesto, in km/h.
  * Stessi numeri di `SpeedRules.legal` dell'app (oltre 12 t, autoarticolato) per IT, AT, DE, CH, CZ, NL, FR, ES, PL
  * (AT: 70 anche sulle trunk, come l'app; il limite notturno di 60 non è applicato).
- * Alcune righe vanno verificate sulla legge (SK, SI, HR, BE, DE per le Kraftfahrstraßen).
+ *
+ * Righe controllate il 2026-11-19 sui testi di legge e sulle pagine «Guidare all'estero» dell'UE
+ * (europa.eu/youreurope). Sopra i 90 km/h vale il limitatore dei mezzi pesanti (direttiva 92/6/CEE):
+ * le righe si fermano a 90. EXPRESS sono le trunk e le motorroad: dove le trunk sono quasi sempre a
+ * una carreggiata (ES, PL, GB) vale il limite delle strade normali, non quello delle superstrade.
+ * - SK: 90 fuori dai centri sopra 3,5 t (zákon 8/2009 §16); HR: 80 fuori, 90 in autostrada (ZSPC art. 55).
+ * - ES: 90 solo su autopista/autovía (motorway in OSM), 80 sulle nazionali (RGC art. 48).
+ * - PL: 80 su autostrade, superstrade e doppie carreggiate (motorway in OSM), 70 altrove (art. 20 ust. 3).
+ * - GB: valori dell'Inghilterra e del Galles, 50 mph su carreggiata singola e 56 mph in autostrada
+ *   (la Scozia è più bassa: 40 mph); le doppie carreggiate (60 mph) restano a 80.
+ * - BG: DV 64/2025 (dal 07.09.2025). DE: 80 sulle Kraftfahrstraßen solo a carreggiate separate (qui sempre 80).
+ * - LT: le greitkeliai sono motorway in OSM, ma per i camion valgono 80 (qui 90).
+ * - EE (solo pagina UE), AL (art. 140 non letto), MK, CY, BY: fiducia media o bassa.
+ * - AD, FO, GE, MD, XK, IM, GG: nessuna fonte trovata, restano sulla riga di riserva.
  */
 object HgvLegalSpeeds {
     /** Ordine: URBAN, MINOR, RURAL, EXPRESS, MOTORWAY. */
@@ -70,17 +83,39 @@ object HgvLegalSpeeds {
         "NL" to intArrayOf(50, 80, 80, 80, 80),
         "DK" to intArrayOf(50, 80, 80, 80, 80),
         "FR" to intArrayOf(50, 60, 80, 80, 90),
-        "ES" to intArrayOf(50, 80, 80, 90, 90),
-        "PL" to intArrayOf(50, 70, 70, 80, 80),
-        "SK" to intArrayOf(50, 80, 80, 90, 90),
+        "ES" to intArrayOf(50, 80, 80, 80, 90),
+        "PL" to intArrayOf(50, 70, 70, 70, 80),
+        "SK" to intArrayOf(50, 90, 90, 90, 90),
         "HU" to intArrayOf(50, 70, 70, 70, 80),
         "SI" to intArrayOf(50, 70, 70, 80, 80),
-        "HR" to intArrayOf(50, 70, 70, 80, 80),
+        "HR" to intArrayOf(50, 80, 80, 80, 90),
         "BE" to intArrayOf(50, 60, 60, 90, 90),
         "LU" to intArrayOf(50, 75, 75, 75, 90),
         "PT" to intArrayOf(50, 80, 80, 80, 90),
         "RO" to intArrayOf(50, 70, 70, 80, 90),
         "BG" to intArrayOf(50, 80, 80, 90, 90),
+        "AL" to intArrayOf(40, 60, 60, 60, 80),
+        "BY" to intArrayOf(60, 70, 70, 70, 90),
+        "BA" to intArrayOf(50, 70, 70, 70, 70),
+        "CY" to intArrayOf(50, 64, 64, 80, 80),
+        "EE" to intArrayOf(50, 90, 90, 90, 90),
+        "FI" to intArrayOf(50, 80, 80, 80, 80),
+        "GB" to intArrayOf(48, 80, 80, 80, 90),
+        "GR" to intArrayOf(50, 70, 70, 70, 80),
+        "IS" to intArrayOf(50, 80, 80, 80, 80),
+        "IE" to intArrayOf(50, 80, 80, 80, 90),
+        "LV" to intArrayOf(50, 80, 80, 80, 80),
+        "LI" to intArrayOf(50, 80, 80, 80, 80),
+        "LT" to intArrayOf(50, 80, 80, 80, 90),
+        "MK" to intArrayOf(50, 70, 70, 70, 80),
+        "MT" to intArrayOf(40, 60, 60, 60, 60),
+        "MC" to intArrayOf(50, 50, 50, 50, 50),
+        "ME" to intArrayOf(50, 70, 70, 70, 70),
+        "NO" to intArrayOf(50, 80, 80, 80, 80),
+        "RS" to intArrayOf(50, 70, 70, 70, 90),
+        "SE" to intArrayOf(50, 80, 80, 80, 80),
+        "TR" to intArrayOf(50, 80, 80, 85, 90),
+        "UA" to intArrayOf(50, 90, 90, 90, 90),
     )
 
     /** Riga di riserva per un Paese sconosciuto o assente. */
