@@ -457,8 +457,8 @@ class RoutingGraph private constructor(
             rg.flush()
             GraphProperties(File(dir, "profiles")).apply {
                 load(); set("speed_model", rg.speedModel); set("country", rg.country ?: ""); set("priority_model", encoding.priorityModel.id)
-                // solo coi grafi costruiti con un DEM: il file degli altri (ORS compresi) resta quello di prima
-                if (importOptions.dem != null) {
+                // solo se il DEM è servito davvero a un profilo col terreno: il file degli altri (ORS compresi) resta quello di prima
+                if (importOptions.dem != null && stats.demUsed) {
                     rg.terrain = "dem"; rg.demSource = importOptions.demSource?.takeIf { it.isNotBlank() } ?: "hgt"
                     set("terrain", rg.terrain!!); set("dem_source", rg.demSource!!)
                 }

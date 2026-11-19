@@ -11,12 +11,17 @@
 #   https://copernicus-dem-90m.s3.amazonaws.com (le celle di terra in tileList.txt), convertito con GDAL:
 #   gdalwarp sul riquadro allargato di mezzo campione (lon-1/2400 … lon+1+1/2400), 1201×1201, bilineare,
 #   Int16 (quote al metro), poi gdal_translate in SRTMHGT; un avviso di allineamento di GDAL fa fallire il
-#   passo, e il bordo comune di due celle vicine deve coincidere. Se qualcosa va storto si passa a skadi.
+#   passo, e il bordo comune di due celle vicine deve coincidere (check_edges). Il mosaico (gdalbuildvrt) è
+#   alla risoluzione più fine delle celle e bilineare: sopra i 50° N le celle GLO-90 sono più strette in
+#   longitudine (800 colonne fra 50° e 60°, 1200 sotto), e la risoluzione media di gdalbuildvrt le
+#   ricampionerebbe al vicino più prossimo. Se il download, GDAL o la prova dei bordi falliscono si passa a skadi.
 #   Attribuzione da mettere nei crediti dell'app: «produced using Copernicus WorldDEM-90 © DLR e.V.
 #   2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European
 #   Union and ESA; all rights reserved» (licenza COPDEM:
 #   https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Data/DEM/resources/license/License-COPDEM-30.pdf;
 #   da riscontrare con l'allegato GLO-90).
+# Se anche la riserva fallisce: un avviso chiaro e uscita 3 (nessun DEM a metà). Chi chiama decide: i
+# flussi grafo-nm e prova-velocita costruiscono allora il Paese senza DEM (solo le curve) con un ::warning::.
 # skadi (riserva, senza GDAL): le celle .hgt.gz di Tilezen (https://elevation-tiles-prod.s3.amazonaws.com/skadi,
 #   3601×3601, composito: EU-DEM in Europa, SRTM altrove, ultimo aggiornamento 2016); attribuzioni in
 #   https://github.com/tilezen/joerd/blob/master/docs/attribution.md.
@@ -80,7 +85,7 @@ PY
   echo "scaricate $(wc -l < "$WORK/tifs.txt") celle ($(du -sh "$WORK/tif" | cut -f1))"
   # un mosaico solo: le celle vicine danno la riga e la colonna in comune (e il mezzo campione oltre il bordo);
   # fuori dalle celle (mare) nessun dato, escluso dalla bilineare di gdalwarp
-  gdalbuildvrt -q -vrtnodata -32768 -input_file_list "$WORK/tifs.txt" "$WORK/dem.vrt" || return 1
+  gdalbuildvrt -q -resolution highest -r bilinear -vrtnodata -32768 -input_file_list "$WORK/tifs.txt" "$WORK/dem.vrt" || return 1
   export WORK OUT
   # shellcheck disable=SC2016
   awk '{print $1, $2, $3}' "$WORK/land.txt" | xargs -P "$JOBS" -L1 bash -c '
@@ -111,7 +116,8 @@ skadi() {
       403|404) rm -f "$WORK/gz/$name.hgt.gz" ;; # mare: la cella non c è
       *) echo "skadi $name: risposta $code" >&2; exit 1 ;;
     esac
-  ' _
+  ' _ || return 1
+  [ -n "$(find "$OUT" -maxdepth 1 -name '*.hgt' -print -quit)" ] || { echo "skadi: nessuna cella nel riquadro"; return 1; }
   echo "skadi" > "$OUT/SOURCE"
 }
 
@@ -168,19 +174,28 @@ if total and bad > total * 0.01:
 PY
 }
 
+clean() { rm -f "$OUT"/*.hgt "$OUT"/*.aux.xml "$OUT/SOURCE"; }
+
+# nessun DEM: la cartella vuota, un avviso chiaro, uscita 3 (il chiamante decide se costruire senza pendenze)
+fail() {
+  clean
+  echo "ATTENZIONE: DEM non disponibile per $AREA ($*): nessuna cella .hgt in $OUT; il grafo avrebbe solo le curve, senza salite né discese" >&2
+  exit 3
+}
+
+# dentro un `if` bash non applica set -e: ogni funzione controlla da sé i suoi passi
 case "$SRC" in
   glo90)
-    if ! glo90; then
-      echo "GLO-90 non riuscito: riserva skadi"
-      rm -f "$OUT"/*.hgt "$OUT"/*.aux.xml "$OUT/SOURCE"
-      skadi
+    if glo90 && check_edges; then :; else
+      echo "GLO-90 non riuscito (download, GDAL o bordi comuni): riserva skadi"
+      clean
+      if skadi && check_edges; then :; else fail "GLO-90 e skadi falliti"; fi
     fi
     ;;
-  skadi) skadi ;;
+  skadi) if skadi && check_edges; then :; else fail "skadi fallito"; fi ;;
   *) echo "fonte sconosciuta: $SRC (glo90 o skadi)" >&2; exit 2 ;;
 esac
 
 COUNT=$(find "$OUT" -maxdepth 1 -name '*.hgt' | wc -l)
-[ "$COUNT" -gt 0 ] || { echo "nessuna cella .hgt scritta" >&2; exit 1; }
-check_edges
+[ "$COUNT" -gt 0 ] || fail "nessuna cella .hgt scritta"
 echo "DEM pronto: $COUNT celle $(cat "$OUT/SOURCE") in $OUT ($(du -sh "$OUT" | cut -f1))"

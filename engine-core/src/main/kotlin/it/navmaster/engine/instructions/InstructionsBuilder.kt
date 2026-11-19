@@ -63,10 +63,13 @@ class InstructionsBuilder(
      * per le salite, le discese e le curve ([it.navmaster.engine.terrain.WayTerrain]); il confronto delle
      * velocità ([OutgoingEdges.outgoingEdgesAreSlowerByFactor]) usa allora la velocità più alta dei due
      * sensi e una tolleranza di [NAVMASTER_SPEED_TOLERANCE] km/h, perché un'istruzione non compaia o
-     * sparisca per il rumore del terreno. I grafi ORS restano come in GraphHopper (uguaglianza esatta).
+     * sparisca per il rumore del terreno. Vale solo per il camion (`heavyvehicle`, il solo profilo col
+     * terreno): l'auto dei grafi NAVMASTER e i grafi ORS restano come in GraphHopper (uguaglianza esatta).
      */
-    private val navmasterSpeeds: Boolean = false,
+    navmasterSpeeds: Boolean = false,
 ) {
+    /** La tolleranza delle velocità: grafo NAVMASTER e camion. */
+    private val navmasterSpeeds = navmasterSpeeds && profile.profile.name == TERRAIN_PROFILE
     private val sh = encoding.shared
     private val outIt = graph.createEdgeIterator()
     private val tmpIt = graph.createEdgeIterator()
@@ -304,6 +307,8 @@ class InstructionsBuilder(
         const val MAX_U_TURN_DISTANCE = 35.0
         /** Velocità uguali per le istruzioni sui grafi NAVMASTER (km/h, due passi di velocità). */
         const val NAVMASTER_SPEED_TOLERANCE = 10.0
+        /** Il profilo con le salite, le discese e le curve ([it.navmaster.engine.profile.VehicleProfile.climb]). */
+        const val TERRAIN_PROFILE = "heavyvehicle"
         private val MAJOR = setOf(RoadClass.MOTORWAY, RoadClass.TRUNK, RoadClass.PRIMARY, RoadClass.SECONDARY, RoadClass.TERTIARY)
 
         fun isNameSimilar(a: String?, b: String?): Boolean {

@@ -68,10 +68,16 @@ class ClimbModel(
     }
 
     /** L'accelerazione possibile (m/s²) a [vMs] su una pendenza [grade]: [accel], o meno se la potenza non basta; mai negativa. */
-    fun acceleration(vMs: Double, grade: Double): Double {
+    fun acceleration(vMs: Double, grade: Double): Double = max(0.0, powerAcceleration(vMs, grade))
+
+    /**
+     * L'accelerazione (m/s²) che la potenza dà a [vMs] su [grade], al più [accel]: negativa sopra la velocità
+     * sostenibile di una salita (il camion rallenta da sé, senza frenare).
+     */
+    fun powerAcceleration(vMs: Double, grade: Double): Double {
         val v = max(vMs, 0.5)
         val spare = wheelPowerW / v - resistance(v, grade)
-        return max(0.0, min(accel, spare / massKg))
+        return min(accel, spare / massKg)
     }
 
     /** La forza resistente (N) a [vMs] su [grade]: pendenza, rotolamento, aria. */

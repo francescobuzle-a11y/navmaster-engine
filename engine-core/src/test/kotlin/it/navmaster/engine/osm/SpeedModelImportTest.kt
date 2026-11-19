@@ -178,6 +178,37 @@ class SpeedModelImportTest {
         }
     }
 
+    @Test
+    fun `a flat DSM full of forest blocks and villages - almost no truck km slowed by slope on Heidelberg`() {
+        // pianura a 100 m con blocchi di bosco o di case alti 15 m (300 × 300 m, quattro su dieci) e 1 m di rumore
+        // ogni 30 m: come un DEM di superficie sulla Val Padana; le strade di Heidelberg ci passano sopra in ogni verso
+        fun hash(a: Long, b: Long): Long { var h = a * 0x9E3779B97F4A7C15uL.toLong() + b * 0xC2B2AE3D27D4EB4FuL.toLong(); h = h xor (h ushr 31); h *= 0x94D049BB133111EBuL.toLong(); return h xor (h ushr 29) }
+        val dsm = it.navmaster.engine.terrain.ElevationSource { lat, lon ->
+            val y = lat * 111_195.0; val x = lon * 111_195.0 * 0.65
+            val block = if (Math.floorMod(hash(Math.floorDiv(x.toLong(), 300L), Math.floorDiv(y.toLong(), 300L)), 10L) < 4) 15.0 else 0.0
+            val noise = Math.floorMod(hash(Math.floorDiv(x.toLong(), 30L) + 7, Math.floorDiv(y.toLong(), 30L)), 1000L) / 1000.0 * 2 - 1
+            100 + block + noise
+        }
+        // senza i tag incline (veri, sulle salite di Heidelberg: sulle way corte valgono al posto del DEM): conta solo il DEM
+        val reader = OsmPbfReader(pbf)
+        val noIncline = object : OsmSource {
+            override val nodeCount get() = reader.nodeCount
+            override val wayCount get() = reader.wayCount
+            override fun read(sink: OsmSink, nodes: Boolean, ways: Boolean, relations: Boolean) = reader.read(object : OsmSink {
+                override fun node(id: Long, lat: Double, lon: Double, tags: Map<String, String>?) = sink.node(id, lat, lon, tags)
+                override fun way(way: OsmWay) = sink.way(if (way.hasTag("incline")) OsmWay(way.id, way.tags - "incline", way.nodeIds) else way)
+                override fun relation(id: Long, tags: Map<String, String>, members: List<RelationMember>) = sink.relation(id, tags, members)
+            }, nodes, ways, relations)
+        }
+        imported(navProfiles("DE"), noIncline, options = ImportOptions(dem = dsm, curves = false)) { _, _, stats ->
+            val t = stats.terrain!!
+            println("NAVMASTER Heidelberg su una pianura con boschi: ${"%.1f".format(t.slopeKm)} km frenati su ${"%.0f".format(t.km)}; per classe ${t.slopeShareByClass.mapValues { "%.2f %%".format(100 * it.value) }}")
+            assertTrue(stats.demUsed)
+            assertTrue(t.slopeKm / t.km < 0.002, "km frenati dalla pendenza in pianura: ${t.slopeKm} su ${t.km}")
+            for ((c, share) in t.slopeShareByClass) assertTrue(share < 0.005, "$c: ${100 * share} % dei km frenati in pianura")
+        }
+    }
+
     // ---------------------------------------------------------------- dati in memoria
 
     private class Node(val id: Long, val lat: Double, val lon: Double, val tags: Map<String, String>? = null)

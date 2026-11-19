@@ -141,20 +141,27 @@ fun profilesFromArgs(args: List<String>): List<VehicleProfile> {
     }
 }
 
+/**
+ * Il modello del terreno dell'import: la cartella di `--dem` e la sua fonte (`--dem-source`, altrimenti il
+ * file SOURCE della cartella, altrimenti «hgt»); (null, null) senza `--dem`. Solo col modello navmaster:
+ * il confronto con ORS non deve mai averlo, e `--dem` con `--speed-model=ors` è un errore.
+ */
+fun demFromArgs(args: List<String>, profiles: List<VehicleProfile>): Pair<File?, String?> {
+    val demDir = opt(args, "dem")?.takeIf { it.isNotBlank() }?.let { File(it) } ?: return null to null
+    require(profiles.all { it.options.speedModel == SpeedModel.NAVMASTER }) { "--dem vale solo col modello navmaster, non con --speed-model=ors" }
+    require(demDir.isDirectory) { "--dem: $demDir non è una cartella" }
+    val source = opt(args, "dem-source")?.takeIf { it.isNotBlank() }
+        ?: File(demDir, "SOURCE").takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.isNotEmpty() } ?: "hgt"
+    return demDir to source
+}
+
 private fun importGraph(args: List<String>) {
     val positional = args.filter { !it.startsWith("--") }
     require(positional.size == 2) { "uso: import <file.osm.pbf> <cartella-grafo>" }
     val pbf = File(positional[0]); val dir = File(positional[1])
     val profiles = profilesFromArgs(args)
-    // il modello del terreno: solo col modello navmaster (il confronto con ORS non deve mai averlo)
-    val demDir = opt(args, "dem")?.takeIf { it.isNotBlank() }?.let { File(it) }
-    if (demDir != null) {
-        require(profiles.all { it.options.speedModel == SpeedModel.NAVMASTER }) { "--dem vale solo col modello navmaster, non con --speed-model=ors" }
-        require(demDir.isDirectory) { "--dem: $demDir non è una cartella" }
-    }
+    val (demDir, demSource) = demFromArgs(args, profiles)
     val dem = demDir?.let { d -> HgtDem(d) }
-    val demSource = opt(args, "dem-source")?.takeIf { it.isNotBlank() }
-        ?: demDir?.let { d -> File(d, "SOURCE").takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.isNotEmpty() } } ?: demDir?.let { "hgt" }
     val importOptions = it.navmaster.engine.osm.ImportOptions(widthFromCarriageway = !args.contains("--no-width-from-carriageway"), tollNodes = !args.contains("--no-toll-nodes"),
         dem = dem, demSource = demSource)
     println("${Engine.NAME}: import di $pbf → $dir, profili ${profiles.map { it.name }}" + if (!importOptions.widthFromCarriageway) " (tag width ignorato)" else "")
@@ -162,7 +169,7 @@ private fun importGraph(args: List<String>) {
     val country = profiles.first().options.country
     println("modello delle velocità: ${model.id}" + (country?.let { ", Paese $it" + if (HgvLegalSpeeds.knows(it)) "" else " (limiti legali di riserva)" } ?: ""))
     if (model == SpeedModel.NAVMASTER && country == null) println("nessun Paese: limiti legali di riserva")
-    if (dem != null) println("terreno: DEM $demDir ($demSource, ${dem.tileCount()} celle .hgt) per le pendenze del camion")
+    if (dem != null && demSource != null) println("terreno: DEM $demDir ($demSource, ${dem.tileCount()} celle .hgt) per le pendenze del camion")
     else if (model == SpeedModel.NAVMASTER) println("terreno: senza DEM (solo le curve del camion)")
     val (rg, stats) = RoutingGraph.build(pbf, dir, profiles, mmap = args.contains("--mmap"), importOptions = importOptions)
     rg.use {
@@ -181,10 +188,16 @@ private fun importGraph(args: List<String>) {
             println("camion, velocità media per classe (km/h, pesata per lunghezza): " + stats.hgvSpeedByClass.entries.joinToString(", ") { "%s %.1f".format(it.key, it.value) })
         if (!stats.hgvSlowSignedShare.isNaN())
             println("camion sotto 30 km/h su primary e secondary con cartello > 50: %.2f %% dei km".format(100 * stats.hgvSlowSignedShare))
+        if (dem != null && !stats.demUsed) println("terreno: il DEM non ha dato nessuna quota alle strade del camion (celle fuori dal riquadro?): grafo senza terrain/dem_source")
         stats.terrain?.let { t ->
             if (t.dem) println("terreno, DEM: %.1f %% dei km del camion coperti (%,.0f km per senso), %d celle aperte".format(100 * t.demCoverage, t.km, dem?.openedTiles ?: 0))
             println("terreno, camion: pendenza %,.0f km frenati, %,.0f min persi; curve %,d, %,.0f min persi; insieme %,.0f min (%,d sensi d'arco cambiati)".format(
                 t.slopeKm, t.slopeLossMin, t.curves, t.curveLossMin, t.lossMin, t.changedEdgeDirections))
+            // in pianura vicino a zero: altrimenti è il rumore del DEM (boschi, paesi) a frenare il camion
+            if (t.dem) println("terreno, camion frenato dalla pendenza (quota dei km per classe): " +
+                t.slopeShareByClass.entries.joinToString(", ") { "%s %.2f %%".format(it.key, 100 * it.value) })
+            println("terreno, curve: %.2f s/km persi in media, %.2f %% dei sensi d'arco cambiati".format(
+                if (t.km > 0) t.curveLossMin * 60 / t.km else 0.0, if (it.graph.edgeCount > 0) 100.0 * t.changedEdgeDirections / (2.0 * it.graph.edgeCount) else 0.0))
         }
         println("bbox: ${it.graph.bounds}")
         println("priorità del peso consigliato: ${it.encoding.priorityModel.id}")

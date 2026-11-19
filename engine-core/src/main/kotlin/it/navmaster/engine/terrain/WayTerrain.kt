@@ -22,15 +22,29 @@ import kotlin.math.sqrt
  * due nodi ([nodeCum] per indice del nodo nella way). La pendenza è nel senso della way (positiva in
  * salita); la way è divisa in celle di circa [CELL_M] m per il profilo di velocità ([TerrainSpeeds]).
  *
- * Pendenza:
- * - way lunghe (≥ [LONG_WAY_M] m, non ponti né gallerie): quote del DEM ogni ~[DEM_STEP_M] m, pendenza di
- *   ogni tratto dalla retta di regressione sulle quote entro ±[FIT_HALF_WINDOW_M] m (finestra di 450 m,
- *   tagliata ai capi della way): un DEM di superficie (Copernicus) ha gradini di 5-20 m ai margini dei
- *   boschi e sui paesi, che una media mobile trasformerebbe in pendenze finte;
- * - way corte, ponti, gallerie, coperture (`bridge`, `tunnel`, `covered`, `man_made=bridge`): una
- *   pendenza sola, dalla quota media del DEM entro [END_RADIUS_M] m dai due nodi estremi (per un ponte
- *   o una galleria il DEM in mezzo è la valle o il monte); sotto [SHORT_BASELINE_M] m di corda la base
- *   si allunga lungo la corda, perché 1-2 m di rumore su 20 m sono già il 5-10 %;
+ * Pendenza. Un DEM di superficie (Copernicus) ha gradini di 5-20 m ai margini dei boschi e sui paesi: una
+ * regressione su 450 m ne fa una pendenza finta del 5 % (gradino di 15 m a metà finestra). Per questo il
+ * profilo delle quote passa prima da un filtro del minimo su ~90 m (±[MIN_FILTER_HALF_M] m: via file
+ * d'alberi, case, capannoni più stretti) e la pendenza è la mediana delle pendenze delle sottocorde di
+ * [LAG_M] m dentro la finestra ([windowSlope]): un gradino ne tocca 4 su 16, la mediana resta zero; una
+ * salita vera le alza tutte.
+ * - way lunghe (≥ [LONG_WAY_M] m, non ponti né gallerie): quote del DEM ogni ~[DEM_STEP_M] m lungo la way,
+ *   pendenza di ogni tratto dalla finestra di ~450 m centrata sul tratto e spostata dentro la way vicino
+ *   ai capi (mai tagliata: una finestra di 200 m non distingue un gradino da una rampa);
+ * - way corte (non ponti né gallerie): una pendenza sola, la più piccola di due stime che devono dare lo
+ *   stesso segno (altrimenti zero): (a) la finestra di 450 m centrata sulla way, prolungata in linea
+ *   retta oltre i capi (un gradino del bosco a cavallo di una way di 150 m resta un gradino in mezzo a
+ *   450 m); (b) i capi della way, ciascuno la mediana del DEM entro [END_RADIUS_M] m (sotto
+ *   [SHORT_BASELINE_M] m di corda la base si allunga lungo la corda, perché 1-2 m di rumore su 20 m sono
+ *   già il 5-10 %). (a) da sola sbaglierebbe sui tornanti (il prolungamento entra nel versante), (b) da
+ *   sola sui gradini: la più piccola delle due non inventa salite;
+ * - ponti, gallerie, coperture (`bridge`, `tunnel`, `covered`, `man_made=bridge`): una pendenza sola dai
+ *   capi, ciascuno la mediana dei campioni FUORI dalla struttura, da [APPROACH_FROM_M] a [APPROACH_TO_M] m
+ *   oltre il capo sul prolungamento della way (per un ponte il DEM in mezzo e intorno ai capi è la valle,
+ *   per una galleria il monte; una spalla sull'orlo di una gola non porta la gola nella media); con la
+ *   stessa regola delle way corte (la più piccola, stesso segno) contro la tendenza dei due accessi fino
+ *   a 255 m oltre i capi (filtro del minimo e mediana delle sottocorde), perché un bosco o un paese
+ *   contro una sola spalla non diventi una salita;
  * - `incline` numerico (`8%`, `-8 %`, `4°`; `up`/`down` non dicono quanto) vale al posto del DEM sulle
  *   way corte e dove il DEM manca;
  * - sotto il [MIN_GRADE] la pendenza è zero (il camion non rallenta e il DEM lì è rumore); poi il tetto
@@ -38,7 +52,9 @@ import kotlin.math.sqrt
  *
  * Curve: la geometria è diradata a punti distanti almeno [THIN_M] m; i vertici consecutivi che girano
  * nello stesso verso (più di [TURN_MIN_DEG]°) fanno una curva sola, col raggio più piccolo dei suoi
- * vertici ((l1 + l2)/2 / Δθ); conta solo se gira più di [CURVE_MIN_DEG]° entro [CURVE_WINDOW_M] m (il
+ * vertici ((l1 + l2)/2 / Δθ); un gomito solo ha il raggio del cerchio tangente ai due lati entro metà del
+ * lato più corto (min(l1, l2)/2 / tan(Δθ/2)): con (l1 + l2)/2 un incrocio fra un lato di 15 m e uno di
+ * 200 m dava un raggio di 70 m, cioè quasi nessuna frenata, solo perché il lato lungo è diritto. Conta solo se gira più di [CURVE_MIN_DEG]° entro [CURVE_WINDOW_M] m (il
  * rumore delle geometrie OSM e le curve larghe, che un camion fa comunque alla sua velocità, no). Un
  * gomito isolato subito annullato dal gomito opposto è uno spostamento laterale (corsie, disegno), non
  * una curva. Le rotatorie hanno già il loro tetto ([it.navmaster.engine.profile.VehicleProfile]).
@@ -70,10 +86,23 @@ class WayTerrain private constructor(
         /** Il passo del profilo di velocità: un tornante di 12 m è lungo ~38 m, e la curva vale per celle intere. */
         const val CELL_M = 5.0
         const val DEM_STEP_M = 25.0
-        const val LONG_WAY_M = 200.0
+        /** Da qui in su la pendenza varia lungo la way: ogni finestra di 450 m sta tutta dentro la way. */
+        const val LONG_WAY_M = 450.0
         const val FIT_HALF_WINDOW_M = 225.0
+        /** Il filtro del minimo sul profilo delle quote: ±45 m (~90 m, due campioni per parte a 25 m). */
+        const val MIN_FILTER_HALF_M = 45.0
+        /** La lunghezza delle sottocorde di cui si prende la pendenza mediana. */
+        const val LAG_M = 100.0
+        /** Le sottocorde valide che servono per una pendenza (meno: il DEM manca). */
+        const val MIN_LAGS = 5
         const val END_RADIUS_M = 50.0
         const val SHORT_BASELINE_M = 60.0
+        /** I campioni dei capi di ponti e gallerie: da 30 a 80 m oltre il capo, ogni 10 m, sul prolungamento. */
+        const val APPROACH_FROM_M = 30.0
+        const val APPROACH_TO_M = 80.0
+        const val APPROACH_STEP_M = 10.0
+        /** La direzione del prolungamento oltre un capo: dagli ultimi ~30 m della way. */
+        const val APPROACH_DIR_M = 30.0
         const val MIN_GRADE = 0.02
         const val THIN_M = 15.0
         const val TURN_MIN_DEG = 4.0
@@ -152,28 +181,64 @@ class WayTerrain private constructor(
                     return x
                 }
                 val structure = isStructure(way)
-                if (structure || length < LONG_WAY_M) {
-                    val g: Double
-                    if (structure) {
-                        val ha = smoothed(dem, vlat[0], vlon[0]); val hb = smoothed(dem, vlat[nv - 1], vlon[nv - 1])
-                        g = (hb - ha) / length
-                    } else {
-                        // la corda; sotto SHORT_BASELINE_M allungata intorno al suo centro, poi riportata lungo la way
-                        val dx = vx[nv - 1] - vx[0]; val dy = vy[nv - 1] - vy[0]
-                        val chord = hypot(dx, dy)
-                        g = if (chord < 1.0) Double.NaN else if (chord >= SHORT_BASELINE_M) {
-                            (smoothed(dem, vlat[nv - 1], vlon[nv - 1]) - smoothed(dem, vlat[0], vlon[0])) / length
-                        } else {
-                            val mx = (vx[0] + vx[nv - 1]) / 2; val my = (vy[0] + vy[nv - 1]) / 2
-                            val ux = dx / chord * SHORT_BASELINE_M / 2; val uy = dy / chord * SHORT_BASELINE_M / 2
-                            fun latOf(y: Double) = lat0 + y / DistanceCalc.METERS_PER_DEGREE
-                            fun lonOf(x: Double) = lon0 + x / kx
-                            val ha = smoothed(dem, latOf(my - uy), lonOf(mx - ux)); val hb = smoothed(dem, latOf(my + uy), lonOf(mx + ux))
-                            (hb - ha) / SHORT_BASELINE_M * (chord / length)
+                val ends = Ends(pts, vlat, vlon, nv, length)
+                if (structure) {
+                    // i capi fuori dalla struttura, sul prolungamento della way (mediana, non media): la quota
+                    // mediana sta a ~55 m oltre ogni capo, e la pendenza è su quella distanza
+                    val mid = (APPROACH_FROM_M + APPROACH_TO_M) / 2
+                    val gEnds = (ends.approach(dem, false) - ends.approach(dem, true)) / (length + 2 * mid)
+                    // la tendenza dei due accessi, da 30 m a 255 m oltre ogni capo (la struttura e i 30 m vicini
+                    // esclusi): un bosco o un paese contro una sola spalla sposta gEnds, non la tendenza
+                    val side = FIT_HALF_WINDOW_M
+                    val m = ceil((length + 2 * (APPROACH_FROM_M + side)) / DEM_STEP_M).toInt()
+                    val step = (length + 2 * (APPROACH_FROM_M + side)) / m
+                    val h = DoubleArray(m + 1) { k ->
+                        val t = -(APPROACH_FROM_M + side) + k * step
+                        when {
+                            t <= -APPROACH_FROM_M -> if (ends.at(true, -t)) dem.ele(ends.lat, ends.lon) else Double.NaN
+                            t >= length + APPROACH_FROM_M -> if (ends.at(false, t - length)) dem.ele(ends.lat, ends.lon) else Double.NaN
+                            else -> Double.NaN
                         }
                     }
+                    val gTrend = windowSlope(minFilter(h, Math.round(MIN_FILTER_HALF_M / step).toInt()), 0, m, max(1, Math.round(LAG_M / step).toInt()), step, DoubleArray(m + 1))
+                    val g = agree(gEnds, gTrend)
                     coverage = if (g.isNaN()) 0.0 else 1.0
                     val gg = finish(g, mayUseIncline = length < LONG_WAY_M)
+                    if (gg != 0.0) grade = DoubleArray(cells) { gg }
+                } else if (length < LONG_WAY_M) {
+                    // (b) i capi: la corda; sotto SHORT_BASELINE_M allungata intorno al suo centro, poi riportata lungo la way
+                    val dx = vx[nv - 1] - vx[0]; val dy = vy[nv - 1] - vy[0]
+                    val chord = hypot(dx, dy)
+                    val gEnds = if (chord < 1.0) Double.NaN else if (chord >= SHORT_BASELINE_M) {
+                        (ground(dem, vlat[nv - 1], vlon[nv - 1]) - ground(dem, vlat[0], vlon[0])) / length
+                    } else {
+                        val mx = (vx[0] + vx[nv - 1]) / 2; val my = (vy[0] + vy[nv - 1]) / 2
+                        val ux = dx / chord * SHORT_BASELINE_M / 2; val uy = dy / chord * SHORT_BASELINE_M / 2
+                        fun latOf(y: Double) = lat0 + y / DistanceCalc.METERS_PER_DEGREE
+                        fun lonOf(x: Double) = lon0 + x / kx
+                        val ha = ground(dem, latOf(my - uy), lonOf(mx - ux)); val hb = ground(dem, latOf(my + uy), lonOf(mx + ux))
+                        (hb - ha) / SHORT_BASELINE_M * (chord / length)
+                    }
+                    // (a) la finestra di 450 m centrata sulla way, prolungata in linea retta oltre i capi
+                    val window = 2 * FIT_HALF_WINDOW_M
+                    val e = (window - length) / 2
+                    val m = ceil(window / DEM_STEP_M).toInt()
+                    val step = window / m
+                    val h = DoubleArray(m + 1)
+                    pts.reset()
+                    for (k in 0..m) {
+                        val t = -e + k * step
+                        h[k] = when {
+                            t < 0 -> if (ends.at(true, -t)) dem.ele(ends.lat, ends.lon) else Double.NaN
+                            t > length -> if (ends.at(false, t - length)) dem.ele(ends.lat, ends.lon) else Double.NaN
+                            else -> { pts.at(t); dem.ele(pts.lat, pts.lon) }
+                        }
+                    }
+                    val hm = minFilter(h, Math.round(MIN_FILTER_HALF_M / step).toInt())
+                    val gWindow = windowSlope(hm, 0, m, max(1, Math.round(LAG_M / step).toInt()), step, DoubleArray(m + 1))
+                    val g = agree(gEnds, gWindow)
+                    coverage = if (g.isNaN()) 0.0 else 1.0
+                    val gg = finish(g, mayUseIncline = true)
                     if (gg != 0.0) grade = DoubleArray(cells) { gg }
                 } else {
                     val m = max(1, ceil(length / DEM_STEP_M).toInt())
@@ -187,28 +252,18 @@ class WayTerrain private constructor(
                         if (!h[j].isNaN()) valid++
                     }
                     coverage = valid.toDouble() / (m + 1)
+                    val hm = minFilter(h, Math.round(MIN_FILTER_HALF_M / step).toInt())
+                    val lag = max(1, Math.round(LAG_M / step).toInt())
+                    val half = Math.round(FIT_HALF_WINDOW_M / step).toInt()
+                    val buf = DoubleArray(m + 1)
                     val g = DoubleArray(m)
                     var any = false
-                    val half = (FIT_HALF_WINDOW_M / step).toInt()
                     for (j in 0 until m) {
-                        // regressione sulle quote dei campioni entro la finestra centrata sul tratto j
-                        val c = (j + 0.5) * step
-                        var n = 0; var st = 0.0; var sh = 0.0
-                        val lo = max(0, j - half - 1); val hi = min(m, j + half + 2)
-                        for (k in lo..hi) { if (h[k].isNaN() || abs(k * step - c) > FIT_HALF_WINDOW_M + 1e-6) continue; n++; st += k * step - c; sh += h[k] }
-                        var slope = Double.NaN
-                        if (n >= 3) {
-                            val mt = st / n; val mh = sh / n
-                            var num = 0.0; var den = 0.0; var tMin = Double.POSITIVE_INFINITY; var tMax = Double.NEGATIVE_INFINITY
-                            for (k in lo..hi) {
-                                if (h[k].isNaN() || abs(k * step - c) > FIT_HALF_WINDOW_M + 1e-6) continue
-                                val t = k * step - c
-                                num += (t - mt) * (h[k] - mh); den += (t - mt) * (t - mt)
-                                if (t < tMin) tMin = t; if (t > tMax) tMax = t
-                            }
-                            if (den > 0 && tMax - tMin >= 100.0) slope = num / den
-                        }
-                        g[j] = finish(slope, mayUseIncline = false)
+                        // la finestra centrata sul tratto j (campioni j - half .. j + 1 + half), spostata dentro la way ai capi
+                        var lo = j - half; var hi = j + 1 + half
+                        if (lo < 0) { hi -= lo; lo = 0 }
+                        if (hi > m) { lo = max(0, lo - (hi - m)); hi = m }
+                        g[j] = finish(windowSlope(hm, lo, hi, lag, step, buf), mayUseIncline = false)
                         if (g[j] != 0.0) any = true
                     }
                     if (any) grade = DoubleArray(cells) { c -> g[min(m - 1, floor((c + 0.5) * cellLen / step).toInt())] }
@@ -227,18 +282,64 @@ class WayTerrain private constructor(
 
         private val EMPTY = DoubleArray(0)
 
-        /** La quota media del DEM entro [END_RADIUS_M] m da un punto (centro, 8 punti a metà raggio, 8 sul bordo); NaN se nessuno. */
-        fun smoothed(dem: ElevationSource, lat: Double, lon: Double): Double {
+        /**
+         * La quota del terreno vicino a un punto: la mediana del DEM entro [END_RADIUS_M] m (centro, 8 punti a
+         * metà raggio, 8 sul bordo); NaN se nessuno. La mediana, non la media: un bosco o un argine su metà
+         * del cerchio non sposta la quota.
+         */
+        fun ground(dem: ElevationSource, lat: Double, lon: Double): Double {
             val kLat = 1 / DistanceCalc.METERS_PER_DEGREE
             val kLon = 1 / (DistanceCalc.METERS_PER_DEGREE * cos(Math.toRadians(lat)))
-            var sum = 0.0; var n = 0
-            fun add(v: Double) { if (!v.isNaN()) { sum += v; n++ } }
+            val v = DoubleArray(17); var n = 0
+            fun add(x: Double) { if (!x.isNaN()) v[n++] = x }
             add(dem.ele(lat, lon))
             for (r in doubleArrayOf(END_RADIUS_M / 2, END_RADIUS_M)) for (k in 0 until 8) {
                 val a = k * PI / 4
                 add(dem.ele(lat + r * cos(a) * kLat, lon + r * sin(a) * kLon))
             }
-            return if (n == 0) Double.NaN else sum / n
+            return median(v, n)
+        }
+
+        /** Due stime della stessa pendenza: la più piccola se hanno lo stesso segno, zero se no (una sola se l'altra manca). */
+        private fun agree(a: Double, b: Double): Double = when {
+            a.isNaN() -> b
+            b.isNaN() -> a
+            a * b <= 0 -> 0.0
+            abs(a) < abs(b) -> a
+            else -> b
+        }
+
+        /** La mediana dei primi [n] valori di [v] (riordinati); NaN se n = 0. */
+        private fun median(v: DoubleArray, n: Int): Double {
+            if (n == 0) return Double.NaN
+            java.util.Arrays.sort(v, 0, n)
+            return if (n % 2 == 1) v[n / 2] else (v[n / 2 - 1] + v[n / 2]) / 2
+        }
+
+        /** Il minimo delle quote entro ±[r] campioni (i NaN non contano; NaN se tutti NaN). */
+        internal fun minFilter(h: DoubleArray, r: Int): DoubleArray {
+            if (r <= 0) return h
+            val n = h.size
+            return DoubleArray(n) { k ->
+                var best = Double.NaN
+                for (j in max(0, k - r)..min(n - 1, k + r)) { val x = h[j]; if (!x.isNaN() && (best.isNaN() || x < best)) best = x }
+                best
+            }
+        }
+
+        /**
+         * La pendenza della finestra di campioni [lo]..[hi] (passo [step] m): la mediana delle pendenze delle
+         * sottocorde di [lag] campioni con i due capi nella finestra e validi; NaN se meno di [MIN_LAGS].
+         * [buf]: almeno hi - lo + 1 posti.
+         */
+        internal fun windowSlope(hm: DoubleArray, lo: Int, hi: Int, lag: Int, step: Double, buf: DoubleArray): Double {
+            var n = 0
+            for (k in lo..hi - lag) {
+                val a = hm[k]; val b = hm[k + lag]
+                if (a.isNaN() || b.isNaN()) continue
+                buf[n++] = (b - a) / (lag * step)
+            }
+            return if (n < MIN_LAGS) Double.NaN else median(buf, n)
         }
 
         /** Le curve della geometria (vedi la classe): [inizi, fini, raggi], o null se nessuna. */
@@ -298,6 +399,8 @@ class WayTerrain private constructor(
                 var r = Double.POSITIVE_INFINITY
                 var theta = 0.0
                 for (i in a..b) { if (radius[i] < r) r = radius[i]; theta += turn[i] }
+                // un gomito solo: il cerchio tangente ai due lati entro metà del lato più corto
+                if (a == b) r = min(lIn[a], lOut[a]) / 2 / kotlin.math.tan(abs(turn[a]) / 2)
                 // l'arco: dal primo all'ultimo vertice più mezza corda per parte (al più CURVE_EDGE_M), ma non
                 // più lungo di un arco di quel raggio che gira quanto la curva (un tornante di 12 m è lungo ~38 m)
                 val f0 = vs[keep[a]] - min(CURVE_EDGE_M, lIn[a] / 2); val t0 = vs[keep[b]] + min(CURVE_EDGE_M, lOut[b] / 2)
@@ -312,12 +415,65 @@ class WayTerrain private constructor(
         }
     }
 
-    /** Un punto che scorre lungo la polilinea dei punti validi, a distanze crescenti. */
+    /**
+     * Il prolungamento della way in linea retta oltre i suoi capi, nella direzione degli ultimi
+     * [APPROACH_DIR_M] m (o di tutta la way, se più corta): per i capi di ponti e gallerie e per la
+     * finestra delle way corte. [at] mette il punto in [lat]/[lon] (falso se la direzione non si sa).
+     */
+    private class Ends(pts: Polyline, vlat: DoubleArray, vlon: DoubleArray, nv: Int, length: Double) {
+        private val sLat = vlat[0]; private val sLon = vlon[0]
+        private val eLat = vlat[nv - 1]; private val eLon = vlon[nv - 1]
+        /** Gradi per metro verso l'esterno, all'inizio e alla fine; NaN se la direzione non si sa. */
+        private val sdLat: Double; private val sdLon: Double; private val edLat: Double; private val edLon: Double
+        var lat = 0.0; var lon = 0.0
+
+        init {
+            val d = min(APPROACH_DIR_M, length)
+            pts.reset(); pts.at(d)
+            val s = outward(sLat, sLon, pts.lat, pts.lon)
+            pts.at(length - d)
+            val e = outward(eLat, eLon, pts.lat, pts.lon)
+            sdLat = s[0]; sdLon = s[1]; edLat = e[0]; edLon = e[1]
+        }
+
+        /** La direzione da (lat, lon) verso l'esterno, via da (iLat, iLon), in gradi per metro. */
+        private fun outward(lat: Double, lon: Double, iLat: Double, iLon: Double): DoubleArray {
+            val k = cos(Math.toRadians(lat)) * DistanceCalc.METERS_PER_DEGREE
+            val dy = (lat - iLat) * DistanceCalc.METERS_PER_DEGREE; val dx = (lon - iLon) * k
+            val norm = hypot(dx, dy)
+            if (norm < 0.5) return doubleArrayOf(Double.NaN, Double.NaN)
+            return doubleArrayOf(dy / norm / DistanceCalc.METERS_PER_DEGREE, dx / norm / k)
+        }
+
+        /** Il punto a [d] m oltre il capo d'inizio ([start]) o di fine. */
+        fun at(start: Boolean, d: Double): Boolean {
+            val dl = if (start) sdLat else edLat
+            if (dl.isNaN()) return false
+            lat = (if (start) sLat else eLat) + dl * d
+            lon = (if (start) sLon else eLon) + (if (start) sdLon else edLon) * d
+            return true
+        }
+
+        /** La quota di un capo dai campioni fuori dalla struttura ([APPROACH_FROM_M]..[APPROACH_TO_M] m oltre), mediana; NaN se nessuno. */
+        fun approach(dem: ElevationSource, start: Boolean): Double {
+            val count = ((APPROACH_TO_M - APPROACH_FROM_M) / APPROACH_STEP_M).toInt() + 1
+            val v = DoubleArray(count); var n = 0
+            for (k in 0 until count) {
+                if (!at(start, APPROACH_FROM_M + k * APPROACH_STEP_M)) break
+                val x = dem.ele(lat, lon)
+                if (!x.isNaN()) v[n++] = x
+            }
+            return median(v, n)
+        }
+    }
+
+    /** Un punto che scorre lungo la polilinea dei punti validi (a distanze crescenti; tornando indietro riparte dal primo tratto). */
     private class Polyline(val lats: DoubleArray, val lons: DoubleArray, val cum: DoubleArray, val n: Int) {
         var lat = 0.0; var lon = 0.0
         private var i = 0
         fun reset() { i = 0 }
         fun at(s: Double) {
+            if (s < cum[i]) i = 0
             while (i < n - 2 && cum[i + 1] < s) i++
             val seg = cum[i + 1] - cum[i]
             val f = if (seg <= 0) 0.0 else ((s - cum[i]) / seg).coerceIn(0.0, 1.0)
@@ -329,10 +485,12 @@ class WayTerrain private constructor(
 
 /**
  * Il profilo di velocità di una way per un mezzo ([ClimbModel]) e una velocità di base, nei due sensi:
- * in ogni cella il tetto è min(base, tetto della pendenza nel senso di marcia, tetto della curva); una
- * passata in avanti limita le ripartenze all'accelerazione possibile (0,5 m/s², meno se la potenza non
- * basta in salita), una all'indietro le frenate a [ClimbModel.decel]. Il tempo si integra cella per
- * cella (moto uniformemente accelerato). Ai capi della way il mezzo entra ed esce al tetto locale: le
+ * i tetti «duri» di ogni cella sono la base, il tetto della discesa (i freni) e quello della curva, e
+ * una passata all'indietro ci arriva frenando a [ClimbModel.decel]; la salita invece non è un tetto da
+ * raggiungere frenando: nella passata in avanti la velocità cambia secondo la potenza (ripartenze a
+ * 0,5 m/s² al più, meno in salita; sopra la velocità sostenibile della salita il camion rallenta da sé,
+ * col solo deficit di potenza, finché non ci arriva). Il tempo si integra cella per cella (moto
+ * uniformemente accelerato). Ai capi della way il mezzo entra ed esce al tetto locale: le
  * fermate agli incroci le paga [it.navmaster.engine.profile.NodeDelays].
  *
  * [slope] e [curves] false escludono la pendenza o le curve (le statistiche dell'import separano i due effetti).
@@ -366,7 +524,8 @@ class TerrainSpeeds(private val t: WayTerrain, private val climb: ClimbModel, va
     }
 
     private fun run(forward: Boolean, base: Double, grade: DoubleArray?, curveCap: DoubleArray, out: DoubleArray, slow: DoubleArray): Boolean {
-        val cap = DoubleArray(n); val gr = DoubleArray(n)
+        // hard: base, discesa, curva (si frena per arrivarci); up: la velocità sostenibile in salita (infinita altrove)
+        val hard = DoubleArray(n); val up = DoubleArray(n); val gr = DoubleArray(n)
         var any = false
         for (i in 0 until n) {
             val c = if (forward) i else n - 1 - i
@@ -374,10 +533,11 @@ class TerrainSpeeds(private val t: WayTerrain, private val climb: ClimbModel, va
             gr[i] = gg
             val sc = if (gg == 0.0) Double.POSITIVE_INFINITY else climb.slopeKmh(gg) / 3.6
             var v = base
-            if (sc < v) v = sc
+            if (gg < 0 && sc < v) v = sc
             if (curveCap[c] < v) v = curveCap[c]
-            cap[i] = v
-            if (v < base) any = true
+            hard[i] = v
+            up[i] = if (gg > 0) sc else Double.POSITIVE_INFINITY
+            if (min(v, up[i]) < base) any = true
             // celle frenate dalla pendenza, contate per posizione lungo la way
             slow[c + 1] = if (sc < base) h else 0.0
         }
@@ -386,19 +546,26 @@ class TerrainSpeeds(private val t: WayTerrain, private val climb: ClimbModel, va
             for (k in 0..n) out[k] = (if (forward) k else n - k) * h / base
             return false
         }
-        // tetti ai nodi della griglia: il più basso delle due celle vicine
+        // tetti duri ai nodi della griglia (il più basso delle due celle vicine), poi la frenata all'indietro
         val v = DoubleArray(n + 1)
-        v[0] = cap[0]; v[n] = cap[n - 1]
-        for (k in 1 until n) v[k] = min(cap[k - 1], cap[k])
-        // in avanti: accelerazione limitata; all'indietro: frenata limitata
-        for (k in 0 until n) {
-            val a = climb.acceleration(v[k], gr[k])
-            val reach = sqrt(v[k] * v[k] + 2 * a * h)
-            if (reach < v[k + 1]) v[k + 1] = reach
-        }
+        v[0] = hard[0]; v[n] = hard[n - 1]
+        for (k in 1 until n) v[k] = min(hard[k - 1], hard[k])
         for (k in n - 1 downTo 0) {
             val reach = sqrt(v[k + 1] * v[k + 1] + 2 * climb.decel * h)
             if (reach < v[k]) v[k] = reach
+        }
+        // in avanti: si entra alla velocità sostenibile della prima cella; poi la potenza decide
+        if (up[0] < v[0]) v[0] = up[0]
+        for (k in 0 until n) {
+            val vk = v[k]
+            val next = if (vk > up[k]) {
+                // sopra la velocità sostenibile della salita: rallenta col deficit di potenza, non sotto quella velocità
+                val a = climb.powerAcceleration(vk, gr[k])
+                max(up[k], sqrt(max(0.0, vk * vk + 2 * a * h)))
+            } else {
+                min(up[k], sqrt(vk * vk + 2 * climb.acceleration(vk, gr[k]) * h))
+            }
+            if (next < v[k + 1]) v[k + 1] = next
         }
         val tt = DoubleArray(n + 1)
         for (k in 0 until n) tt[k + 1] = tt[k] + 2 * h / (v[k] + v[k + 1])

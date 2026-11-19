@@ -1,6 +1,10 @@
 package it.navmaster.engine.osm
 
+import it.navmaster.engine.RoutingGraph
 import it.navmaster.engine.profile.CarProfile
+import it.navmaster.engine.profile.NodeDelays
+import it.navmaster.engine.storage.GraphProperties
+import java.io.File
 import it.navmaster.engine.profile.ClimbModel
 import it.navmaster.engine.profile.HgvProfile
 import it.navmaster.engine.profile.SpeedModel
@@ -10,6 +14,8 @@ import it.navmaster.engine.storage.BaseGraph
 import it.navmaster.engine.storage.GraphDirectory
 import it.navmaster.engine.storage.GraphEncoding
 import it.navmaster.engine.terrain.ElevationSource
+import it.navmaster.engine.terrain.TerrainSpeeds
+import it.navmaster.engine.terrain.WayTerrain
 import it.navmaster.engine.util.DistanceCalc
 import it.navmaster.engine.weighting.FastestWeighting
 import java.nio.file.Files
@@ -280,5 +286,131 @@ class TerrainImportTest {
         val withDem = carAndTruck(ImportOptions(dem = dem))
         assertEquals(plain.first, withDem.first, "auto")
         assertTrue(plain.second != withDem.second, "camion")
+    }
+
+    /** Un piano del [grade] verso nord con un gradino di [step] m (il margine di un bosco nel DEM di superficie) da [atM] m in su. */
+    private fun forestStep(grade: Double, step: Double, atM: Double) = ElevationSource { lat, _ ->
+        val y = (lat - lat0) * DistanceCalc.METERS_PER_DEGREE
+        500 + y * grade + if (y >= atM) step else 0.0
+    }
+
+    @Test
+    fun `a flat road crossing a 15 m forest step in the DEM gets no slope slowdown`() {
+        val dem = forestStep(0.0, 15.0, 1000.0)
+        // una way di 2 km (pendenza per tratto), 13 way da 150 m e 7 da 300 m (una pendenza per way) a cavallo del gradino
+        for ((count, parts) in listOf(40 to 1, 39 to 13, 42 to 7)) {
+            imported(navProfiles(), northRoad(count, 50.0, parts, primary), ImportOptions(dem = dem)) { g, enc, stats ->
+                val s = speeds(g, enc)
+                println("gradino del bosco, $parts way: $s; ${stats.terrain}")
+                assertTrue(s.all { it == 65.0 to 65.0 }, "$parts way: il gradino frena il camion: $s")
+                val t = assertNotNull(stats.terrain)
+                assertEquals(0.0, t.slopeKm, 1e-9, "$parts way: km frenati dalla pendenza")
+                assertEquals(0.0, t.slopeShareByClass.getValue("primary"), 1e-9)
+            }
+        }
+        // una fascia di bosco di 200 m (sale e scende di 15 m) e una fila d'alberi di 60 m: nemmeno
+        val strip = ElevationSource { lat, _ -> val y = (lat - lat0) * DistanceCalc.METERS_PER_DEGREE; 500 + (if (y in 800.0..1000.0) 15.0 else 0.0) + (if (y in 1400.0..1460.0) 12.0 else 0.0) }
+        imported(navProfiles(), northRoad(40, 50.0, 1, primary), ImportOptions(dem = strip)) { g, enc, stats ->
+            assertEquals(listOf(65.0 to 65.0), speeds(g, enc)); assertEquals(0.0, stats.terrain!!.slopeKm, 1e-9)
+        }
+        // una salita vera del 6 % resta tale anche col gradino del bosco sopra
+        imported(navProfiles(), northRoad(40, 50.0, 1, primary), ImportOptions(dem = forestStep(0.06, 15.0, 1000.0))) { g, enc, _ ->
+            assertEquals(listOf(40.0 to 50.0), speeds(g, enc), "6 % col gradino: 40 in salita, 50 in discesa")
+        }
+    }
+
+    @Test
+    fun `a flat bridge with one abutment at the edge of a gorge keeps a grade near zero`() {
+        // una gola profonda 100 m da 2 a 200 m; il ponte (300 m) parte sull'orlo e finisce sul piano
+        val gorge = ElevationSource { lat, _ -> val y = (lat - lat0) * DistanceCalc.METERS_PER_DEGREE; if (y > 2 && y < 200) 400.0 else 500.0 }
+        val bridge = northRoad(6, 50.0, 1, primary + ("bridge" to "yes") + ("layer" to "1"))
+        imported(navProfiles(), bridge, ImportOptions(dem = gorge)) { g, enc, stats ->
+            assertEquals(listOf(65.0 to 65.0), speeds(g, enc), "ponte piano sull'orlo della gola")
+            assertEquals(0.0, stats.terrain!!.slopeKm, 1e-9)
+        }
+        // i capi dal DEM fuori dal ponte: un ponte che sale davvero del 4 % (strada in salita prima e dopo) sale
+        imported(navProfiles(), bridge, ImportOptions(dem = ElevationSource { lat, _ -> val y = (lat - lat0) * DistanceCalc.METERS_PER_DEGREE; 500 + 0.04 * y - (if (y > 2 && y < 200) 100.0 else 0.0) })) { g, enc, _ ->
+            val (fwd, bwd) = speeds(g, enc).single()
+            assertTrue(fwd < 65.0 && bwd == 65.0, "ponte al 4 %: $fwd / $bwd")
+        }
+    }
+
+    @Test
+    fun `interior signal on a 6 percent way - each direction pays the delay at its own speed`() {
+        val nodes = (0..20).map { node(100L + it, 0.0, it * 100.0, if (it == 10) mapOf("highway" to "traffic_signals") else null) }
+        val road = MemoryOsm(nodes, listOf(OsmWay(1000, primary, LongArray(21) { 100L + it })))
+        imported(navProfiles(), road, ImportOptions(dem = plane(0.06))) { g, enc, _ ->
+            val hgv = enc.profile("heavyvehicle")
+            val p = navProfiles()[1]
+            assertEquals(1, g.edgeCount)
+            val f = g.getFlags(0)
+            val vf = hgv.speed.get(f, false); val vb = hgv.speed.get(f, true)
+            assertEquals(40.0 to 50.0, vf to vb)
+            val df = hgv.delay!!.get(f, false); val db = hgv.delay!!.get(f, true)
+            val ef = NodeDelays.seconds(NodeDelays.Control.SIGNALS, vf, p.acceleration, p.deceleration)
+            val eb = NodeDelays.seconds(NodeDelays.Control.SIGNALS, vb, p.acceleration, p.deceleration)
+            println("semaforo al 6 %: in salita $df s (atteso ${"%.1f".format(ef)}), in discesa $db s (atteso ${"%.1f".format(eb)})")
+            assertEquals(ef, df, 1.0, "in salita, alla velocità della salita")
+            assertEquals(eb, db, 1.0, "in discesa, alla velocità della discesa")
+            assertTrue(db > df, "in discesa si arriva più veloci: si perde di più ($df / $db)")
+        }
+    }
+
+    @Test
+    fun `terrain keys in the graph only when the DEM was used by a profile`() {
+        val pbf = File("../data/heidelberg.test.pbf")
+        // un piano che sale del 5 % verso nord intorno a Heidelberg
+        val slope = ElevationSource { lat, _ -> 100 + (lat - 49.4) * DistanceCalc.METERS_PER_DEGREE * 0.05 }
+        val none = ElevationSource { _, _ -> Double.NaN }
+        val nav = { listOf(CarProfile(VehicleProfileOptions(useAcceleration = false, blockFords = false, speedModel = SpeedModel.NAVMASTER, country = "DE")),
+            HgvProfile(VehicleProfileOptions(maximumGradeLevel = 1, useAcceleration = false, blockFords = false, speedModel = SpeedModel.NAVMASTER, country = "DE"))) }
+        fun keys(profiles: List<VehicleProfile>, options: ImportOptions): Triple<Boolean, String?, String?> {
+            val dir = Files.createTempDirectory("nme-terrain-keys").toFile().also { it.deleteOnExit() }
+            val used = RoutingGraph.build(pbf, dir, profiles, importOptions = options).let { (rg, stats) -> rg.close(); stats.demUsed }
+            val props = GraphProperties(File(dir, "profiles")).also { assertTrue(it.load()) }
+            RoutingGraph.load(dir).use { rg ->
+                assertEquals(props.get("terrain")?.takeIf { it.isNotBlank() }, rg.terrain)
+                assertEquals(props.get("dem_source")?.takeIf { it.isNotBlank() }, rg.demSource)
+                return Triple(used, rg.terrain, rg.demSource)
+            }
+        }
+        assertEquals(Triple(true, "dem", "prova-dem"), keys(nav(), ImportOptions(dem = slope, demSource = "prova-dem")), "DEM usato dal camion")
+        assertEquals(Triple(true, "dem", "hgt"), keys(nav(), ImportOptions(dem = slope)), "senza fonte: hgt")
+        assertEquals(Triple(false, null, null), keys(nav(), ImportOptions(dem = none, demSource = "prova-dem")), "DEM senza quote nel riquadro")
+        assertEquals(Triple(false, null, null), keys(orsProfiles(), ImportOptions(dem = slope, demSource = "prova-dem")), "grafo ORS: il DEM non serve a nessun profilo")
+        assertEquals(Triple(false, null, null), keys(nav(), ImportOptions()), "senza DEM")
+    }
+
+    @Test
+    fun `no braking before a climb - the speed bleeds into it, while curves and descents are braked for`() {
+        // 1 km in piano, poi 1 km al 6 % (una way sola verso nord)
+        val dem = ElevationSource { lat, _ -> val y = (lat - lat0) * DistanceCalc.METERS_PER_DEGREE; 500 + 0.06 * maxOf(0.0, y - 1000) }
+        val nodes = (0..40).map { node(100L + it, 0.0, it * 50.0) }
+        val way = OsmWay(1000, primary, LongArray(41) { 100L + it })
+        val t = WayTerrain.analyse(way, DoubleArray(41) { nodes[it].lat }, DoubleArray(41) { nodes[it].lon }, 41, dem)
+        val g = assertNotNull(t.grade)
+        val s0 = g.indexOfFirst { it > 0 } * t.cellLen
+        assertTrue(s0 in 850.0..1150.0, "la salita comincia a $s0 m")
+        val climb = ClimbModel.HGV
+        val sp = TerrainSpeeds(t, climb, 65.0)
+        val base = 65 / 3.6
+        val up = climb.uphillKmh(0.06) / 3.6
+        // in salita (avanti): nessuna frenata nei 150 m prima; nei primi 100 m della salita più svelto della velocità sostenibile
+        assertEquals(150 / base, sp.seconds(s0 - 150, s0, true), 0.05, "frenata prima della salita")
+        val first = sp.seconds(s0, s0 + 100, true)
+        println("salita del 6 % dopo il piano: primi 100 m in ${"%.1f".format(first)} s (a velocità sostenibile ${"%.1f".format(100 / up)} s)")
+        assertTrue(first < 100 / up - 1, "la velocità cala da sé nella salita: $first s")
+        // in fondo alla salita il camion va alla velocità sostenibile
+        assertEquals(100 / up, sp.seconds(t.length - 100, t.length, true), 0.5)
+        // in discesa (indietro): il tetto della discesa è duro; arrivati al piano si riparte verso la base
+        val down = climb.downhillKmh(0.06) / 3.6
+        assertEquals(100 / down, sp.seconds(t.length - 300, t.length - 200, false), 0.05, "in discesa al tetto dei freni")
+        // senza pendenza, una curva stretta a metà: si frena prima (la frenata resta per le curve)
+        val bend = (0..40).map { k -> if (k <= 20) node(500L + k, 0.0, k * 50.0) else node(500L + k, (k - 20) * 50.0, 1000.0) }
+        val tb = WayTerrain.analyse(OsmWay(2000, primary, LongArray(41) { 500L + it }), DoubleArray(41) { bend[it].lat }, DoubleArray(41) { bend[it].lon }, 41, null)
+        assertEquals(1, tb.curves)
+        val sb = TerrainSpeeds(tb, climb, 65.0)
+        val c0 = tb.curveFrom[0]
+        assertTrue(sb.seconds(c0 - 50, c0, true) > 50 / base + 0.5, "nessuna frenata prima della curva")
     }
 }
