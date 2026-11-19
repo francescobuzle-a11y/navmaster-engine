@@ -1979,7 +1979,15 @@ class CrossBorderDirections(
             if (path.size == 2) return true
             // con [onePerPlace] il punto più leggero di ogni luogo
             val sorted = next.sortedBy { it.second }.let { s -> if (onePerPlace) s.distinctBy { placeOf[it.first] } else s }
-            layer = sorted.take(if (k == path.size - 1) sorted.size else layerSize)
+            // gli strati più leggeri e in più il passaggio più leggero di ogni luogo: col solo peso fin qui più punti
+            // dello stesso valico riempivano lo strato, e un valico più lontano ma migliore dopo restava fuori
+            // (Canneto → Bielsko-Biała: Tarvisio, 66 min più rapido, scartato al confine italia/austria per i punti
+            // del Brennero e della Pusteria). Lo strato seguente è una ricerca sola da tutti: i luoghi in più costano poco
+            layer = if (k == path.size - 1) sorted else {
+                val top = sorted.take(layerSize)
+                val inTop = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Transfer, Boolean>()).apply { top.forEach { add(it.first) } }
+                (top + sorted.distinctBy { placeOf[it.first] }.filter { it.first !in inTop }).sortedBy { it.second }
+            }
             log?.invoke("    pesi ${from.id}/${to.id}: ${layer.joinToString { "%.0f".format(it.second) }}")
             if (layer.isEmpty()) return true
         }
