@@ -16,7 +16,7 @@ import kotlin.test.assertTrue
  * Controlla:
  * 1. la statale 52 fra Mikulov e Pohořelice: camion ≥ 60 km/h dove il cartello è 90 (auto ≥ 80), ≥ 55 dove è 70;
  * 2. Wien → Brno del camion per il valico di Mikulov (A5 → 52 → D52), senza L3050 né 422;
- * 3. durata Wien → Brno del camion fra 105 e 135 minuti;
+ * 3. durata Wien → Brno del camion fra 105 e 145 minuti (con pendenze e curve del terreno circa 137);
  * e stampa (righe «velocità») i tempi di una decina di viaggi nei due Paesi coi due modelli.
  */
 class SpeedModelRealTest {
@@ -126,7 +126,7 @@ class SpeedModelRealTest {
                     if ("52" !in t || "D52" !in t) problems += "Wien → Brno: mancano la 52 o la D52 (${t.filter { it.length <= 6 }})"
                     if ("L3050" in t || "422" in t) problems += "Wien → Brno: passa per L3050 o 422"
                     val min = best.millis / 60000.0
-                    if (min < 105 || min > 135) problems += "Wien → Brno: %.1f min, atteso fra 105 e 135".format(min)
+                    if (min < 105 || min > 145) problems += "Wien → Brno: %.1f min, atteso fra 105 e 145".format(min)
                 }
             }
             for (p in problems) println("velocità: PROBLEMA $p")
