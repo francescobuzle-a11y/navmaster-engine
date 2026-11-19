@@ -802,8 +802,22 @@ class CrossBorderDirections(
         if (byModel.size < 2) null else byModel.entries.joinToString("; ") { (m, gs) -> "${m.id}: ${gs.joinToString(", ") { it.id }}" }
     }
 
+    /**
+     * I grafi coi divieti di transito dei mezzi pesanti ([it.navmaster.engine.profile.HgvTransit], grafi
+     * NAVMASTER da novembre 2026) accanto a grafi senza, null se tutti uguali: nei Paesi coi grafi di prima
+     * il camion attraversa i tratti solo destinazione senza il ×10, e la scelta dei valichi pende verso di
+     * loro. Come [mixedPriority]: si dice, e l'app fa aggiornare i Paesi insieme.
+     */
+    val mixedTransit: String? by lazy {
+        val byTransit = graphs.groupBy { it.graph.encoding.shared.withTransit }
+        if (byTransit.size < 2) null else listOf(true, false).joinToString("; ") { t ->
+            "${if (t) "con" else "senza"}: ${byTransit.getValue(t).joinToString(", ") { it.id }}"
+        }
+    }
+
     private fun route(request: DirectionsRequest, pointGraph: List<String?>, penalized: Set<String>?, rc: RequestContext): Map<String, Any?> {
         mixedPriority?.let { log?.invoke("ATTENZIONE grafi con priorità diverse ($it): scelta dei valichi falsata, vanno aggiornati i Paesi coi grafi di prima") }
+        mixedTransit?.let { log?.invoke("ATTENZIONE grafi con divieti di transito e senza ($it): il camion li evita solo nei Paesi aggiornati, vanno aggiornati gli altri") }
         val started = System.currentTimeMillis()
         val ctx = Ctx(request, penalized, rc = rc)
         // varianti NavMaster: fra due Paesi anche gli altri valichi (fonte V); il loro tempo (budget_ms)
@@ -947,6 +961,7 @@ class CrossBorderDirections(
         metadata["engine"] = pieces[0].graph.service.engineInfo()
         metadata["countries"] = pieces.map { it.graph.id }
         mixedPriority?.let { metadata["mixed_priority"] = it }
+        mixedTransit?.let { metadata["mixed_transit"] = it }
         if (nav != null) {
             val (features, alternatives) = variantsAcross(ctx, request, pieces, pieceRequests, finals, feature, nav, rc, navStart, navBudget!!)
             metadata["navmaster"] = linkedMapOf("alternatives" to alternatives)

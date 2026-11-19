@@ -282,4 +282,24 @@ class CrossBorderChoiceTest {
             }
         }
     }
+
+    @Test
+    fun `graphs with and without transit bans are reported`() {
+        val orsDir = Files.createTempDirectory("nme-cbc-tr0").toFile().also { it.deleteOnExit() }
+        val navDir = Files.createTempDirectory("nme-cbc-tr1").toFile().also { it.deleteOnExit() }
+        RoutingGraph.build(File("../data/heidelberg.test.pbf"), orsDir, listOf(HgvProfile())).first.use { it.prepareCH(withCore = false, landmarkSets = emptyList()) }
+        val nav = HgvProfile(it.navmaster.engine.profile.VehicleProfileOptions(maximumGradeLevel = 1, useAcceleration = false, blockFords = false,
+            speedModel = it.navmaster.engine.profile.SpeedModel.NAVMASTER, country = "DE"))
+        RoutingGraph.build(File("../data/heidelberg.test.pbf"), navDir, listOf(nav)).first.use { it.prepareCH(withCore = false, landmarkSets = emptyList()) }
+        RoutingGraph.load(orsDir, mmap = false).use { g0 ->
+            RoutingGraph.load(navDir, mmap = false).use { g1 ->
+                assertTrue(g1.encoding.shared.withTransit); assertTrue(!g0.encoding.shared.withTransit)
+                val a = CountryGraph("a", DirectionsService(g0)); val b = CountryGraph("b", DirectionsService(g1)); val c = CountryGraph("c", DirectionsService(g1))
+                kotlin.test.assertNull(CrossBorderDirections(listOf(b, c), { _, _ -> emptyList() }).mixedTransit)
+                kotlin.test.assertNull(CrossBorderDirections(listOf(a), { _, _ -> emptyList() }).mixedTransit)
+                // un Paese di prima accanto a due ricostruiti coi divieti di transito
+                assertEquals("con: b, c; senza: a", CrossBorderDirections(listOf(a, b, c), { _, _ -> emptyList() }).mixedTransit)
+            }
+        }
+    }
 }

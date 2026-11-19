@@ -166,6 +166,10 @@ private fun importGraph(args: List<String>) {
             println("camion, velocità media per classe (km/h, pesata per lunghezza): " + stats.hgvSpeedByClass.entries.joinToString(", ") { "%s %.1f".format(it.key, it.value) })
         if (!stats.hgvSlowSignedShare.isNaN())
             println("camion sotto 30 km/h su primary e secondary con cartello > 50: %.2f %% dei km".format(100 * stats.hgvSlowSignedShare))
+        // divieti di transito dei mezzi pesanti (solo grafi NAVMASTER): i km per classe dicono se finiscono su autostrade o superstrade
+        if (stats.hgvTransitEdges > 0)
+            println("archi vietati al transito dei camion: %,d (km per classe: %s)".format(stats.hgvTransitEdges,
+                stats.hgvTransitKmByClass.entries.joinToString(", ") { "%s %.1f".format(it.key, it.value) }))
         println("bbox: ${it.graph.bounds}")
         println("priorità del peso consigliato: ${it.encoding.priorityModel.id}")
         val sets = opt(args, "landmark-sets")?.let { v -> if (v == "none") emptyList() else v.split(',').map { CoreLandmarks.parseSetName(it) }.filter { it != 0 } }

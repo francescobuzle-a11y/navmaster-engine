@@ -444,16 +444,28 @@ class RoutingGraph private constructor(
         /**
          * Importa un PBF in [dir] con i profili dati e lascia il grafo pronto. [encoding] solo per le prove
          * che rifanno un grafo di prima (per esempio NAVMASTER senza i divieti di transito).
+         *
+         * Attenzione: un grafo NAVMASTER senza i divieti di transito (`GraphEncoding(profiles, withTransit = false)`)
+         * serve solo a riprodurre i grafi costruiti prima di novembre 2026 nei test; non va mai distribuito: la
+         * variante di formato torna `navmaster`, il camion attraversa i tratti solo destinazione senza il ×10
+         * (l'import non legge [it.navmaster.engine.profile.HgvTransit]: niente bit `hgv_destination`, niente
+         * limiti di classe) e, accanto ai grafi nuovi,
+         * falsa la scelta dei valichi (CrossBorderDirections.mixedTransit). La CLI e la CI non passano mai [encoding].
          */
         fun build(pbf: File, dir: File, profiles: List<VehicleProfile>, mmap: Boolean = false, importOptions: ImportOptions = ImportOptions(),
-                  encoding: GraphEncoding = GraphEncoding(profiles)): Pair<RoutingGraph, ImportStats> {
+                  encoding: GraphEncoding = GraphEncoding(profiles)): Pair<RoutingGraph, ImportStats> =
+            build(it.navmaster.engine.osm.OsmPbfReader(pbf), dir, profiles, mmap, importOptions, encoding)
+
+        /** Come [build] da un PBF, da una sorgente qualunque (le prove coi dati in memoria). */
+        fun build(source: it.navmaster.engine.osm.OsmSource, dir: File, profiles: List<VehicleProfile>, mmap: Boolean = false,
+                  importOptions: ImportOptions = ImportOptions(), encoding: GraphEncoding = GraphEncoding(profiles)): Pair<RoutingGraph, ImportStats> {
             val gdir = GraphDirectory(dir, mmap)
             val graph = BaseGraph(gdir, encoding.registry)
             val tc = TurnCostStorage(gdir, TurnCostEncoding(profiles.map { it.name }))
             val guidance = if (importOptions.guidance) GuidanceStore(gdir.create("guidance"), graph.names) else null
             val points = if (importOptions.guidance) PointStore(gdir.create("points")) else null
             val rg = RoutingGraph(dir, encoding, graph, tc, guidance, points)
-            val stats = OsmGraphImporter(graph, encoding, tc, importOptions, guidance, points).import(pbf)
+            val stats = OsmGraphImporter(graph, encoding, tc, importOptions, guidance, points).import(source)
             rg.speedModel = (profiles.firstOrNull { it.options.speedModel == SpeedModel.NAVMASTER } ?: profiles.first()).options.speedModel.id
             rg.country = profiles.firstNotNullOfOrNull { it.options.country }
             // i motori di prima non sanno del peso NAVMASTER né dei divieti di transito: per loro il grafo ha un formato sconosciuto

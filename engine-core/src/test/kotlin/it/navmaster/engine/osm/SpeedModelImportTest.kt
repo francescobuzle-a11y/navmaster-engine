@@ -309,7 +309,7 @@ class SpeedModelImportTest {
             Node(1, 47.0, 10.0), Node(3, 47.0, 10.05), Node(2, 47.0, 10.1),          // A, M, B
             Node(4, 47.05, 10.0), Node(5, 47.05, 10.1),                              // D1, D2
             Node(6, 46.99, 10.1), Node(7, 46.98, 10.1), Node(8, 46.97, 10.1), Node(9, 46.96, 10.1), Node(20, 46.95, 10.1),
-            Node(21, 46.94, 10.1), Node(22, 46.93, 10.1),
+            Node(21, 46.94, 10.1), Node(22, 46.93, 10.1), Node(23, 46.92, 10.1), Node(24, 46.91, 10.1),
         )
         val fernpass = mapOf("highway" to "secondary", "ref" to "B 179", "maxweightrating:hgv" to "7.5", "maxweightrating:hgv:conditional" to "none @ destination; none @ delivery")
         val ways = listOf(
@@ -328,6 +328,9 @@ class SpeedModelImportTest {
             // FR: ponte da 19 t (maxweightrating senza deroga) e divieto sopra 26 t
             OsmWay(18, mapOf("highway" to "secondary", "maxweightrating" to "19"), longArrayOf(20, 21)),
             OsmWay(19, mapOf("highway" to "secondary", "hgv:conditional" to "no @ (weight>26)"), longArrayOf(21, 22)),
+            // limiti di classe del solo camion senza deroga: il camion no, il camper sì
+            OsmWay(30, mapOf("highway" to "secondary", "maxweight:hgv" to "7.5"), longArrayOf(22, 23)),
+            OsmWay(31, mapOf("highway" to "secondary", "maxweightrating:hgv" to "7.5"), longArrayOf(23, 24)),
         )
         return MemoryOsm(nodes, ways)
     }
@@ -369,9 +372,24 @@ class SpeedModelImportTest {
             assertEquals(!navmaster, accepted(18), "ponte da 19 t (maxweightrating)")
             assertEquals(!navmaster, accepted(19), "no @ (weight>26)")
             assertTrue(accepted(10) && accepted(12))
+            assertEquals(!navmaster, accepted(30), "maxweight:hgv senza deroga: solo il camion")
+            assertEquals(!navmaster, accepted(31), "maxweightrating:hgv senza deroga: solo il camion")
+            // anche senza misure: è un divieto del camion (bit HGV), non un limite di peso
+            val bare = it.navmaster.engine.weighting.EdgeFilterFactory.create(enc, "heavyvehicle")
+            run { val e = edgeOf(31); iter.setEdge(e, g.nodeA(e)); assertEquals(!navmaster, bare.accept(iter)) }
             // l'auto coi pesi non vede la deroga del camion
             val van = it.navmaster.engine.weighting.EdgeFilterFactory.create(enc, "car-ors", params = it.navmaster.engine.weighting.VehicleParameters(weight = 12.0))
             run { val e = edgeOf(16); iter.setEdge(e, g.nodeA(e)); assertFalse(van.accept(iter)) }
+            // car-ors con le misure di un camper pesante: maxweight:hgv e maxweightrating:hgv non lo riguardano (il ponte generale sì)
+            val camper = it.navmaster.engine.weighting.EdgeFilterFactory.create(enc, "car-ors",
+                params = it.navmaster.engine.weighting.VehicleParameters(weight = 12.0, height = 3.4, width = 2.4, length = 9.0))
+            fun camperOk(way: Long): Boolean { val e = edgeOf(way); iter.setEdge(e, g.nodeA(e)); return camper.accept(iter) }
+            assertTrue(camperOk(30) && camperOk(31), "camper e limiti del camion")
+            assertEquals(Double.POSITIVE_INFINITY, enc.shared.maxWeight.get(g.getFlags(edgeOf(30))))
+            assertEquals(Double.POSITIVE_INFINITY, enc.shared.maxWeight.get(g.getFlags(edgeOf(31))))
+            assertTrue(camperOk(18), "ponte da 19 t, camper da 12")
+            val heavy = it.navmaster.engine.weighting.EdgeFilterFactory.create(enc, "car-ors", params = it.navmaster.engine.weighting.VehicleParameters(weight = 20.0))
+            run { val e = edgeOf(18); iter.setEdge(e, g.nodeA(e)); assertEquals(!navmaster, heavy.accept(iter), "ponte da 19 t (maxweightrating generale): vale per ogni veicolo") }
 
             // i percorsi: A → B, e A → M (a metà del tratto vietato)
             fun node(lat: Double, lon: Double) = (0 until g.nodeCount).first { abs(g.lat(it) - lat) < 1e-6 && abs(g.lon(it) - lon) < 1e-6 }

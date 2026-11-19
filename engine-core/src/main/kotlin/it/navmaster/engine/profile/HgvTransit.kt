@@ -22,7 +22,9 @@ import it.navmaster.engine.osm.OsmWay
  *   `motor_vehicle`, `vehicle`, `access` `:conditional`: decide la chiave più specifica che ha una parte
  *   valida, e fra le sue parti l'ultima valida (regola del wiki). Una parte con un orario, un giorno, un
  *   mese, PH, neve o bagnato (qualunque termine che non sia un peso) non vale: i divieti a orario non
- *   diventano permanenti;
+ *   diventano permanenti. Se `hgv` semplice (o `goods`, se manca `hgv`) apre la strada
+ *   (`yes|designated|permissive`), le chiavi meno specifiche non contano più: si legge solo
+ *   `hgv:conditional` (o `hgv:conditional` e `goods:conditional`), come per l'accesso semplice;
  * - `hgv=no` con `hgv:conditional=yes|destination|delivery @ (destination|delivery)`: era un divieto
  *   totale, la via di consegna stessa diventava irraggiungibile;
  * - `maxweightrating[:hgv][:forward|:backward]` o `maxweight:hgv` N < 40 con la deroga
@@ -31,11 +33,13 @@ import it.navmaster.engine.osm.OsmWay
  * - `maxweight`/`maxgcweight` N < 40 con la stessa deroga: due sensi più [EXEMPT], perché il filtro del
  *   camion non blocchi sul peso (le altre misure sì).
  *
- * **Divieti veri:** `no @ (weight>N)` senza orari blocca il camion (bit HGV, come `hgv=no`);
- * `maxweightrating[:hgv][:senso]` e `maxweight:hgv` N < 40 senza deroga diventano un limite di peso
- * (il minimo con `maxweight`, [ratingLimit]): così si rispettano i ponti francesi, ormai segnati tutti
- * con `maxweightrating`. Il limite di peso è unico per i due sensi: un `:forward` senza deroga limita
- * anche l'altro senso (prudente, raro).
+ * **Divieti veri:** `no @ (weight>N)` senza orari blocca il camion (bit HGV, come `hgv=no`), e così
+ * `maxweightrating:hgv[:senso]` e `maxweight:hgv` N < 40 senza deroga ([hgvRatingBlock]): valgono solo
+ * per i mezzi pesanti, quindi non possono finire nel limite di peso condiviso, che vale anche per l'auto
+ * coi pesi (camper, `car-ors`). Solo `maxweightrating[:senso]` senza `:hgv`, che vale per ogni veicolo,
+ * diventa un limite di peso (il minimo con `maxweight`, [ratingLimit]): così si rispettano i ponti
+ * francesi, ormai segnati tutti con `maxweightrating`. Il limite di peso e il bit HGV sono unici per i
+ * due sensi: un `:forward` senza deroga vale anche per l'altro senso (prudente, raro).
  *
  * Limiti noti: una deroga per zona (Fernpass B179: chi parte o arriva nei distretti di Imst, Reutte,
  * Landeck, Innsbruck e nei Landkreis vicini) non si esprime per strada: un Reutte → Imst gira largo.
@@ -56,6 +60,10 @@ object HgvTransit {
     private val plainValues = setOf("destination", "delivery", "local")
     private val conditionalKeys = listOf("hgv", "goods", "motor_vehicle", "vehicle", "access").map { "$it:conditional" }
     private val ratingBases = listOf("maxweightrating:hgv", "maxweightrating", "maxweight:hgv")
+    /** I limiti di classe che valgono per ogni veicolo: senza deroga vanno nel limite di peso condiviso. */
+    private val generalRatingBases = listOf("maxweightrating")
+    /** I limiti di classe dei soli mezzi pesanti: senza deroga bloccano il camion (bit HGV), non l'auto. */
+    private val hgvRatingBases = listOf("maxweightrating:hgv", "maxweight:hgv")
     private val exemptionConditions = setOf("destination", "delivery")
     private val exemptionValues = setOf("none", "no")
     private val hgvExemptionValues = setOf("yes", "destination", "delivery")
@@ -82,21 +90,39 @@ object HgvTransit {
         }
         // maxweight con la deroga: solo destinazione nei due sensi, e il filtro non blocca sul peso
         if (plainWeightExempt(way)) bits = bits or BOTH or EXEMPT
+        // Caso misto, scelta prudente: `maxweight` con la deroga (es. 7,5 + `none @ destination`) e sulla
+        // stessa way `maxweightrating` senza deroga (es. 19). Il limite condiviso è il minimo dei due (7,5)
+        // e uno solo: non si sa a quale dei due la deroga voglia rinunciare, quindi la deroga sul peso cade
+        // e il camion più pesante di 7,5 t è bloccato dal filtro, anche se per arrivare basterebbero le 19 t
+        // del limite di classe. Raro; meglio un giro largo che un ponte sbagliato.
         if (bits and EXEMPT != 0 && ratingLimit(way).isFinite()) bits = bits and EXEMPT.inv()
         return bits
     }
 
     /**
-     * Il limite di peso vero dei limiti di classe senza deroga (`maxweightrating[:hgv][:senso]`,
-     * `maxweight:hgv`, N < 40), il più basso; +∞ se nessuno.
+     * Il limite di peso vero dei limiti di classe generali senza deroga (`maxweightrating[:senso]`, senza
+     * `:hgv`, N < 40), il più basso; +∞ se nessuno. Vale per ogni veicolo (anche l'auto coi pesi).
      */
     fun ratingLimit(way: OsmWay): Double {
         var limit = Double.POSITIVE_INFINITY
-        for (base in ratingBases) for ((dir, _) in DIRS) {
+        for (base in generalRatingBases) for ((dir, _) in DIRS) {
             val n = limitTons(way.tag(if (dir == null) base else "$base:$dir")) ?: continue
             if (n < HgvProfile.REF_TRUCK_T && !exempted(way, base, dir) && n < limit) limit = n
         }
         return limit
+    }
+
+    /**
+     * Vero se un limite di classe dei soli mezzi pesanti (`maxweightrating:hgv[:senso]`, `maxweight:hgv`)
+     * N < 40 non ha la deroga per destinazione: il camion di riferimento non ci passa (bit HGV, come
+     * `no @ (weight>N)`). Con la deroga resta un tratto solo destinazione ([flags]).
+     */
+    fun hgvRatingBlock(way: OsmWay): Boolean {
+        for (base in hgvRatingBases) for ((dir, _) in DIRS) {
+            val n = limitTons(way.tag(if (dir == null) base else "$base:$dir")) ?: continue
+            if (n < HgvProfile.REF_TRUCK_T && !exempted(way, base, dir)) return true
+        }
+        return false
     }
 
     /** `maxweight` (o `maxgcweight`) N < 40 con la deroga `none @ destination|delivery` nel suo `:conditional`. */
@@ -110,9 +136,17 @@ object HgvTransit {
     fun hgvNoWithDestinationExemption(way: OsmWay): Boolean =
         way.hasTag("hgv", "no") && exemption(way.tag("hgv:conditional"), hgvExemptionValues)
 
-    /** La condizione di solo peso che vale per il camion di riferimento, dalla chiave più specifica che ne ha una. */
+    /**
+     * La condizione di solo peso che vale per il camion di riferimento, dalla chiave più specifica che ne ha
+     * una. Se `hgv` semplice (o `goods`, se manca `hgv`) è `yes|designated|permissive`, le condizionali delle
+     * chiavi meno specifiche (`motor_vehicle`, `vehicle`, `access`, e `goods` sotto `hgv`) non contano: la
+     * strada è aperta ai camion e solo la loro condizionale può chiuderla.
+     */
     fun weightRule(way: OsmWay): Rule {
-        for (key in conditionalKeys) {
+        val plainKey = if (way.hasTag("hgv")) "hgv" else if (way.hasTag("goods")) "goods" else null
+        val open = plainKey != null && way.tagValues(plainKey).let { v -> v.isNotEmpty() && v.all { it.trim().lowercase() in openValues } }
+        val keys = if (open) conditionalKeys.subList(0, conditionalKeys.indexOf("$plainKey:conditional") + 1) else conditionalKeys
+        for (key in keys) {
             val r = weightRule(way.tag(key))
             if (r != Rule.NONE) return r
         }

@@ -115,28 +115,67 @@ class HgvTransitTest {
         // a orario: niente
         assertEquals(0, nav(w("hgv:conditional" to "no @ (Mo-Fr 22:00-05:00)")).blockedHeavyVehicleTypes)
         assertEquals(0, nav(w("hgv:conditional" to "no @ (weight>40)")).blockedHeavyVehicleTypes)
-        // FR: i ponti con maxweightrating senza deroga sono limiti di peso veri
+        // FR: i ponti con maxweightrating (generale) senza deroga sono limiti di peso veri, per ogni veicolo
         val bridge = nav(w("maxweightrating" to "19"))
-        assertEquals(19.0, bridge.maxWeight); assertEquals(0, bridge.hgvTransit)
-        assertEquals(30.0, nav(w("maxweightrating:hgv" to "30")).maxWeight)
-        assertEquals(Double.POSITIVE_INFINITY, nav(w("maxweightrating:hgv" to "40")).maxWeight)
-        assertEquals(7.5, nav(w("maxweight:hgv" to "7.5")).maxWeight)
-        assertEquals(12.0, nav(w("maxweightrating:hgv:forward" to "12")).maxWeight, "un limite per senso limita l'arco")
+        assertEquals(19.0, bridge.maxWeight); assertEquals(0, bridge.hgvTransit); assertEquals(0, bridge.blockedHeavyVehicleTypes)
+        assertEquals(12.0, nav(w("maxweightrating:forward" to "12")).maxWeight, "un limite per senso limita l'arco")
+        assertEquals(Double.POSITIVE_INFINITY, nav(w("maxweightrating" to "40")).maxWeight)
         // il minimo con maxweight
-        assertEquals(3.5, nav(w("maxweight" to "3.5", "maxweightrating:hgv" to "7.5")).maxWeight)
-        assertEquals(7.5, nav(w("maxweight" to "12", "maxweightrating:hgv" to "7.5")).maxWeight)
+        assertEquals(3.5, nav(w("maxweight" to "3.5", "maxweightrating" to "7.5")).maxWeight)
+        assertEquals(7.5, nav(w("maxweight" to "12", "maxweightrating" to "7.5")).maxWeight)
+        // i limiti di classe del solo camion senza deroga: bloccano il camion (bit HGV), il limite condiviso non cambia
+        for (way in listOf(w("maxweightrating:hgv" to "30"), w("maxweight:hgv" to "7.5"), w("maxweightrating:hgv:forward" to "12"),
+                w("maxweightrating:hgv:backward" to "7.5", "maxweightrating:hgv:forward:conditional" to "none @ destination"))) {
+            val a = nav(way)
+            assertEquals(hgvBit, a.blockedHeavyVehicleTypes, way.tags.toString())
+            assertEquals(Double.POSITIVE_INFINITY, a.maxWeight, way.tags.toString())
+            assertEquals(0, a.blockedHeavyVehicleTypes and HeavyVehicleAttributes.BUS, "solo il camion: ${way.tags}")
+        }
+        assertEquals(0, nav(w("maxweightrating:hgv" to "40")).blockedHeavyVehicleTypes)
+        assertEquals(12.0, nav(w("maxweight" to "12", "maxweightrating:hgv" to "7.5")).maxWeight)
         // DE: la deroga a orario non è una deroga
         val timed = nav(w("maxweightrating:hgv" to "7.5", "maxweightrating:hgv:conditional" to "none @ (destination AND 06:00-22:00)"))
-        assertEquals(7.5, timed.maxWeight); assertEquals(0, timed.hgvTransit)
+        assertEquals(hgvBit, timed.blockedHeavyVehicleTypes); assertEquals(Double.POSITIVE_INFINITY, timed.maxWeight); assertEquals(0, timed.hgvTransit)
         // con la deroga non è un limite: solo destinazione
         val fernpass = nav(w("maxweightrating:hgv" to "7.5", "maxweightrating:hgv:conditional" to "none @ destination; none @ delivery"))
-        assertEquals(Double.POSITIVE_INFINITY, fernpass.maxWeight); assertEquals(BOTH, fernpass.hgvTransit)
+        assertEquals(Double.POSITIVE_INFINITY, fernpass.maxWeight); assertEquals(BOTH, fernpass.hgvTransit); assertEquals(0, fernpass.blockedHeavyVehicleTypes)
+        val hgvMax = nav(w("maxweight:hgv" to "7.5", "maxweight:hgv:conditional" to "none @ destination"))
+        assertEquals(Double.POSITIVE_INFINITY, hgvMax.maxWeight); assertEquals(BOTH, hgvMax.hgvTransit); assertEquals(0, hgvMax.blockedHeavyVehicleTypes)
         // maxweight con deroga: il limite resta (per l'auto coi pesi e per i fatti), il filtro del camion lo salta
         val exempt = nav(w("maxweight" to "7.5", "maxweight:conditional" to "none @ destination"))
         assertEquals(7.5, exempt.maxWeight); assertEquals(BOTH or EXEMPT, exempt.hgvTransit)
-        // un limite di classe senza deroga sulla stessa way: niente deroga sul peso
+    }
+
+    @Test
+    fun `mixed - maxweight with the destination exemption plus maxweightrating without it keeps the lower limit (prudent)`() {
+        // un solo limite condiviso (7,5, il minimo): la deroga sul peso cade, il camion sopra 7,5 t non passa
+        // anche se il limite di classe da solo (19) lo lascerebbe arrivare. Scelta prudente (HgvTransit.flags)
         val mixed = nav(w("maxweight" to "7.5", "maxweight:conditional" to "none @ destination", "maxweightrating" to "19"))
         assertEquals(7.5, mixed.maxWeight); assertEquals(BOTH, mixed.hgvTransit)
+        assertEquals(0, mixed.blockedHeavyVehicleTypes)
+    }
+
+    @Test
+    fun `an open hgv tag ignores the weight conditionals of less specific keys`() {
+        val designated = nav(w("hgv" to "designated", "motor_vehicle:conditional" to "no @ (weight>7.5)"))
+        assertEquals(0, designated.blockedHeavyVehicleTypes and hgvBit); assertEquals(0, designated.hgvTransit)
+        for (way in listOf(
+            w("hgv" to "yes", "vehicle:conditional" to "destination @ (weight>7.5)"),
+            w("hgv" to "permissive", "access:conditional" to "no @ (weight>3.5)"),
+            w("goods" to "yes", "motor_vehicle:conditional" to "destination @ (weight>7.5)"),
+            w("hgv" to "designated", "goods:conditional" to "no @ (weight>7.5)"),
+        )) {
+            assertEquals(HgvTransit.Rule.NONE, HgvTransit.weightRule(way), way.tags.toString())
+            assertEquals(0, HgvTransit.flags(way), way.tags.toString())
+            assertEquals(0, nav(way).blockedHeavyVehicleTypes and hgvBit, way.tags.toString())
+        }
+        // la condizionale del camion stesso vale ancora
+        assertEquals(hgvBit, nav(w("hgv" to "designated", "hgv:conditional" to "no @ (weight>7.5)")).blockedHeavyVehicleTypes and hgvBit)
+        assertEquals(HgvTransit.Rule.DESTINATION, HgvTransit.weightRule(w("goods" to "yes", "hgv:conditional" to "destination @ (weight>7.5)")))
+        assertEquals(HgvTransit.Rule.DESTINATION, HgvTransit.weightRule(w("goods" to "yes", "goods:conditional" to "destination @ (weight>7.5)")))
+        // hgv non aperto (assente o destination): le chiavi meno specifiche contano come prima
+        assertEquals(HgvTransit.Rule.NO, HgvTransit.weightRule(w("motor_vehicle:conditional" to "no @ (weight>7.5)")))
+        assertEquals(HgvTransit.Rule.NO, HgvTransit.weightRule(w("hgv" to "destination", "motor_vehicle:conditional" to "no @ (weight>7.5)")))
     }
 
     @Test

@@ -30,9 +30,11 @@ object WayAttributeParser {
      * @param privateMainRoads modello NAVMASTER: su autostrade, superstrade e statali `private` non blocca i
      *   mezzi pesanti (corsie di dogana e di cantiere, vedi `HgvProfile.privateMainRoad`); `no` sì.
      * @param transitBans modello NAVMASTER: i divieti di transito dei mezzi pesanti ([HgvTransit]): il bit
-     *   «solo destinazione» per senso ([WayAttributes.hgvTransit]), i limiti di classe senza deroga nel
-     *   limite di peso, `no @ (weight>N)` come `hgv=no`, e `hgv=delivery` / `hgv=no` con la deroga per
-     *   destinazione non più bloccati. Con `false` (modello ORS) il risultato è quello di sempre.
+     *   «solo destinazione» per senso ([WayAttributes.hgvTransit]), `maxweightrating` generale senza deroga
+     *   nel limite di peso (vale per ogni veicolo), `maxweightrating:hgv` / `maxweight:hgv` senza deroga e
+     *   `no @ (weight>N)` come `hgv=no` (solo il camion, l'auto coi pesi non li vede), e `hgv=delivery` /
+     *   `hgv=no` con la deroga per destinazione non più bloccati. Con `false` (modello ORS) il risultato è
+     *   quello di sempre.
      */
     fun parse(way: OsmWay, isFerry: Boolean, roadAccessRestrictions: List<String> = carRestrictions, widthFromCarriageway: Boolean = true,
               privateMainRoads: Boolean = false, transitBans: Boolean = false): WayAttributes = WayAttributes(
@@ -79,8 +81,8 @@ object WayAttributeParser {
      *
      * Con [transitBans] (modello NAVMASTER, vedi [HgvTransit]): `hgv|goods=delivery` non blocca più gli
      * altri mezzi pesanti, e `hgv=no` con `hgv:conditional=yes @ destination` (o delivery) non blocca il
-     * camion: diventano tratti solo destinazione. `no @ (weight>N)` con N < 40 senza orari blocca il
-     * camion come `hgv=no`.
+     * camion: diventano tratti solo destinazione. `no @ (weight>N)` con N < 40 senza orari, e
+     * `maxweightrating:hgv` / `maxweight:hgv` N < 40 senza deroga, bloccano il camion come `hgv=no`.
      */
     fun blockedHeavyVehicleTypes(way: OsmWay, privateMainRoads: Boolean = false, transitBans: Boolean = false): Int {
         if (!way.hasTag("highway")) return 0
@@ -110,7 +112,9 @@ object WayAttributeParser {
         }
         if (transitBans) {
             if (HgvTransit.hgvNoWithDestinationExemption(way)) blocked = blocked and HeavyVehicleAttributes.HGV.inv()
-            if (HgvTransit.weightRule(way) == HgvTransit.Rule.NO) blocked = blocked or HeavyVehicleAttributes.HGV
+            // divieti veri del solo camion: `no @ (weight>N)` e i limiti di classe `:hgv` senza deroga (non nel
+            // limite di peso condiviso, che vale anche per l'auto coi pesi)
+            if (HgvTransit.weightRule(way) == HgvTransit.Rule.NO || HgvTransit.hgvRatingBlock(way)) blocked = blocked or HeavyVehicleAttributes.HGV
         }
         return blocked
     }
