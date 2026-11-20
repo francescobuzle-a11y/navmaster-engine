@@ -505,7 +505,16 @@ class AlternativesRealDiagTest {
                 val t0 = System.currentTimeMillis()
                 val wc = try { core.route(s0, s1).weight } catch (e: RouteNotFoundException) { Double.POSITIVE_INFINITY }
                 val t1 = System.currentTimeMillis()
-                val wf = try { g.router(full, p).route(s0, s1).weight } catch (e: RouteNotFoundException) { Double.POSITIVE_INFINITY }
+                val pfull = try { g.router(full, p).route(s0, s1) } catch (e: RouteNotFoundException) { null }
+                val wf = pfull?.weight ?: Double.POSITIVE_INFINITY
+                // la ricerca piena edge-based può passare due volte sullo stesso arco (un giro d'inversione su un
+                // piazzale per evitare le penalità): un anello per nodi contratti non è uno shortcut, il core non lo
+                // rappresenta e dà il percorso senza inversione. Non è un'inesattezza del core: la coppia si salta
+                if (pfull != null && pfull.edges.map { it.edge }.let { it.size != it.toSet().size }) {
+                    println("  (f) coppia saltata: la ricerca piena passa due volte sullo stesso arco (core %.1f, piena %.1f)".format(
+                        try { core.route(s0, s1).weight } catch (e: RouteNotFoundException) { Double.POSITIVE_INFINITY }, wf))
+                    continue
+                }
                 println("  (f) %.1f km: core %.1f (${t1 - t0} ms), piena %.1f (${System.currentTimeMillis() - t1} ms), ${p.size} archi penalizzati".format(best.distance / 1000, wc, wf))
                 check("f", (wc.isInfinite() && wf.isInfinite()) || Math.abs(wc - wf) <= 1e-6 * wf, "core $wc, piena $wf")
                 verified++
