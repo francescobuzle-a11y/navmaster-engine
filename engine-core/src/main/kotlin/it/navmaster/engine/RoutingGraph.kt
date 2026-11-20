@@ -117,6 +117,13 @@ class RoutingGraph private constructor(
     val avoidLandmarks = LinkedHashMap<String, MutableList<CoreLandmarks>>()
 
     /**
+     * Vero se il grafo è stato costruito coi file mappati (`--mmap`, i Paesi grandi): le CH, i core e i
+     * landmark preparati da [prepareCH] si riaprono allora mappati dal file appena scritti, fuori
+     * dall'heap. In RAM restavano tutti fino alla fine (Germania: oltre 5 GB) e l'import finiva la memoria.
+     */
+    var mappedFiles = false
+
+    /**
      * L'insieme di landmark per una richiesta che evita [avoidFeatures] (già ridotti a quelli del
      * profilo): fra quelli ammissibili (le strade escluse nella preparazione sono tutte evitate dalla
      * richiesta, così i limiti restano inferiori) quello con più strade escluse, cioè coi limiti più
@@ -164,6 +171,16 @@ class RoutingGraph private constructor(
     fun prepareCH(log: ((String) -> Unit)? = null, withCore: Boolean = true, landmarkCount: Int = 16, coreWide: Boolean = true,
                   landmarkSets: List<Int> = DEFAULT_LANDMARK_SETS) {
         val setNames = LinkedHashSet<String>()
+        // con i file mappati una CH scritta si riapre dal file (stessi dati, fuori dall'heap)
+        fun reopened(st: CHStorage, k: String): CHStorage {
+            if (!mappedFiles) return st
+            st.close()
+            val m = CHStorage(GraphDirectory(dir, mmap = true), k, graph.edgeCount, graph.nodeCount)
+            check(m.loadExisting()) { "CH $k non riaperta dal file" }
+            return m
+        }
+        fun reopened(lm: CoreLandmarks, file: String, base: CoreLandmarks?): CoreLandmarks =
+            if (!mappedFiles) lm else CoreLandmarks.load(GraphDirectory(dir, mmap = true), file, graph.nodeCount, base) ?: lm
         for (pe in encoding.profiles) for (method in listOf(defaultCHWeighting(pe.profile.name), WeightingMethod.SHORTEST)) {
             val name = pe.profile.name
             val w = WeightingFactory.create(encoding, pe, method)
@@ -173,7 +190,7 @@ class RoutingGraph private constructor(
             CHPreparation(graph, w, storage, params = CHPreparation.Params(log = log)).prepare()
             storage.flush()
             log?.invoke("CH $key: ${storage.shortcutCount} shortcut in ${System.currentTimeMillis() - t0} ms")
-            chStorages[key] = storage
+            chStorages[key] = reopened(storage, key)
             // il core per ogni peso, come ORS (`core.weightings: recommended,shortest`)
             if (withCore) {
                 val selector = CoreEdgeSelector(encoding, name, turnCosts, wide = coreWide)
@@ -187,11 +204,13 @@ class RoutingGraph private constructor(
                 if (prep.keptInCore > 0) log?.invoke("Core $coreKey: ${prep.keptInCore} nodi lasciati nel core per troppi shortcut")
                 coreStorage.flush()
                 log?.invoke("Core $coreKey: ${coreStorage.coreNodeCount} nodi nel core (${100 * coreStorage.coreNodeCount / maxOf(1, graph.nodeCount)} %), ${coreStorage.shortcutCount} shortcut in ${System.currentTimeMillis() - t0} ms")
-                chStorages[coreKey] = coreStorage
+                val core = reopened(coreStorage, coreKey)
+                chStorages[coreKey] = core
                 t0 = System.currentTimeMillis()
-                val chg = CHGraph(graph, coreStorage, w)
-                val lm = CoreLandmarks.prepare(chg, w, landmarkCount, log)
-                lm.save(GraphDirectory(dir, mmap = false), coreKey)
+                val chg = CHGraph(graph, core, w)
+                val lm0 = CoreLandmarks.prepare(chg, w, landmarkCount, log)
+                lm0.save(GraphDirectory(dir, mmap = false), coreKey)
+                val lm = reopened(lm0, coreKey, null)
                 landmarks[coreKey] = lm
                 log?.invoke("Landmark $coreKey: ${lm.landmarkCount} in ${System.currentTimeMillis() - t0} ms")
                 // gli insiemi con delle strade escluse (ORS `lmsets`): solo col core largo, dove quelle
@@ -203,7 +222,7 @@ class RoutingGraph private constructor(
                     val filter = AvoidFeaturesEdgeFilter(encoding.shared, avoid, pe.profile.category, name == "heavyvehicle")
                     val set2 = CoreLandmarks.prepare(chg, w, landmarkCount, log, filter = filter, avoidFeatures = avoid)
                     set2.save(GraphDirectory(dir, mmap = false), CoreLandmarks.fileName(coreKey, avoid), withIndex = false)
-                    avoidLandmarks.getOrPut(coreKey) { ArrayList() }.add(set2)
+                    avoidLandmarks.getOrPut(coreKey) { ArrayList() }.add(reopened(set2, CoreLandmarks.fileName(coreKey, avoid), lm))
                     setNames += set2.setName
                     log?.invoke("Landmark $coreKey ${set2.setName}: ${set2.landmarkCount} in ${System.currentTimeMillis() - t0} ms")
                 }
@@ -473,6 +492,7 @@ class RoutingGraph private constructor(
             val guidance = if (importOptions.guidance) GuidanceStore.forImport(gdir, graph.names) else null
             val points = if (importOptions.guidance) PointStore(gdir.create("points")) else null
             val rg = RoutingGraph(dir, encoding, graph, tc, guidance, points)
+            rg.mappedFiles = mmap
             val stats = OsmGraphImporter(graph, encoding, tc, importOptions, guidance, points).import(source)
             rg.speedModel = (profiles.firstOrNull { it.options.speedModel == SpeedModel.NAVMASTER } ?: profiles.first()).options.speedModel.id
             rg.country = profiles.firstNotNullOfOrNull { it.options.country }
